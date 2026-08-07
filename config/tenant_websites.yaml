@@ -1,0 +1,19 @@
+# Tenant → website registry for the tenant_profile fetcher.
+#
+# Source of truth for `survey-tagger profile fetch-all`. Kept manually so it
+# stays clean and current.
+#
+# Each entry runs all three agents (org → cx → ex) unless `agents:` overrides.
+# Example overrides:
+#   agents: [org, cx]            # skip EX for B2C tenants without an EX program
+#   agents: [org]                # only the org profile, defer CX/EX
+#
+# Add new tenants here as they're onboarded.
+
+tenants:
+  - tenant_id: 79814 
+    website_url: https://www.yamaha-motor-india.com/
+    agents: [org, cx, ex]         # skip EX for this tenant
+  # - tenant_id: 79807
+  #   website_url: https://www.rfhospital.org/
+  #   agents: [org, cx, ex]             # only run org profile for this tenant

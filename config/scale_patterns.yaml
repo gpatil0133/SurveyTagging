@@ -1,0 +1,128 @@
+# Standard scale fingerprints for benchmark question detection
+# Each pattern defines a recognizable, standardized measurement scale
+
+benchmark_scales:
+  nps_0_10:
+    name: "Net Promoter Score (NPS)"
+    option_count: 11
+    weight_range: [0, 10]
+    text_patterns:
+      - ["Not at all Likely", "Extremely Likely"]
+      - ["Not at all likely", "Extremely likely"]
+    rs_type: 2
+
+  csat_5_point:
+    name: "Customer Satisfaction (CSAT)"
+    option_count: 5
+    weight_range: [1, 5]
+    text_patterns:
+      - ["Very Dissatisfied", "Dissatisfied", "Neutral", "Satisfied", "Very Satisfied"]
+      - ["Very dissatisfied", "Dissatisfied", "Neutral", "Satisfied", "Very satisfied"]
+    rs_type: 4
+
+  ces:
+    name: "Customer Effort Score (CES)"
+    rs_type: 3
+    # Note: rs_type=3 is used by the Sogolytics platform exclusively for CES.
+    # Common 5-point effort scales but also used with Likert-style agreement wording.
+    option_count_typical: [5, 7]
+    text_patterns:
+      - ["Very Difficult", "Difficult", "Neutral", "Easy", "Very Easy"]
+      - ["Strongly Disagree", "Disagree", "Somewhat Disagree", "Neutral", "Somewhat Agree", "Agree", "Strongly Agree"]
+
+  quality_5_point:
+    name: "Quality / Performance Scale"
+    option_count: 5
+    weight_range: [1, 5]
+    text_patterns:
+      - ["Very Poor", "Poor", "Average", "Good", "Excellent"]
+
+  satisfaction_10_point:
+    name: "10-point Satisfaction Scale"
+    option_count: 10
+    weight_range: [1, 10]
+    text_patterns: []  # Often unlabeled (blank text with weights 1-10)
+
+# Domain vocabulary for directory-based industry detection
+domain_keywords:
+  Healthcare:
+    - Patient
+    - Hospital
+    - Visit_Type
+    - Diagnosis
+    - OPD
+    - Doctor
+    - Nurse
+    - Medical
+    - Clinic
+    - In-Patient
+
+  "Financial Services":
+    - Account_Number
+    - Branch_Code
+    - Transaction
+    - Loan
+    - Balance
+    - Banking
+    - Credit
+    - Savings
+    - Checking
+    - ATM
+
+  "Higher Education":
+    - Student_ID
+    - Grade
+    - Course
+    - Faculty
+    - Semester
+    - GPA
+    - Dean
+    - Campus
+    - Enrollment
+
+  "K-12 Education":
+    - Student_ID
+    - Grade
+    - Parent_Name
+    - Teacher
+    - School
+    - Classroom
+    - Guardian
+
+  "Hospitality / Travel":
+    - Hotel
+    - Room_Type
+    - Loyalty_Points
+    - Guest
+    - Reservation
+    - Check_In
+    - Concierge
+    - Booking
+
+  "Retail / E-commerce":
+    - Product
+    - Purchase
+    - Store
+    - Order
+    - SKU
+    - Cart
+    - Bike_Model
+    - Brand
+    - Purchase_City
+
+  "SaaS / Technology":
+    - License
+    - Subscription
+    - API
+    - Feature
+    - Ticket
+    - SLA
+    - Deployment
+
+  "Government / Public Sector":
+    - Citizen
+    - Agency
+    - Permit
+    - Compliance
+    - Regulation
+    - Filing

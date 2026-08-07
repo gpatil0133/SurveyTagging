@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["survey_tagging*"]
+
+[project]
+name = "survey-tagging"
+version = "0.1.0"
+description = "Automated survey tagging system for multi-tenant survey platform"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "pyarrow>=14.0",
+    # SMB client. Lets SURVEY_TAGGER_SHARE_ROOT be a UNC path
+    # (//server/share/...) that the process opens itself, instead of requiring
+    # a root-owned CIFS mount on the host. See sharefs.py.
+    "smbprotocol>=1.15",
+    "pandas>=2.1",
+    "litellm>=1.30",
+    "jinja2>=3.1",
+    "click>=8.1",
+    "structlog>=24.1",
+    "pyyaml>=6.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.7",
+    "parallel-web>=0.5.0",
+    "numpy>=1.26",
+    "rapidfuzz>=3.0",
+    # 3.x+ required for compatibility with transformers>=4.5x: older 2.7 loads
+    # weights via .to(device), which crashes on the meta-tensor init that modern
+    # transformers uses by default ("Cannot copy out of meta tensor; no data!").
+    "sentence-transformers>=3.1,<6",
+    "httpx>=0.27",
+    "PyJWT[crypto]>=2.8.0",
+    # Lets the SoGo client verify TLS against the OS trust store
+    # (Windows/macOS/Linux). Required when SoGo intuc serves a cert chained
+    # to a corporate root CA that's installed in the OS trust store but not
+    # in Python's bundled `certifi` — the default path would fail with
+    # CERTIFICATE_VERIFY_FAILED otherwise.
+    "truststore>=0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
+    "respx>=0.21",
+]
+
+[project.scripts]
+survey-tagger = "survey_tagging.main:cli"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

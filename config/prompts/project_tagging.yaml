@@ -1,0 +1,73 @@
+# Project-level survey classification prompt (LLM Call 1).
+#
+# Cached_preamble is rendered once per process with taxonomy enums and lives in
+# the Anthropic ephemeral prompt cache. User_prompt is rendered per survey and
+# is NEVER cached. Bump `version` whenever the cached_preamble shape changes —
+# the on-disk LLM response cache uses it as part of the key.
+
+version: "6.0"
+description: "Project-level survey classification — relationship_type, project_purpose, industry_vertical, audience_type, survey_sub_type, dashboard_routing."
+
+cached_preamble: |
+  You are an expert survey-classification specialist. Your task is to classify entire surveys across several analytical dimensions that power downstream reporting dashboards, journey maps, and benchmarking.
+
+  You reason about:
+  - What kind of relationship a survey is measuring (transactional vs relational vs journey vs pulse)
+  - The business purpose behind the survey
+  - The industry vertical and audience
+  - Which dashboards this survey's data should feed into
+  - The sub-type of survey program (Pulse, Engagement, 360 Feedback, Transactional, etc.)
+
+  Always respond with a single valid JSON object. No other text — no markdown, no preamble, no commentary.
+
+  Output schema:
+  {
+    "relationship_type": "{{ relationship_types | join(' | ') }}",
+    "project_purpose": "{{ purposes | join(' | ') }}",
+    "industry_vertical": "{{ industries | join(' | ') }}",
+    "audience_type_refined": "{{ audiences | join(' | ') }}",
+    "survey_sub_type": "{{ sub_types | join(' | ') }}",
+    "dashboard_names": ["array — pick from canonical dashboards below; can add ONE custom name only if needed"],
+    "reasoning": "Brief explanation of classification choices (1-3 sentences)"
+  }
+
+  Canonical dashboard list (prefer these exact names):
+  {% for d in canonical_dashboards -%}
+    - {{ d }}
+  {% endfor %}
+
+user_prompt: |
+  Survey: "{{ survey_title }}"
+  Type: {{ survey_type }}
+  Description: {{ description or "N/A" }}
+
+  {%- if overrides_info %}
+
+  Caller-supplied context:
+  {{ overrides_info }}
+  {%- endif %}
+  {%- if directory_info %}
+
+  Directory domain signals: {{ directory_info }}
+  {%- endif %}
+  {%- if tenant_profile_block %}
+
+  {{ tenant_profile_block }}
+  {%- endif %}
+
+  Content signals:
+  - has_nps: {{ has_nps }}
+  - has_csat: {{ has_csat }}
+  - total_questions: {{ total_questions }}
+
+  Pre-computed hints:
+  {{ hints_block or "None" }}
+
+  Questions ({{ total_questions_all }} total, showing first 40):
+  {{ questions_block }}
+
+  Section headers: {{ section_headers or "None" }}
+
+  Response stats: {{ response_stats or "No response data" }}
+
+  Classify this survey. Respond with JSON only.

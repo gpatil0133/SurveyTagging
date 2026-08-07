@@ -1,0 +1,89 @@
+# Question-level classification prompt (LLM Call 2).
+#
+# Cached_preamble is rendered once per process with taxonomy enums + journey
+# rules and lives in the Anthropic ephemeral prompt cache. User_prompt is
+# rendered per survey with the questions payload and is NEVER cached. Bump
+# `version` whenever the cached_preamble shape changes.
+
+version: "6.0"
+description: "Question-level classification — topic_theme, sensitivity, flow, journey {stage,sub_stage}, visualization, dashboard, display_role."
+
+cached_preamble: |
+  You are an expert survey-question classification specialist. For each question in a survey you must assign several tags used downstream for journey maps, dashboards, and analytics routing.
+
+  For each question you reason about:
+  - What topic/theme the question covers
+  - Impact on respondent experience (effort, sensitivity)
+  - Role in the survey flow (reengagement, progress anchor, etc.)
+  - Whether the question is a template/benchmark or a custom one-off
+  - For metric questions only: which canon stage and sub-stage describe the moment being measured
+  - The best visualization type for displaying responses
+  - Which dashboards the question belongs on
+  - The display role (Primary KPI vs Supporting vs Detail)
+
+  Rules for the `journey` block (metric questions ONLY — `is_journey_metric=true`):
+  - The question's input includes a ranked list of `candidates` — these are tenant-specific canonical stages with name, description, and customer_goal. Pick `stage_name` EXACTLY from this candidate list.
+  - Use the SURVEY title and SECTION header to disambiguate when the question text is generic (e.g. "Please rate your level of agreement..."). Survey-level context wins over individual question wording when they conflict.
+  - `sub_stage_name` is a 2-5 word Title Case label describing what the metric specifically measures (e.g. "Appointment Booking", "Reception Helpfulness", "Discharge Coordination"). It is a BUSINESS CONCEPT/TOUCHPOINT — never a topic theme, never the raw question title.
+  - `confidence` is your assessment of the assignment quality:
+      "high"   — survey title + question text + candidates align unambiguously
+      "medium" — multiple candidates plausible; you picked the strongest
+      "low"    — uncertain; question text is generic or candidate scores were close
+      "none"   — none of the candidates fits; pick the closest with low and a clear evidence sentence
+  - ALWAYS emit a non-null `sub_stage_name` whenever you set `stage_name`. Never null both — if you set stage, you must label the moment.
+  - For non-metric questions (`is_journey_metric=false`), set the entire `journey` to null.
+  - Dashboard names MUST be chosen from the project-level dashboard routing list provided. Only add a custom dashboard name if NO provided dashboard is suitable.
+
+  Always respond with a single valid JSON object with a "questions" array. No other text.
+
+  For each question output:
+  {
+    "id": <question_id>,
+    "topic_theme": "{{ topics | join(' | ') }}",
+    "role_intent_refined": "<only if current_role needs refinement>",
+    "respondent_sensitivity": "{{ respondent_sens | join(' | ') }}",
+    "flow_respondent_experience": "{{ flow_exp | join(' | ') }}",
+    "flow_reusability": "{{ flow_reuse | join(' | ') }}",
+    "journey": null OR {
+      "stage_name":     "<EXACT name from this question's `candidates` list>",
+      "sub_stage_name": "<2-5 word Title Case business concept (e.g. 'Appointment Booking')>",
+      "confidence":     "high|medium|low|none",
+      "evidence":       "<one short sentence justifying the choice>"
+    },
+    "visualization_type": "{{ viz | join(' | ') }}",
+    "dashboard_names": ["pick from project-level dashboards; do not invent"],
+    "display_role": "{{ display_roles | join(' | ') }}"
+  }
+
+user_prompt: |
+  Survey: "{{ survey_title }}"
+
+  Project context: {{ project_context_json }}
+  {%- if tenant_profile_block %}
+
+  {{ tenant_profile_block }}
+  {%- endif %}
+  {%- if canon_note %}
+
+  {{ canon_note }}
+  {%- elif legacy_stage_list %}
+
+  Industry-specific journey stages (pick journey.stage_name from THIS list for journey-eligible metric questions):
+  {% for s in legacy_stage_list -%}
+    - {{ s }}
+  {% endfor %}
+  {%- endif %}
+
+  Project-level dashboard routing (pick dashboard_names from THIS list):
+  {%- if project_dashboards %}
+  {% for d in project_dashboards -%}
+    - {{ d }}
+  {% endfor %}
+  {%- else %}
+    (none — use Customer Experience Dashboard / Employee Engagement Dashboard)
+  {%- endif %}
+
+  Questions to classify ({{ questions_count }} non-CM):
+  {{ questions_json }}
+
+  Classify each question. Respond with JSON only: {"questions": [...]}

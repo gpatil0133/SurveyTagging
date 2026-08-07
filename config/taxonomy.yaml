@@ -1,0 +1,500 @@
+# Master Survey Tagging Taxonomy (V6 — adds tenant_level shape tags)
+# Defines tag dimensions across tenant, project, and question levels.
+# V6 adds: tenant_level (compliance_posture, customer_segment_signature,
+#          workforce_signature, ex_maturity_signature, key_cx_touchpoints,
+#          key_ex_lifecycle_stages). Tenant-level tags are persisted once
+#          per tenant in output/{tenant_id}/tenant_tags.json — not duplicated
+#          on every per-survey tagged_output.json.
+
+tenant_level:
+  compliance_posture:
+    description: "Tenant's regulatory compliance signature; backend uses this to set anonymization defaults and identifier policies."
+    allowed_values:
+      - None
+      - GDPR
+      - HIPAA
+      - SOC2
+      - FERPA
+      - PCI
+      - Multi-Regulatory
+
+  customer_segment_signature:
+    description: "Normalized customer segment shape. Backend uses this to prioritize default segmentation dimensions."
+    allowed_values:
+      - B2B-Enterprise
+      - B2B-SMB
+      - B2C
+      - B2B2C
+      - Mixed
+      - N/A
+
+  workforce_signature:
+    description: "Workforce composition shape. Backend uses this to select EX dashboard layout (frontline-ops vs knowledge-engagement)."
+    allowed_values:
+      - Frontline-heavy
+      - Knowledge
+      - Hybrid
+      - Field
+      - Distributed
+      - N/A
+
+  ex_maturity_signature:
+    description: "Tenant's EX program maturity. Backend uses this to pick dashboard complexity (simple vs full driver/cross-tab)."
+    allowed_values:
+      - Foundational
+      - Developing
+      - Established
+      - Advanced
+      - N/A
+
+  key_cx_touchpoints:
+    description: "Flat list of semantic CX touchpoint / journey-stage names extracted from tenant_profile.cx_journeys. Used by backend to align widgets with tenant-specific touchpoints."
+    multi_label: true
+    user_defined: true
+
+  key_ex_lifecycle_stages:
+    description: "Flat list of semantic EX lifecycle stage names from tenant_profile.ex_lifecycle_stages. Used by backend to align EX widgets."
+    multi_label: true
+    user_defined: true
+
+
+project_level:
+  project_type:
+    description: "Survey program type (CX/EX/general Survey/Assessment). Renamed from `category` in V6."
+    allowed_values:
+      - Survey
+      - CX
+      - EX
+      - Assessment
+
+  survey_cadence:
+    description: "Deployment frequency pattern"
+    allowed_values:
+      - One-time
+      - Recurring
+      - Always-on
+      - Ad-hoc
+
+  relationship_type:
+    description: "Nature of the respondent relationship being measured"
+    allowed_values:
+      - Transactional
+      - Relational
+      - Journey-based
+      - Pulse
+
+  project_purpose:
+    description: "Primary business objective of the survey"
+    allowed_values:
+      - Measure Loyalty
+      - Understand Churn / Retention
+      - Product / Service Feedback
+      - Employee Engagement
+      - Onboarding / Training
+      - Market Research / VOC
+      - Compliance / Audit
+      - Event / Program Feedback
+
+  lifecycle_status:
+    description: "Current deployment state of the survey"
+    allowed_values:
+      - Edit
+      - Active
+      - Expired
+
+  audience_type:
+    description: "Target respondent group"
+    allowed_values:
+      - "External \u2013 Customers"
+      - "External \u2013 Panel"
+      - "Internal \u2013 Employees"
+      - Mixed
+
+  industry_vertical:
+    description: "Industry domain of the survey"
+    allowed_values:
+      - Healthcare
+      - Financial Services
+      - "Retail / E-commerce"
+      - Higher Education
+      - K-12 Education
+      - "SaaS / Technology"
+      - "Hospitality / Travel"
+      - "Fitness & Wellness"
+      - "Government / Public Sector"
+      - Other
+
+  ai_assist_flag:
+    description: "How the survey was created"
+    allowed_values:
+      - AI-Created
+      - AI-Assisted
+      - Manual
+
+  program_initiative:
+    description: "User-defined label grouping surveys under one business initiative"
+    allowed_values: []
+    user_defined: true
+
+  owner_team:
+    description: "Department, team, or individual accountable for the project"
+    allowed_values: []
+    user_defined: true
+
+  # --- V2 Additions (project-level) ---
+
+  survey_sub_type:
+    description: "Detailed survey sub-classification within CX/EX"
+    allowed_values:
+      - Transactional
+      - Relationship
+      - Touchpoint
+      - Journey
+      - Pulse
+      - Engagement
+      - Lifecycle
+      - "360 Feedback"
+      - Culture
+      - "Manager Effectiveness"
+      - "Product / Service"
+      - "Market Research"
+      - "Ad Hoc"
+
+  dashboard_routing:
+    description: "Which dashboards this survey should appear on (multi-label)"
+    multi_label: true
+    allowed_values: []
+    user_defined: true
+    canonical_values:
+      - Executive Dashboard
+      - Operations Dashboard
+      - Customer Experience Dashboard
+      - Employee Engagement Dashboard
+      - Voice of Customer Dashboard
+      - Voice of Employee Dashboard
+      - HR Dashboard
+      - Manager Effectiveness Dashboard
+
+question_level:
+  topic_theme:
+    description: "Subject matter of the question"
+    allowed_values:
+      - Product Experience
+      - "Service / Support"
+      - Onboarding
+      - "Manager / Leadership"
+      - "Culture & Belonging"
+      - "Compensation & Benefits"
+      - "Brand & Perception"
+      - "Pricing & Value"
+      - "Competitor / Market"
+      - Demographics
+
+  role_intent:
+    description: "Analytical function of the question within the survey"
+    allowed_values:
+      - Primary Metric
+      - "Driver / Attribute"
+      - "Follow-up / Verbatim"
+      - Diagnostic
+      - "Outcome / Behavioral Intent"
+      - Segmentation
+      - "Profiling / Demographic"
+      - Screener
+      - "Contextual / Situational"
+      - Benchmarkable
+      - "Compliance / Consent"
+      - Validation
+
+  data_sensitivity:
+    description: "PII or sensitive data classification"
+    multi_label: true
+    allowed_values:
+      - "PII \u2013 Name"
+      - "PII \u2013 Email"
+      - "PII \u2013 Phone"
+      - "PII \u2013 Location"
+      - "PII \u2013 ID"
+      - "Sensitive \u2013 Health"
+      - "Sensitive \u2013 Financial"
+      - Anonymous-safe
+
+  respondent_sensitivity:
+    description: "Impact on respondent experience"
+    allowed_values:
+      - Emotionally Sensitive
+      - Politically Sensitive
+      - Effort-intensive
+      - "Optional / Low Stakes"
+      - High Analytical Weight
+
+  flow_placement:
+    description: "Position within the survey flow"
+    allowed_values:
+      - Opening
+      - Warm-up
+      - Core Block
+      - Deep Dive
+      - Closing
+      - Standalone
+
+  flow_logic_role:
+    description: "Role in survey branching and logic"
+    multi_label: true
+    allowed_values:
+      - Branching Trigger
+      - Branching Target
+      - Skip Logic Source
+      - Piping Source
+      - Piping Target
+      - Loop Trigger
+      - Termination Trigger
+      - Quota Controller
+
+  flow_dependency:
+    description: "Dependency relationships with other questions"
+    allowed_values:
+      - Independent
+      - Conditionally Shown
+      - Conditionally Required
+      - Carries Forward
+      - References Prior
+      - Mutually Exclusive Block
+
+  flow_respondent_experience:
+    description: "Effect on respondent engagement and flow"
+    allowed_values:
+      - Effort Checkpoint
+      - Re-engagement Point
+      - Progress Anchor
+      - Trust Builder
+
+  flow_reusability:
+    description: "Standardization and reuse potential"
+    allowed_values:
+      - Template Question
+      - Benchmark Question
+      - "Custom / One-off"
+      - Candidate for Library
+
+  apply_method:
+    description: "How the tag was assigned"
+    allowed_values:
+      - System-applied
+      - User-applied
+
+  # --- V2 Additions (question-level) ---
+
+  metric_type:
+    description: "Classification of the question's measurement type"
+    allowed_values:
+      - Standard Metric
+      - Custom Metric
+      - Open-ended
+      - Categorical
+      - Not Applicable
+
+  metric_name:
+    description: "Named metric this question measures"
+    allowed_values:
+      - NPS
+      - CSAT
+      - CES
+      - eNPS
+      - Engagement Score
+      - Retention Intent
+      - Overall Satisfaction
+      - Text Feedback
+    user_defined: true
+
+  calculation_type:
+    description: "How responses should be aggregated"
+    allowed_values:
+      - Mean
+      - Percentage
+      - Count
+      - Sum
+      - NPS Score
+      - "Top Box %"
+      - Distribution
+      - "Mean Rank"
+      - "Not Applicable"
+
+  is_filterable:
+    description: "Whether this question can serve as a filter/facet in reporting UI"
+    allowed_values:
+      - "Yes"
+      - "No"
+
+  is_segmentable:
+    description: "Whether responses can be used to segment/cross-tab other data"
+    allowed_values:
+      - "Yes"
+      - "No"
+
+  stat_test_eligible:
+    description: "Whether statistical tests can be applied to responses"
+    allowed_values:
+      - "Yes - Parametric"
+      - "Yes - Non-parametric"
+      - "Yes - Chi-square"
+      - "No"
+
+  trend_trackable:
+    description: "Whether this question should be tracked over time"
+    allowed_values:
+      - "Yes"
+      - "No"
+
+  segment_dimensions:
+    description: "Specific dimensions this question can segment data by"
+    multi_label: true
+    allowed_values: []
+    user_defined: true
+
+  journey_stage:
+    description: "Customer/employee lifecycle stage this question maps to (industry-dependent enum). Tagged ONLY for journey-eligible metric questions: NPS/CSAT/CES (rs_type 2/3/4) or platform-flagged custom metric (is_custom_metric=True). All other questions get status=skipped."
+    allowed_values: []
+    user_defined: true
+
+  sub_stage_name:
+    description: "LLM-derived semantic sub-stage label for this metric question's journey tag (2-5 word Title Case, e.g. 'Overall Satisfaction', 'Checkout Ease'). Tagged ONLY for journey-eligible metric questions; status=skipped otherwise. Clustered into canonical per-stage sub-stages at the tenant level."
+    allowed_values: []
+    user_defined: true
+
+  visualization_type:
+    description: "Recommended chart type for this question's data"
+    allowed_values:
+      - Score Card
+      - Gauge
+      - Bar Chart
+      - Line Chart
+      - Trend Line
+      - Pie Chart
+      - Table
+      - Heat Map
+      - Distribution Chart
+      - Word Cloud
+      - Scatter Plot
+
+  dashboard_placement:
+    description: "Which dashboards this question should appear on (multi-label)"
+    multi_label: true
+    allowed_values: []
+    user_defined: true
+
+  display_role:
+    description: "How this question should be displayed on dashboards"
+    allowed_values:
+      - Primary KPI
+      - Supporting Metric
+      - Detail View
+      - Drill-down
+      - Comparison Metric
+      - Trend Indicator
+
+  # --- V7 Additions (question-level): Dashboard Capability Layer ---
+  # Intrinsic, per-question facts consumed by the downstream (LLM-driven)
+  # dashboard-composition service. This layer states what each question is
+  # CAPABLE of (which charts can render it, whether it can act as a filter or
+  # segment, how it can be cross-tabbed). It does NOT decide the dashboard —
+  # the dashboard service confirms data VIABILITY (response volume, null rate,
+  # distinct-value count) and does the contextual selection/pairing/layout.
+  # All six derive deterministically from rs_type + question_type + answer
+  # option weights (Stage 3, no LLM cost).
+
+  response_format:
+    description: "Canonical answer shape of the question. The anchor field the rest of the capability layer derives from. Deterministic from rs_type + question_type + option weights."
+    allowed_values:
+      - NPS-Scale           # rs_type=2
+      - Rating-Scale        # rs_type=4 (CSAT); weighted RS/RT/RW
+      - Effort-Scale        # rs_type=3 (CES)
+      - Ranking             # RK
+      - Single-Select       # L / R / SR (unweighted)
+      - Multi-Select        # C / ML
+      - Hidden-Select       # HR (routing question)
+      - Matrix-Row          # GR / GC / RG / GQ
+      - Open-Text           # T
+      - Contact             # CS (contact / signature)
+      - Not Applicable
+
+  scale_of_measurement:
+    description: "Statistical level of measurement. Independently gates valid chart types AND stat_test_eligible. Nominal=categories, Ordinal=ranked, Interval=equal-spacing (e.g. NPS 0-10), Ratio=true zero."
+    allowed_values:
+      - Nominal
+      - Ordinal
+      - Interval
+      - Ratio
+      - Unstructured        # free text
+      - N/A
+
+  cardinality_class:
+    description: "Shape of the value space; gatekeeps pie-vs-bar-vs-histogram-vs-wordcloud. Derived from option_count and response_format."
+    allowed_values:
+      - Binary              # 2 options
+      - Low                 # 3-7 options
+      - High                # 8+ discrete options
+      - Continuous          # numeric / scale
+      - Free-Text
+      - N/A
+
+  widget_compatibility:
+    description: "The SET of chart/widget types that can validly render this question. `visualization_type` remains the single DEFAULT pick; this is the full allow-list the dashboard service chooses from. Derived by rule table over response_format + scale_of_measurement + cardinality_class."
+    multi_label: true
+    allowed_values:
+      - Score Card
+      - Gauge
+      - Bar Chart
+      - Stacked Bar Chart
+      - Line Chart
+      - Trend Line
+      - Pie Chart
+      - Distribution Chart
+      - Heat Map
+      - Word Cloud
+      - Sentiment
+      - Table
+      - Ranking Bar
+      - Scatter Plot
+      - Map
+
+  control_role:
+    description: "Which dashboard control roles this question can play (multi-label). Supersedes and folds in is_filterable + is_segmentable — those remain as derived boolean projections. A demographic can be BOTH a Dropdown-Filter and a Segment-Control."
+    multi_label: true
+    allowed_values:
+      - Dropdown-Filter     # facet the UI can filter by
+      - Date-Filter
+      - Segment-Control     # can meaningfully segment OTHER questions
+      - Search-Filter       # free-text search over verbatims
+      - None
+
+  crosstab_axis_role:
+    description: "Eligibility as an axis when combining questions in a table / cross-tab widget. Column-Eligible = a measured metric; Row-Eligible = a grouping dimension."
+    allowed_values:
+      - Row-Eligible
+      - Column-Eligible
+      - Both
+      - None
+
+  # --- V7 Additions (question-level): Cross-Question Relationships ---
+  # Surfaced directly from raw platform signals already loaded onto
+  # QuestionContext (is_key_driver, metric_question_id / is_followup_question,
+  # matrix_group_title / matrix_group_size). These let the dashboard service
+  # pair questions: drivers to outcomes, verbatims to parents, matrix rows to
+  # one widget. user_defined because values are references/ids, not enums.
+  # status=skipped when the relationship does not apply.
+
+  driver_link:
+    description: "For key-driver questions (raw is_key_driver=True): marks the question as an explanatory driver to be paired with the outcome metric it explains. Value carries the linked outcome metric question_id when resolvable, else the flag 'Key Driver'. status=skipped for non-drivers. Source: is_key_driver."
+    allowed_values: []
+    user_defined: true
+
+  verbatim_link:
+    description: "For follow-up / open-text questions attached to a parent metric (raw is_followup_question + metric_question_id): the parent metric question_id this question elaborates, so its verbatim/detail can be rendered alongside the parent's widget. status=skipped when standalone. Source: metric_question_id."
+    allowed_values: []
+    user_defined: true
+
+  block_id:
+    description: "Grouping key for questions that belong to one matrix/grid block (raw matrix_group_title, matrix_group_size > 1), so the dashboard service can render the whole block as a single heat-map/table widget. Value is the matrix group identifier; status=skipped for standalone questions. Source: matrix_group_*."
+    allowed_values: []
+    user_defined: true

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Survey Auto-Tagger</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <span>Survey Auto-Tagger</span>
+      </div>
+
+      <!-- Direct entry. Real forms so Enter submits natively; these inputs live
+           in static markup and are never re-rendered, so typing is never
+           interrupted by a state change elsewhere. -->
+      <form class="entry" id="corpForm" autocomplete="off">
+        <label for="corpInput">Corp</label>
+        <input type="text" id="corpInput" inputmode="numeric" placeholder="11224"
+               aria-label="Corp number" />
+        <button type="submit" class="btn primary sm" id="corpBtn">Load</button>
+      </form>
+
+      <form class="entry" id="surveyForm" autocomplete="off">
+        <label for="surveyInput">Survey</label>
+        <input type="text" id="surveyInput" inputmode="numeric" placeholder="26101"
+               aria-label="Survey number" />
+        <button type="submit" class="btn sm" id="surveyBtn">Go</button>
+      </form>
+    </div>
+
+    <div class="totals" id="topStatus"></div>
+  </header>
+
+  <div id="busybar" aria-hidden="true"></div>
+
+  <aside class="sidebar">
+    <div class="top-tabs" id="topTabs">
+      <div class="top-tab" data-action="set-topview" data-topview="surveys">Surveys</div>
+      <div class="top-tab" data-action="set-topview" data-topview="tenant">Tenant</div>
+      <div class="top-tab" data-action="set-topview" data-topview="adhoc">Ad-hoc</div>
+    </div>
+
+    <input type="text" id="navSearch" class="nav-search" placeholder="Filter surveys…"
+           aria-label="Filter surveys" hidden />
+    <div id="navFilters" hidden></div>
+    <div class="sidebar-heading" id="sidebarHeading">Surveys</div>
+    <ul class="survey-list" id="nav"></ul>
+  </aside>
+
+  <main class="workspace" id="workspace">
+    <div id="banner"></div>
+    <div id="content"></div>
+  </main>
+
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<noscript>
+  <p style="padding:24px">This tool needs JavaScript enabled.</p>
+</noscript>
+
+<script src="/static/render.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
