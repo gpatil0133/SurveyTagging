@@ -5,7 +5,7 @@
 # is NEVER cached. Bump `version` whenever the cached_preamble shape changes —
 # the on-disk LLM response cache uses it as part of the key.
 
-version: "6.0"
+version: "7.0"
 description: "Project-level survey classification — relationship_type, project_purpose, industry_vertical, audience_type, survey_sub_type, dashboard_routing."
 
 cached_preamble: |
@@ -28,8 +28,14 @@ cached_preamble: |
     "audience_type_refined": "{{ audiences | join(' | ') }}",
     "survey_sub_type": "{{ sub_types | join(' | ') }}",
     "dashboard_names": ["array — pick from canonical dashboards below; can add ONE custom name only if needed"],
-    "reasoning": "Brief explanation of classification choices (1-3 sentences)"
+    "reasoning": "2-4 sentences: the signals behind each dimension above"
   }
+
+  Rules for `reasoning` (REQUIRED):
+  - It is stored verbatim against EVERY dimension you assigned above and shown to humans auditing the tagging, so it must touch each dimension you actually set — a reader inspecting `survey_sub_type` alone should find the sentence that explains `survey_sub_type`.
+  - Cite the signal that drove each call: the survey title, a section header, the question mix, the tenant profile, a directory domain. Do not restate the value ("purpose is Engagement because it measures engagement" is useless).
+  - Where one call was close, name the alternative you rejected and why.
+  - Keep it under 80 words, plain sentences, no markdown or bullets.
 
   Canonical dashboard list (prefer these exact names):
   {% for d in canonical_dashboards -%}

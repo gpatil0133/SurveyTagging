@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.tags import TagAccumulator, TagResult
 from models.tenant_profile import _normalize_agent_industry
@@ -57,7 +58,17 @@ class IndustryTagger(ProjectTagger):
                 value=top_domain,
                 source="hybrid",
                 confidence=0.95,
-                evidence=f"Directory columns match {top_domain}: {dir_signals.domain_keywords[:5]}",
+                evidence=ev.rule(
+                    "project.industry.directory_schema",
+                    f"The respondent directory's own column names point at "
+                    f"{top_domain}. This is the strongest signal available — the "
+                    "customer configured those fields themselves to hold their real "
+                    "data, so it outranks both the research agent and the survey text.",
+                    stage=1,
+                    inputs={"matched_domain": top_domain,
+                            "domain_keywords": dir_signals.domain_keywords[:5],
+                            "all_inferred_domains": dir_signals.inferred_domains[:3]},
+                ),
             )
 
         # Tier 2: Parallel.ai TenantProfile.industry_vertical (Phase 4 prior).
@@ -73,9 +84,19 @@ class IndustryTagger(ProjectTagger):
                     value=mapped,
                     source="hybrid",
                     confidence=conf,
-                    evidence=(
-                        f"Parallel.ai org_profile.industry={profile.industry_vertical!r} "
-                        f"(confidence={profile.org_confidence or 'Unknown'})"
+                    evidence=ev.profile(
+                        "project.industry.tenant_profile",
+                        f"No directory columns gave a domain, so the tenant profile "
+                        f"decides: the org research agent reports "
+                        f'"{profile.industry_vertical}", which normalizes to {mapped}. '
+                        f"Confidence tracks the agent's own rating "
+                        f"({profile.org_confidence or 'unrated'}) so a shaky agent "
+                        "cannot outrank a caller-supplied override.",
+                        field="org.industry_vertical",
+                        stage=1,
+                        inputs={"normalized_to": mapped,
+                                "agent_confidence": profile.org_confidence or "unknown"},
+                        quote=profile.industry_vertical,
                     ),
                 )
 
@@ -88,7 +109,14 @@ class IndustryTagger(ProjectTagger):
                     value=mapped,
                     source="hybrid",
                     confidence=0.70,
-                    evidence=f"Caller-supplied industry: {override_industry}",
+                    evidence=ev.rule(
+                        "project.industry.caller_override",
+                        f'The caller supplied industry "{override_industry}" on the '
+                        f"request, which maps to {mapped}. Reached only when neither "
+                        "the directory nor the tenant profile produced a domain.",
+                        stage=1,
+                        inputs={"override": override_industry, "mapped_to": mapped},
+                    ),
                 )
 
         # Tier 4: Survey content heuristics
@@ -118,7 +146,18 @@ class IndustryTagger(ProjectTagger):
                 value=best_match,
                 source="hybrid",
                 confidence=min(0.60 + best_score * 0.05, 0.85),
-                evidence=f"Content keyword matches for {best_match} (score={best_score})",
+                evidence=ev.statistic(
+                    "project.industry.content_keywords",
+                    f"Last resort before defaulting: the survey title and question text "
+                    f"contain {best_score} {best_match} keyword(s), more than any other "
+                    "vertical scored. Confidence rises with the hit count because a "
+                    "single stray word is not a vertical.",
+                    measure=f"{best_match}_keyword_hits",
+                    observed=best_score,
+                    threshold=2,
+                    stage=1,
+                    inputs={"matched_domain": best_match},
+                ),
             )
 
         # Fallback — will be refined by LLM in stage 4
@@ -126,7 +165,16 @@ class IndustryTagger(ProjectTagger):
             value="Other",
             source="hybrid",
             confidence=0.40,
-            evidence="No strong industry signals detected",
+            evidence=ev.fallback(
+                "project.industry.no_signal",
+                "All four tiers came up empty: no directory domain columns, no usable "
+                "tenant profile industry, no caller override, and fewer than two "
+                "vertical keywords anywhere in the survey text. Other is a placeholder "
+                "and the 0.40 confidence invites the Stage 4 LLM pass to replace it.",
+                stage=1,
+                inputs={"best_keyword_domain": best_match or "(none)",
+                        "best_keyword_score": best_score},
+            ),
         )
 
 

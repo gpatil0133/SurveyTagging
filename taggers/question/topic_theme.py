@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
@@ -38,7 +39,8 @@ class TopicThemeTagger(QuestionTagger):
         accumulator: TagAccumulator,
     ) -> TagResult:
         if question.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped")
+            return TagResult(value=None, source="deterministic", status="skipped",
+                             evidence=ev.content_message("topic_theme", stage=5))
 
         title_lower = question.title.lower()
         group_lower = question.matrix_group_title.lower()
@@ -53,17 +55,38 @@ class TopicThemeTagger(QuestionTagger):
                         value="Demographics",
                         source="hybrid",
                         confidence=0.85,
-                        evidence="Demographic question content + role",
+                        evidence=ev.hybrid(
+                            "question.topic_theme.demographics",
+                            "Two signals agree: the wording matches a demographic "
+                            "pattern (age / gender / income / region / name / email) "
+                            f"and role_intent is already {role}. Either alone would be "
+                            "weaker — plenty of non-demographic questions mention age.",
+                            components=[
+                                ev.component("demographic keyword",
+                                             f"matched {pattern.pattern!r}"),
+                                ev.component("role_intent", role),
+                            ],
+                            stage=5,
+                        ),
                     )
 
         # Keyword prior matching
         for keywords, theme in _TOPIC_KEYWORDS:
             if any(kw in combined for kw in keywords):
+                matched = [kw for kw in keywords if kw in combined]
                 return TagResult(
                     value=theme,
                     source="hybrid",
                     confidence=0.75,
-                    evidence=f"Keyword match for {theme}",
+                    evidence=ev.rule(
+                        "question.topic_theme.keyword_prior",
+                        f"The question or its matrix stem contains "
+                        f"{matched[0]!r}, which this tagger maps to {theme}. A prior "
+                        "only — the Stage 5 LLM pass may still overrule it.",
+                        stage=5,
+                        inputs={"matched_keywords": matched[:3], "theme": theme},
+                        quote=question.title,
+                    ),
                 )
 
         # Contextual inference from survey industry
@@ -78,7 +101,16 @@ class TopicThemeTagger(QuestionTagger):
                 value="Service / Support",
                 source="hybrid",
                 confidence=0.75,
-                evidence="Service/support keywords in question",
+                evidence=ev.rule(
+                    "question.topic_theme.service_keywords",
+                    "The question asks about an interaction with people or a support "
+                    "channel (service, staff, agent, response time...) rather than "
+                    "about a product itself.",
+                    stage=5,
+                    inputs={"matched_keywords":
+                                [kw for kw in service_keywords if kw in combined][:3]},
+                    quote=question.title,
+                ),
             )
 
         # Product Experience: questions about product quality
@@ -89,7 +121,16 @@ class TopicThemeTagger(QuestionTagger):
                 value="Product Experience",
                 source="hybrid",
                 confidence=0.70,
-                evidence="Product experience keywords",
+                evidence=ev.rule(
+                    "question.topic_theme.product_keywords",
+                    "The question asks about the thing itself — its quality, features, "
+                    "design or reliability — rather than about the people delivering "
+                    "it.",
+                    stage=5,
+                    inputs={"matched_keywords":
+                                [kw for kw in product_keywords if kw in combined][:3]},
+                    quote=question.title,
+                ),
             )
 
         # Default — will be refined by LLM
@@ -104,7 +145,18 @@ class TopicThemeTagger(QuestionTagger):
             value=default,
             source="llm",
             confidence=0.40,
-            evidence="Requires LLM classification",
+            evidence=ev.fallback(
+                "question.topic_theme.deferred_to_llm",
+                f"No keyword prior matched, so the theme was guessed from survey "
+                f"context alone: purpose {purpose or 'unset'} and industry "
+                f"{industry or 'unset'} make {default} the likeliest default. Held at "
+                "0.40 so LLM Call 2 replaces it — if you see this in the output, that "
+                "call did not answer for this question.",
+                stage=5,
+                inputs={"project_purpose": purpose or "(unset)",
+                        "industry_vertical": industry or "(unset)",
+                        "defaulted_to": default},
+            ),
         )
 
 

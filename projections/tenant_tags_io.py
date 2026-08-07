@@ -13,7 +13,11 @@ Artifact shape:
   "tenant_id": 12345,
   "tags": {
     "compliance_posture": {"value": "HIPAA", "source": "deterministic",
-                           "confidence": 0.95, "evidence": "..."},
+                           "confidence": 0.95,
+                           "evidence": {"type": "profile",
+                                        "rule_id": "tenant.compliance.regulatory_hit",
+                                        "detail": "org profile names HIPAA ...",
+                                        "inputs": {"profile_field": "org.regulatory_environment"}}},
     "key_cx_touchpoints": {"value": ["Booking", "Stay"], ...},
     ...
   },
@@ -55,8 +59,19 @@ def build_tenant_tags(
             "source": tag.source,
             "confidence": tag.confidence,
         }
+        if tag.status != "assigned":
+            entry["status"] = tag.status
+        # Typed `evidence` from the rule-based tenant taggers; `reasoning` is
+        # here for symmetry with the survey levels should a tenant dimension
+        # ever be LLM-assigned.
         if tag.evidence:
             entry["evidence"] = tag.evidence
+        if tag.reasoning:
+            entry["reasoning"] = tag.reasoning
+        if tag.failure_reason:
+            entry["failure_reason"] = tag.failure_reason
+        if tag.apply_method != "System-applied":
+            entry["apply_method"] = tag.apply_method
         serialized[dim] = entry
 
     metadata: dict = {}

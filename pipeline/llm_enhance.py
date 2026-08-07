@@ -139,7 +139,7 @@ def _apply_project_llm_results(parsed: dict, accumulator) -> None:
             value=value,
             source="llm",
             confidence=0.85,
-            reasoning=parsed.get("reasoning", ""),
+            reasoning=parsed.get("reasoning") or None,
         ))
 
     # Multi-label: dashboard_names → dashboard_routing
@@ -156,7 +156,7 @@ def _apply_project_llm_results(parsed: dict, accumulator) -> None:
             value = dashboard_names
         accumulator.set_project_tag("dashboard_routing", TagResult(
             value=value, source="llm", confidence=0.85,
-            reasoning=parsed.get("reasoning", ""),
+            reasoning=parsed.get("reasoning") or None,
         ))
 
 
@@ -188,6 +188,11 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
 
         question = question_by_id.get(q_id)
 
+        # V7: the model's own rationale for this question, stamped onto every
+        # tag it assigns below so each LLM-sourced dimension can explain itself
+        # in the tagged output and the UI.
+        q_reasoning = q_data.get("reasoning") or None
+
         # -------- Standard scalar fields --------
         for field, dimension in scalar_map.items():
             value = q_data.get(field)
@@ -198,6 +203,7 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                 continue
             accumulator.set_question_tag(q_id, dimension, TagResult(
                 value=value, source="llm", confidence=0.80,
+                reasoning=q_reasoning,
             ))
 
         # -------- Journey block (atomic stage + sub_stage) --------
@@ -229,7 +235,8 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                     accumulator.set_question_tag(q_id, "journey_stage", TagResult(
                         value=stage_value, source="llm",
                         confidence=conf_numeric, status=tag_status,
-                        evidence=j_evidence, coverage_metadata=coverage,
+                        evidence=j_evidence, reasoning=q_reasoning,
+                        coverage_metadata=coverage,
                     ))
             if sub_value:
                 existing_sub = accumulator.get_question_tag(q_id, "sub_stage_name")
@@ -237,7 +244,8 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                     accumulator.set_question_tag(q_id, "sub_stage_name", TagResult(
                         value=sub_value, source="llm",
                         confidence=conf_numeric, status=tag_status,
-                        evidence=j_evidence, coverage_metadata=coverage,
+                        evidence=j_evidence, reasoning=q_reasoning,
+                        coverage_metadata=coverage,
                     ))
 
         # Multi-label: dashboard_names → dashboard_placement
@@ -254,6 +262,7 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                 value = dashboard_names
             accumulator.set_question_tag(q_id, "dashboard_placement", TagResult(
                 value=value, source="llm", confidence=0.80,
+                reasoning=q_reasoning,
             ))
 
         # Role intent refinement
@@ -265,6 +274,7 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                     value=refined_role,
                     source="llm",
                     confidence=0.80,
+                    reasoning=q_reasoning,
                 ))
 
 

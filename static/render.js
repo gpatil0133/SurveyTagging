@@ -70,6 +70,26 @@ window.ST = window.ST || {};
     return `<span class="src ${cls}" title="${escapeHtml(hint)}">${escapeHtml(src || "unknown")}</span>`;
   }
 
+  /* A non-default `status` is itself an explanation — it says the value is
+   * provisional, or that the tag never got one. "assigned" is the default and
+   * carries no information, so it renders nothing. */
+  const STATUS_HINT = {
+    pending_llm: "reserved by a rule; the LLM pass was meant to fill this in but did not",
+    low_confidence_assigned: "the LLM was unsure — value kept and flagged for review",
+    failed: "the tagger raised an error; see failure_reason",
+    skipped: "the dimension does not apply to this question",
+  };
+
+  function statusBadge(tag) {
+    const st = tag && tag.status;
+    // Anything non-string is malformed input, not a status worth a badge —
+    // rendering it would put String(value) in front of the user.
+    if (typeof st !== "string" || !st || st === "assigned") return "";
+    const hint = STATUS_HINT[st] || "non-standard tag status";
+    const extra = tag.failure_reason ? ` — ${tag.failure_reason}` : "";
+    return `<span class="src status-${escapeHtml(st)}" title="${escapeHtml(hint + extra)}">${escapeHtml(st.replace(/_/g, " "))}</span>`;
+  }
+
   /* ---------- evidence / provenance ----------
    * A tag's provenance comes in three shapes:
    *   legacy string  — evidence: "rs_type=3 (CES)"
@@ -200,6 +220,7 @@ window.ST = window.ST || {};
     fmtValue,
     confBar,
     srcBadge,
+    statusBadge,
     evidenceParts,
     evidenceHtml,
     evidenceTitle,
@@ -471,6 +492,7 @@ window.ST = window.ST || {};
         <div class="tag-value ${v.empty ? "empty" : ""}">${v.html}</div>
         <div class="tag-foot">
           ${srcBadge(t.source)}
+          ${statusBadge(t)}
           ${confBar(t.confidence)}
         </div>
         ${evidenceHtml(t, "evidence")}
@@ -488,6 +510,7 @@ window.ST = window.ST || {};
         <div class="qtag-value ${v.empty ? "empty" : ""}">${v.html}</div>
         <div class="qtag-meta">
           ${srcBadge(t.source)}
+          ${statusBadge(t)}
           ${confBar(t.confidence)}
         </div>
         ${evidenceHtml(t, "qtag-evidence")}
@@ -615,7 +638,7 @@ window.ST = window.ST || {};
       <div class="question-card" data-q="${escapeHtml(key)}">
         <div class="question-head">
           <div class="qid">${escapeHtml(String(q.question_no ?? ""))}.</div>
-          <div>
+          <div class="qbody">
             <div class="qtitle">${escapeHtml(questionText(q) || "(no title)")}</div>
             <div class="qsummary">
               <span class="badge muted">content message</span>
@@ -658,7 +681,7 @@ window.ST = window.ST || {};
       <div class="question-card ${expanded ? "expanded" : ""}" data-q="${escapeHtml(key)}">
         <div class="question-head" data-action="toggle-q" data-q="${escapeHtml(key)}">
           <div class="qid">${escapeHtml(String(q.question_no ?? ""))}.</div>
-          <div>
+          <div class="qbody">
             <div class="qtitle">${escapeHtml(questionText(q) || "(no title)")}</div>
             <div class="qsummary">${summary}</div>
           </div>
@@ -984,7 +1007,10 @@ window.ST = window.ST || {};
 
   /* ---------- batch tagging result ---------- */
 
-  function statusBadge(status) {
+  /* Per-survey outcome of a batch run. Deliberately NOT named statusBadge:
+     that name belongs to the tag-status badge above, and two function
+     declarations sharing a name in this scope silently shadow each other. */
+  function runStatusBadge(status) {
     const s = String(status || "").toLowerCase();
     const cls = s === "success" ? "ok" : (s === "skipped" ? "muted" : "err");
     return `<span class="badge ${cls}">${escapeHtml(status || "unknown")}</span>`;
@@ -1002,7 +1028,7 @@ window.ST = window.ST || {};
             const rr = row || {};
             return `<tr>
               <td class="mono">${escapeHtml(String(rr.survey_no ?? "—"))}</td>
-              <td>${statusBadge(rr.status)}</td>
+              <td>${runStatusBadge(rr.status)}</td>
               <td>${rr.error ? `<span class="mono">${escapeHtml(String(rr.error))}</span>` : `<span class="empty">&mdash;</span>`}</td>
             </tr>`;
           }).join("")}</tbody>

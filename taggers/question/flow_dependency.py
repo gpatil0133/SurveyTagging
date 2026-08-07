@@ -1,5 +1,6 @@
 """Flow dependency tagger: identifies dependency relationships between questions."""
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
@@ -19,7 +20,8 @@ class FlowDependencyTagger(QuestionTagger):
         accumulator: TagAccumulator,
     ) -> TagResult:
         if question.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped")
+            return TagResult(value=None, source="deterministic", status="skipped",
+                             evidence=ev.content_message("flow_dependency", stage=3))
 
         # Conditionally Shown: follow-up question
         if question.is_followup_question:
@@ -27,7 +29,15 @@ class FlowDependencyTagger(QuestionTagger):
                 value="Conditionally Shown",
                 source="deterministic",
                 confidence=0.95,
-                evidence=f"Follow-up to question {question.metric_question_id}",
+                evidence=ev.rule(
+                    "question.flow_dependency.followup",
+                    f"The platform marks this as a follow-up to question "
+                    f"{question.metric_question_id}, so respondents only reach it "
+                    "depending on how they answered that one. Its response base is "
+                    "therefore a subset of the survey's.",
+                    stage=3,
+                    inputs={"parent_question_id": question.metric_question_id},
+                ),
             )
 
         # References Prior: has piping markers
@@ -36,7 +46,15 @@ class FlowDependencyTagger(QuestionTagger):
                 value="References Prior",
                 source="deterministic",
                 confidence=0.90,
-                evidence=f"Piping markers: {question.piping_markers[:2]}",
+                evidence=ev.rule(
+                    "question.flow_dependency.piping",
+                    "The question text contains piping markers, so its wording is "
+                    "assembled at runtime from an earlier answer. It reads differently "
+                    "for different respondents.",
+                    stage=3,
+                    inputs={"piping_markers": question.piping_markers[:2]},
+                    quote=question.title,
+                ),
             )
 
         # Mutually Exclusive Block: part of matrix group with >1 member
@@ -45,7 +63,15 @@ class FlowDependencyTagger(QuestionTagger):
                 value="Mutually Exclusive Block",
                 source="deterministic",
                 confidence=0.85,
-                evidence=f"Matrix group: {question.matrix_group_title} ({question.matrix_group_size} rows)",
+                evidence=ev.rule(
+                    "question.flow_dependency.matrix_group",
+                    f"One row of a {question.matrix_group_size}-row matrix presented "
+                    "under a single stem. It is answered alongside its siblings and "
+                    "should be read with them, not on its own.",
+                    stage=3,
+                    inputs={"matrix_group_title": question.matrix_group_title,
+                            "matrix_group_size": question.matrix_group_size},
+                ),
             )
 
         # Carries Forward: this question is referenced by follow-ups
@@ -59,7 +85,14 @@ class FlowDependencyTagger(QuestionTagger):
                 value="Carries Forward",
                 source="deterministic",
                 confidence=0.90,
-                evidence="Referenced as metric question by follow-up(s)",
+                evidence=ev.rule(
+                    "question.flow_dependency.referenced_by_followup",
+                    "This question is not itself conditional, but at least one "
+                    "follow-up question names it as the metric it branches on. Its "
+                    "answers drive who sees what later in the survey.",
+                    stage=3,
+                    inputs={"question_id": question.question_id},
+                ),
             )
 
         # Default: Independent
@@ -67,6 +100,13 @@ class FlowDependencyTagger(QuestionTagger):
             value="Independent",
             source="deterministic",
             confidence=1.0,
+            evidence=ev.rule(
+                "question.flow_dependency.independent",
+                "The question stands alone: not conditionally shown, no piping in its "
+                "text, not part of a matrix group, and no follow-up branches off it. "
+                "Every respondent who reaches the survey sees it as written.",
+                stage=3,
+            ),
         )
 
 

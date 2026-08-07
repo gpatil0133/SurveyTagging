@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
@@ -75,9 +76,23 @@ class DataSensitivityTagger(QuestionTagger):
         accumulator: TagAccumulator,
     ) -> TagResult:
         if question.is_content_message:
-            return TagResult(value=["Anonymous-safe"], source="deterministic", confidence=1.0)
+            return TagResult(
+                value=["Anonymous-safe"], source="deterministic", confidence=1.0,
+                evidence=ev.rule(
+                    "question.data_sensitivity.content_message",
+                    "A content message collects no answer at all, so it cannot carry "
+                    "personal or sensitive data. Note this dimension returns "
+                    "Anonymous-safe rather than skipping, because downstream "
+                    "anonymization logic reads every element.",
+                    stage=3,
+                    inputs={"is_content_message": True},
+                ),
+            )
 
         matches: list[str] = []
+        # Multi-label: remember what fired for each category, so the evidence can
+        # name the trigger instead of just restating the categories.
+        why: list[dict] = []
 
         # Check question title
         title = question.title
@@ -95,8 +110,14 @@ class DataSensitivityTagger(QuestionTagger):
             if category in matches:
                 continue
             for pattern in patterns:
-                if pattern.search(check_text):
+                hit = pattern.search(check_text)
+                if hit:
                     matches.append(category)
+                    why.append(ev.component(
+                        category,
+                        f'question text matches {pattern.pattern!r} '
+                        f'(matched "{hit.group(0)}")',
+                    ))
                     break
 
         # Income detection from answer options
@@ -104,14 +125,43 @@ class DataSensitivityTagger(QuestionTagger):
             opt_text = " ".join(o.answer_text.lower() for o in question.answer_options)
             if re.search(r"\$\d+[,.]?\d*", opt_text) and "income" in check_text.lower():
                 matches.append("Sensitive \u2013 Financial")
+                why.append(ev.component(
+                    "Sensitive \u2013 Financial",
+                    "the question mentions income and its answer options are currency "
+                    "bands \u2014 an income bracket, even though no keyword matched",
+                ))
 
         if not matches:
-            matches = ["Anonymous-safe"]
+            return TagResult(
+                value=["Anonymous-safe"],
+                source="deterministic",
+                confidence=1.0,
+                evidence=ev.rule(
+                    "question.data_sensitivity.no_pii_signal",
+                    "Neither the question text nor the matrix group title matched any "
+                    "PII or sensitive-data pattern (name, email, phone, address, ID, "
+                    "health, financial), and the answer options are not currency "
+                    "bands. Safe to report unaggregated.",
+                    stage=3,
+                    inputs={"question_sub_type": question.question_sub_type},
+                    quote=title,
+                ),
+            )
 
         return TagResult(
             value=matches,
             source="deterministic",
-            confidence=0.95 if "Anonymous-safe" not in matches else 1.0,
+            confidence=0.95,
+            evidence=ev.hybrid(
+                "question.data_sensitivity.pattern_match",
+                f"The question collects {len(matches)} kind(s) of personal or sensitive "
+                "data. Each entry below names the category and the pattern that "
+                "detected it \u2014 confidence is 0.95 rather than 1.0 because keyword "
+                "matching can misread context.",
+                components=why,
+                stage=3,
+                inputs={"question_sub_type": question.question_sub_type},
+            ),
         )
 
 

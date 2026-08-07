@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
@@ -53,15 +54,27 @@ class JourneyStageTagger(QuestionTagger):
 
         if q.is_content_message:
             return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence="Content message")
+                             evidence=ev.content_message("journey_stage", stage=5))
 
+        # The eligibility check returns its own typed evidence — the "why was
+        # this question skipped" answer people actually ask for.
         eligible, evidence = is_journey_eligible_metric(q)
         if not eligible:
             return TagResult(value=None, source="deterministic", status="skipped",
                              evidence=evidence)
 
-        return TagResult(value=None, source="llm", confidence=0.0, status="pending_llm",
-                         evidence="Requires LLM classification")
+        return TagResult(
+            value=None, source="llm", confidence=0.0, status="pending_llm",
+            evidence=ev.rule(
+                "question.journey_stage.awaiting_llm",
+                "Journey-eligible, so this tagger reserves the dimension and stops. "
+                "The value comes from LLM Call 2, which picks from the tenant's own "
+                "canon ranked by embedding similarity — a status of pending_llm in "
+                "the final output means that call never landed. The eligibility "
+                "reason is recorded on the assigned tag once it does.",
+                stage=5,
+            ),
+        )
 
 
 def create_tagger() -> JourneyStageTagger:

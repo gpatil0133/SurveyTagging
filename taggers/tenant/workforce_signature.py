@@ -10,6 +10,7 @@ Allowed values: Frontline-heavy / Knowledge / Hybrid / Field / Distributed / N/A
 
 from __future__ import annotations
 
+from models import evidence as ev
 from models.tags import TagResult
 from models.tenant_profile import TenantProfile
 from taggers.tenant.base import TenantTagger
@@ -53,7 +54,13 @@ class WorkforceSignatureTagger(TenantTagger):
                 value="N/A",
                 source="deterministic",
                 confidence=0.40,
-                evidence="No tenant_profile EX data available",
+                evidence=ev.fallback(
+                    "tenant.workforce.no_ex_profile",
+                    "No EX intelligence artifact on disk, so frontline ratio, work "
+                    "arrangement and workforce composition were all unavailable. "
+                    "N/A here means unknown.",
+                    inputs={"has_ex": False},
+                ),
             )
 
         frontline = tenant_profile.frontline_ratio or ""
@@ -73,7 +80,17 @@ class WorkforceSignatureTagger(TenantTagger):
                 value="Frontline-heavy",
                 source="deterministic",
                 confidence=conf_base,
-                evidence=f"frontline_ratio={frontline!r}, work_arrangement={arrangement!r}",
+                evidence=ev.profile(
+                    "tenant.workforce.frontline_high",
+                    "The EX profile describes a high frontline ratio. That outranks "
+                    "work arrangement here: a mostly-frontline workforce needs "
+                    "operational dashboards whether or not the office staff are hybrid.",
+                    field="ex.frontline_ratio",
+                    inputs={"frontline_ratio": frontline,
+                            "frontline_band": "high",
+                            "work_arrangement": arrangement or "(none)"},
+                    quote=frontline or None,
+                ),
             )
 
         # Otherwise honor explicit work arrangement signals
@@ -82,7 +99,16 @@ class WorkforceSignatureTagger(TenantTagger):
                 value=arr,
                 source="deterministic",
                 confidence=conf_base,
-                evidence=f"work_arrangement={arrangement!r}, frontline_ratio={frontline!r}",
+                evidence=ev.profile(
+                    "tenant.workforce.arrangement",
+                    f"Frontline ratio is not high, so the explicit work-arrangement "
+                    f"statement decides it and reads as {arr}.",
+                    field="ex.work_arrangement",
+                    inputs={"work_arrangement": arrangement,
+                            "frontline_ratio": frontline or "(none)",
+                            "frontline_band": band or "(unmatched)"},
+                    quote=arrangement or None,
+                ),
             )
 
         # Composition hints
@@ -92,23 +118,48 @@ class WorkforceSignatureTagger(TenantTagger):
                 value="Hybrid",
                 source="deterministic",
                 confidence=conf_base * 0.9,
-                evidence=f"Mixed frontline+knowledge — frontline_ratio={frontline!r}, composition={composition!r}",
+                evidence=ev.profile(
+                    "tenant.workforce.frontline_medium",
+                    "The frontline ratio reads as moderate/mixed and no explicit work "
+                    "arrangement was given, so the workforce is treated as a "
+                    "frontline-plus-knowledge blend.",
+                    field="ex.frontline_ratio",
+                    inputs={"frontline_ratio": frontline,
+                            "frontline_band": "medium",
+                            "workforce_composition": composition or "(none)"},
+                ),
             )
         if "knowledge" in composition_lower or "professional" in composition_lower or band == "low":
+            trigger = ("workforce_composition" if "knowledge" in composition_lower
+                       or "professional" in composition_lower else "frontline_ratio")
             return TagResult(
                 value="Knowledge",
                 source="deterministic",
                 confidence=conf_base,
-                evidence=f"composition={composition!r}, frontline_ratio={frontline!r}",
+                evidence=ev.profile(
+                    "tenant.workforce.knowledge",
+                    "The workforce reads as knowledge/professional — either the "
+                    "composition says so outright or the frontline ratio is low."
+                    f" Deciding field here was {trigger}.",
+                    field=f"ex.{trigger}",
+                    inputs={"workforce_composition": composition or "(none)",
+                            "frontline_ratio": frontline or "(none)",
+                            "frontline_band": band or "(unmatched)"},
+                ),
             )
 
         return TagResult(
             value="N/A",
             source="deterministic",
             confidence=0.50,
-            evidence=(
-                f"Unrecognized signals — composition={composition!r}, "
-                f"arrangement={arrangement!r}, frontline={frontline!r}"
+            evidence=ev.profile(
+                "tenant.workforce.unrecognized_signals",
+                "The EX profile exists but none of frontline ratio, work arrangement "
+                "or workforce composition matched the vocabulary this tagger reads.",
+                field="ex.workforce_composition",
+                inputs={"workforce_composition": composition or "(none)",
+                        "work_arrangement": arrangement or "(none)",
+                        "frontline_ratio": frontline or "(none)"},
             ),
         )
 

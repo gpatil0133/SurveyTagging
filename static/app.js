@@ -38,25 +38,31 @@ window.ST = window.ST || {};
   var LS = { corp: "st.corp", topView: "st.topview", profileJob: "st.profilejob" };
   var SS = { taxonomy: "st.taxonomy.v1" };
 
+  /* The platform shell's access token, written to same-origin localStorage on
+   * login and on every silent renewal. We only ever READ it: the shell owns the
+   * login and refresh lifecycle, and this app is one of several that ride along
+   * on the same key. Attached to every API call so the server can (a) work out
+   * which corp an embedded session belongs to and (b) forward the same token
+   * outbound to apismx and friends. Absent (plain ops use at localhost) is a
+   * normal state, not an error — the API is open. */
+  var TOKEN_KEY = "access_token";
+
   var ROUTES = {
     taxonomy:        function ()      { return "/api/taxonomy"; },
+    config:          function ()      { return "/api/config"; },
+    me:              function ()      { return "/api/me"; },
     shareHealth:     function ()      { return "/api/health/share"; },
     surveyList:      function (t)     { return "/api/tenants/" + t + "/tag-surveys"; },
     batchTag:        function (t)     { return "/api/tenants/" + t + "/tag-surveys"; },
-    batchRetag:      function (t)     { return "/api/tenants/" + t + "/retag-surveys"; },
     tenantTags:      function (t)     { return "/api/tenants/" + t + "/tags"; },
     tenantTagsBuild: function (t)     { return "/api/tenants/" + t + "/tag"; },   // NOTE: singular
     surveyTags:      function (t,s,jc){ return "/api/tenants/" + t + "/surveys/" + s + "/tags" +
                                                (jc ? "?include_journey_candidates=true" : ""); },
     tagSurvey:       function (t,s)   { return "/api/tenants/" + t + "/surveys/" + s + "/tag"; },
-    retagSurvey:     function (t,s)   { return "/api/tenants/" + t + "/surveys/" + s + "/retag"; },
-    adhoc:           function ()      { return "/api/tag"; },
     profile:         function (t)     { return "/api/tenants/" + t + "/profile"; },
     profileAgent:    function (t,a)   { return "/api/tenants/" + t + "/profile/" + a; },
     profileFetch:    function (t,bg)  { return "/api/tenants/" + t + "/profile/fetch" +
-                                               (bg ? "?background=true" : ""); },
-    autoretag:       function ()      { return "/api/admin/autoretag"; },
-    autoretagRun:    function ()      { return "/api/admin/autoretag/run-now"; }
+                                               (bg ? "?background=true" : ""); }
   };
 
   // A downed share surfaces as a Windows error code buried in a 500 detail, or
@@ -71,7 +77,7 @@ window.ST = window.ST || {};
 
   var state = {
     corpNo: null,
-    topView: "surveys",              // surveys | tenant | adhoc
+    topView: "surveys",              // surveys | tenant
 
     surveys: [],                     // [{survey_no, tagged: bool|null, provisional?}]
     surveyNames: {},                 // {survey_no: title} — backfilled lazily
@@ -94,25 +100,31 @@ window.ST = window.ST || {};
     tableCols: "present",
     expandedQuestions: new Set(),
 
-    tenantSection: "tags",           // tags | profile | batch | scheduler | taxonomy
+    tenantSection: "tags",           // tags | profile | batch | taxonomy
     tenantTags: null, tenantTagsError: null,
     profile: null, profileError: null,
     profileAgents: {},               // {org: envelope|"loading"|"missing"|"error: …"}
     profileJob: null,                // {startedAt, website, agents, polls}
     profileTimer: null,
-    batch: { running: false, force: false, startedAt: null, result: null,
+    batch: { running: false, startedAt: null, result: null,
              progress: null, timer: null },
-    scheduler: null, schedulerError: null,
-
-    adhoc: { busy: false, result: null, error: null },
 
     taxonomy: null,
+    // Server config from /api/config. Until it loads we assume the Parallel
+    // shape, which is the stricter of the two (needs a website), so the form
+    // can never submit something the server would reject.
+    config: { profile_source: "parallel", smx_allow_generate: true,
+              smx_generate_wait_seconds: 90 },
     busy: 0,
     slowWarn: false,
     banner: null,                    // {kind, text, actionsHtml}
     shareDown: false,
+    authExpired: false,              // a 401 came back — see showAuthExpired()
+    tokenCorpNo: null,               // corp_no the JWT claims, from /api/me
     toasts: [],
-    nextToastId: 1
+    nextToastId: 1,
+    ribbons: [],                     // [{id, text}] — stack; newest is on screen
+    nextRibbonId: 1
   };
 
   function persist() {
@@ -127,7 +139,7 @@ window.ST = window.ST || {};
   function restore() {
     try {
       var v = localStorage.getItem(LS.topView);
-      if (v === "surveys" || v === "tenant" || v === "adhoc") state.topView = v;
+      if (v === "surveys" || v === "tenant") state.topView = v;
       var job = localStorage.getItem(LS.profileJob);
       if (job) state.profileJob = JSON.parse(job);
       var tax = sessionStorage.getItem(SS.taxonomy);
@@ -142,7 +154,7 @@ window.ST = window.ST || {};
   var el = {};
   function grabDom() {
     ["corpForm","corpInput","corpBtn","surveyForm","surveyInput","surveyBtn",
-     "topStatus","busybar","topTabs","navSearch","navFilters","sidebarHeading",
+     "topStatus","busybar","ribbon","topTabs","navSearch","navFilters","sidebarHeading",
      "nav","workspace","banner","content","toasts"].forEach(function (id) {
       el[id] = document.getElementById(id);
     });
@@ -167,6 +179,19 @@ window.ST = window.ST || {};
     return fallback || "";
   }
 
+  /* Re-read on every call rather than caching: the shell rewrites the key on
+   * each silent renewal, and a sibling tab's renewal has to be picked up too.
+   * A blank/whitespace value is the same as missing — `Bearer ` with nothing
+   * after it is never a token the server can do anything with. */
+  function readToken() {
+    try {
+      var raw = localStorage.getItem(TOKEN_KEY);
+      if (typeof raw !== "string") return null;
+      raw = raw.trim();
+      return raw.length ? raw : null;
+    } catch (e) { return null; }   // private mode / storage disabled
+  }
+
   function isShareError(res) {
     if (!res) return false;
     if (res.netError) return true;
@@ -176,7 +201,7 @@ window.ST = window.ST || {};
 
   /* Never throws on an HTTP status — the caller branches on `.status`.
    * `timeoutMs: null` disables the abort entirely; pass it for every
-   * long-running POST (tag, retag, batch, sync profile fetch, run-now),
+   * long-running POST (tag, batch, sync profile fetch),
    * otherwise the default would abort exactly the calls that matter. */
   function api(url, opts) {
     opts = opts || {};
@@ -190,6 +215,9 @@ window.ST = window.ST || {};
     }
     if (opts.form) init.body = opts.form;
     if (opts.etag) init.headers["If-None-Match"] = opts.etag;
+
+    var token = readToken();
+    if (token) init.headers["Authorization"] = "Bearer " + token;
 
     var ctrl = null;
     var timer = null;
@@ -229,7 +257,8 @@ window.ST = window.ST || {};
   /* Wrap any call so share failures raise the persistent banner rather than
    * hiding inside a per-section error. */
   function guarded(res) {
-    if (isShareError(res)) showShareDown(res.detail);
+    if (res && res.status === 401) showAuthExpired();
+    else if (isShareError(res)) showShareDown(res.detail);
     else if (state.shareDown && res.ok) clearShareDown();
     return res;
   }
@@ -239,7 +268,7 @@ window.ST = window.ST || {};
    * ================================================================== */
 
   /* Two payload shapes reach the UI:
-   *   POST .../tag|retag -> body.tagged = raw tagged_output.json
+   *   POST .../tag -> body.tagged = raw tagged_output.json
    *                         (question_tags[], question_title_preview, no survey_journey)
    *   GET  .../tags      -> the projection from projections/survey_view.py
    *                         (questions[], question_text, survey_journey)
@@ -315,6 +344,44 @@ window.ST = window.ST || {};
     if (state.slowWarn === on) return;
     state.slowWarn = on;
     renderTopStatus();
+    renderRibbon();
+  }
+
+  /* ---- floating activity ribbon ----
+   * The 2px busybar says "something is happening"; the ribbon says what. Calls
+   * nest, so it is a stack: the newest job is the one on screen and the ribbon
+   * only disappears once every job that opened it has closed. Always pair
+   * ribbonStart with ribbonStop in the same `.then` that clears setBusy. */
+  function ribbonStart(text) {
+    var job = { id: state.nextRibbonId++, text: text };
+    state.ribbons.push(job);
+    renderRibbon();
+    return job.id;
+  }
+
+  function ribbonStop(id) {
+    if (id == null) return;
+    var before = state.ribbons.length;
+    state.ribbons = state.ribbons.filter(function (r) { return r.id !== id; });
+    if (state.ribbons.length !== before) renderRibbon();
+  }
+
+  function renderRibbon() {
+    var top = state.ribbons[state.ribbons.length - 1];
+    if (!top) {
+      el.ribbon.hidden = true;
+      el.ribbon.innerHTML = "";
+      el.ribbon.className = "";
+      return;
+    }
+    var extra = state.ribbons.length - 1;
+    el.ribbon.className = state.slowWarn ? "slow" : "";
+    el.ribbon.innerHTML =
+      '<span class="spinner"></span>' +
+      '<span class="ribbon-text">' + U.escapeHtml(top.text) +
+      (state.slowWarn ? " — still waiting on the network share" : "") + "</span>" +
+      (extra > 0 ? '<span class="ribbon-more">+' + extra + "</span>" : "");
+    el.ribbon.hidden = false;
   }
 
   function showShareDown(detail) {
@@ -332,6 +399,23 @@ window.ST = window.ST || {};
     if (!state.shareDown) return;
     state.shareDown = false;
     state.banner = null;
+    renderBanner();
+  }
+
+  /* A 401 means the token in localStorage is gone, expired, or rejected. We do
+   * not refresh it ourselves — the shell owns that lifecycle and rotates the
+   * key we read — so the honest move is to say so and let the user reload,
+   * which picks up whatever the shell has written since. Distinct from the
+   * share banner: nothing is wrong with the server or the share. */
+  function showAuthExpired() {
+    if (state.authExpired) return;      // one banner, not one per in-flight call
+    state.authExpired = true;
+    state.banner = {
+      kind: "lc-banner",
+      text: "Your session has expired or is not recognized. Reload the page to " +
+            "pick up a fresh sign-in.",
+      actionsHtml: '<button class="btn sm" data-action="reload-page">Reload</button>'
+    };
     renderBanner();
   }
 
@@ -394,7 +478,6 @@ window.ST = window.ST || {};
     { key: "tags",     label: "Tenant Tags" },
     { key: "profile",  label: "Tenant Profile" },
     { key: "batch",    label: "Batch Tagging" },
-    { key: "scheduler",label: "Scheduler" },
     { key: "taxonomy", label: "Taxonomy" }
   ];
 
@@ -410,13 +493,6 @@ window.ST = window.ST || {};
                '" data-action="set-tenant-section" data-section="' + s.key + '">' +
                '<span class="stitle">' + s.label + "</span></li>";
       }).join("");
-      return;
-    }
-
-    if (state.topView === "adhoc") {
-      el.sidebarHeading.textContent = "Ad-hoc";
-      el.nav.innerHTML = '<li class="survey-item" style="cursor:default">' +
-        '<span class="stitle">No corp needed — paste or upload a survey JSON.</span></li>';
       return;
     }
 
@@ -487,7 +563,6 @@ window.ST = window.ST || {};
   }
 
   function renderWorkspace() {
-    if (state.topView === "adhoc") return renderAdhoc();
     if (state.topView === "tenant") return renderTenant();
     return renderSurveys();
   }
@@ -535,7 +610,6 @@ window.ST = window.ST || {};
           "Nothing has been written to this survey's folder on the share.",
           '<div class="btn-row">' +
           '<button class="btn primary" data-action="tag-survey" data-survey-no="' + no + '">Tag survey</button>' +
-          '<button class="btn" data-action="retag-survey" data-survey-no="' + no + '">Force re-tag</button>' +
           "</div>");
       } else {
         el.content.innerHTML = R.errorState(
@@ -560,7 +634,6 @@ window.ST = window.ST || {};
       '<div class="section-head"><div class="survey-header">' +
       R.surveyHeader(state.survey) + "</div>" +
       '<div class="btn-row">' +
-      '<button class="btn" data-action="retag-survey" data-survey-no="' + state.activeSurveyNo + '">Force re-tag</button>' +
       '<button class="btn ghost" data-action="download-json" data-what="survey">Download JSON</button>' +
       '<button class="btn danger sm" data-action="delete-survey-tags" data-survey-no="' + state.activeSurveyNo + '">Delete tags</button>' +
       "</div></div>" +
@@ -581,22 +654,42 @@ window.ST = window.ST || {};
     return R.filterBar(state, {}) + R.projectTags(s, state);
   }
 
-  /* The filter chips and expand/collapse act on whichever survey is on screen —
-   * the loaded one, or the ad-hoc result. */
+  /* The filter chips and expand/collapse act on the survey that is on screen. */
   function currentSurvey() {
-    if (state.topView === "adhoc") return state.adhoc.result || { question_tags: [] };
     return state.survey || { question_tags: [] };
   }
 
-  // Repaint only the results region so the filter inputs keep focus and caret.
+  /* Repaint only the results region so the filter inputs keep focus and caret.
+   * The workspace is the scroll container, and swapping innerHTML collapses its
+   * content height for an instant, which makes the browser clamp scrollTop to
+   * 0 — so the position is saved and restored around the swap. */
   function renderTabBody() {
-    var body = document.getElementById("tabBody") || document.getElementById("adhocResult");
+    var body = document.getElementById("tabBody");
     if (!body) return renderWorkspace();
+    var scroll = el.workspace.scrollTop;
     var qs = document.getElementById("qSearch");
     var caret = qs ? qs.selectionStart : null;
-    body.innerHTML = body.id === "adhocResult" ? adhocResultHtml() : surveyTabBody(state.activeTab);
+    body.innerHTML = surveyTabBody(state.activeTab);
+    el.workspace.scrollTop = scroll;
     var qs2 = document.getElementById("qSearch");
     if (qs2 && caret != null) { qs2.focus(); try { qs2.setSelectionRange(caret, caret); } catch (e) {} }
+  }
+
+  /* Expand / collapse mutates the cards already on screen instead of
+   * re-rendering the list. Nothing about which questions are *shown* changes,
+   * so a rebuild would only cost a reflow and risk the scroll jumping. */
+  function questionCardNodes() {
+    var body = document.getElementById("tabBody");
+    if (!body) return [];
+    return Array.prototype.filter.call(
+      body.querySelectorAll(".question-card"),
+      function (card) { return !!card.querySelector(".tags-wrap"); });   // content messages have none
+  }
+
+  function applyExpansion(open) {
+    var cards = questionCardNodes();
+    if (!cards.length) { renderTabBody(); return; }
+    cards.forEach(function (card) { card.classList.toggle("expanded", open); });
   }
 
   /* ==================================================================
@@ -610,7 +703,7 @@ window.ST = window.ST || {};
       return;
     }
     var fn = { tags: tenantTagsHtml, profile: profileHtml, batch: batchHtml,
-               scheduler: schedulerHtml, taxonomy: taxonomyHtml }[state.tenantSection];
+               taxonomy: taxonomyHtml }[state.tenantSection];
     el.content.innerHTML = fn ? fn() : "";
   }
 
@@ -647,27 +740,59 @@ window.ST = window.ST || {};
       '<button class="btn ghost" data-action="download-json" data-what="profile">Download JSON</button>' +
       '<button class="btn danger sm" data-action="profile-delete">Delete artifacts</button></div></div>';
 
-    var form =
-      '<div class="tenant-panel"><h3>Fetch from Parallel.ai</h3>' +
-      '<p class="micro" style="margin-top:0">Takes 10–30 minutes. Runs in the ' +
-      'background by default; progress is inferred from artifacts appearing on disk.</p>' +
-      '<div class="form-grid">' +
-      '<div class="field"><label for="pfWebsite">Website</label>' +
-      '<input type="text" id="pfWebsite" placeholder="https://acme.com" /></div>' +
+    var isSmx = state.config.profile_source === "smx";
+    var agentBoxes =
       '<div class="field"><label>Agents</label><div class="btn-row">' +
       AGENTS.map(function (a) {
         return '<label class="checkline"><input type="checkbox" class="pfAgent" value="' +
                a + '" checked /> ' + a + "</label>";
-      }).join("") + "</div></div>" +
+      }).join("") + "</div></div>";
+    var forceBox =
       '<div class="field"><label>Options</label>' +
-      '<label class="checkline"><input type="checkbox" id="pfForce" /> Force refresh (ignore cached artifacts)</label></div>' +
-      "</div>" +
-      '<div class="btn-row" style="margin-top:12px">' +
-      '<button class="btn primary" data-action="profile-fetch"' +
-      (state.profileJob ? " disabled" : "") + ">Fetch in background</button>" +
-      '<button class="btn ghost" data-action="profile-fetch-sync"' +
-      (state.profileJob ? " disabled" : "") + ">Run synchronously (blocks up to 30 min)</button>" +
-      "</div></div>";
+      '<label class="checkline"><input type="checkbox" id="pfForce" /> ' +
+      "Force refresh (ignore cached artifacts)</label>";
+
+    var form;
+    if (isSmx) {
+      // SMX resolves in three steps and needs no website — the Research API
+      // already knows the tenant's URL.
+      form =
+        '<div class="tenant-panel"><h3>Resolve from SoGo Research API</h3>' +
+        '<ol class="micro" style="margin:4px 0 10px 18px">' +
+        "<li>Artifacts already on the image server &rarr; used as-is</li>" +
+        "<li>Otherwise read the generated profile from apismx</li>" +
+        "<li>Otherwise trigger generation, then wait ~" +
+        (state.config.smx_generate_wait_seconds || 90) + "s for it</li></ol>" +
+        '<div class="form-grid">' + agentBoxes + forceBox +
+        (state.config.smx_allow_generate
+          ? '<label class="checkline"><input type="checkbox" id="pfGenerate" checked /> ' +
+            "Generate if missing (starts research)</label>"
+          : '<p class="micro">Generation is disabled server-side ' +
+            "(SMX_ALLOW_GENERATE=false).</p>") +
+        "</div></div>" +
+        '<div class="btn-row" style="margin-top:12px">' +
+        '<button class="btn primary" data-action="profile-fetch-sync"' +
+        (state.profileJob ? " disabled" : "") + ">Resolve profile</button>" +
+        '<button class="btn ghost" data-action="profile-fetch"' +
+        (state.profileJob ? " disabled" : "") + ">Resolve in background</button>" +
+        "</div></div>";
+    } else {
+      form =
+        '<div class="tenant-panel"><h3>Fetch from Parallel.ai</h3>' +
+        '<p class="micro" style="margin-top:0">Takes 10–30 minutes. Runs in the ' +
+        'background by default; progress is inferred from artifacts appearing on disk.</p>' +
+        '<div class="form-grid">' +
+        '<div class="field"><label for="pfWebsite">Website</label>' +
+        '<input type="text" id="pfWebsite" placeholder="https://acme.com" /></div>' +
+        agentBoxes + forceBox + "</div>" +
+        "</div>" +
+        '<div class="btn-row" style="margin-top:12px">' +
+        '<button class="btn primary" data-action="profile-fetch"' +
+        (state.profileJob ? " disabled" : "") + ">Fetch in background</button>" +
+        '<button class="btn ghost" data-action="profile-fetch-sync"' +
+        (state.profileJob ? " disabled" : "") + ">Run synchronously (blocks up to 30 min)</button>" +
+        "</div></div>";
+    }
 
     var body;
     if (state.profileError && state.profileError.status === 404) {
@@ -687,9 +812,7 @@ window.ST = window.ST || {};
     var running = state.batch.running;
     var head = '<div class="section-head"><h2>Batch Tagging</h2><div class="btn-row">' +
       '<button class="btn primary" data-action="batch-tag"' + (running ? " disabled" : "") +
-      ">Tag all surveys</button>" +
-      '<button class="btn" data-action="batch-retag"' + (running ? " disabled" : "") +
-      ">Force re-tag all</button></div></div>";
+      ">Tag all surveys</button></div></div>";
 
     var note = '<p class="micro">Incremental by default — surveys whose inputs are ' +
       'unchanged since the last run are skipped. The progress bar counts ' +
@@ -710,26 +833,6 @@ window.ST = window.ST || {};
       "Tag every survey under corp " + state.corpNo + ".", "");
   }
 
-  function schedulerHtml() {
-    var head = '<div class="section-head"><h2>Auto-retag Scheduler</h2><div class="btn-row">' +
-      '<button class="btn" data-action="scheduler-refresh">Refresh</button>' +
-      '<button class="btn danger" data-action="scheduler-run-now">Run scan now</button></div></div>';
-    var warn = '<div class="lc-banner warn"><span>A scan walks <em>every</em> tenant ' +
-      "on the share, not just this corp.</span></div>";
-    if (state.schedulerError) {
-      return head + warn + R.errorState("Scheduler unavailable",
-        state.schedulerError.detail, "scheduler-refresh");
-    }
-    if (!state.scheduler) return head + warn + R.emptyState("Loading…", "", "");
-    var s = state.scheduler;
-    var rows = Object.keys(s).map(function (k) {
-      var v = s[k];
-      var txt = (v && typeof v === "object") ? JSON.stringify(v) : String(v);
-      return "<dt>" + U.escapeHtml(U.labelFor(k)) + "</dt><dd>" + U.escapeHtml(txt) + "</dd>";
-    }).join("");
-    return head + warn + '<div class="tenant-panel"><dl class="kv-list">' + rows + "</dl></div>";
-  }
-
   function taxonomyHtml() {
     var head = '<div class="section-head"><h2>Taxonomy</h2></div>';
     if (!state.taxonomy) {
@@ -741,57 +844,36 @@ window.ST = window.ST || {};
   }
 
   /* ==================================================================
-   * 10. AD-HOC
-   * ================================================================== */
-
-  function renderAdhoc() {
-    el.content.innerHTML =
-      '<div class="section-head"><h2>Ad-hoc tagging</h2></div>' +
-      '<p class="micro">Tags a survey JSON in memory. Deterministic only — there ' +
-      'is no tenant on disk, so no canon, no LLM, and nothing is persisted.</p>' +
-      '<form id="adhocForm" class="tenant-panel">' +
-      '<div class="field"><label for="adhocText">Paste survey_structure.json</label>' +
-      '<textarea id="adhocText" class="code" placeholder="{ &quot;SurveyData&quot;: [ … ] }"></textarea></div>' +
-      '<div class="field" style="margin-top:12px"><label for="adhocFile">…or upload a file</label>' +
-      '<input type="file" id="adhocFile" accept=".json,application/json" /></div>' +
-      '<div class="form-grid" style="margin-top:12px">' +
-      ["industry", "company_name", "department", "purpose", "country"].map(function (f) {
-        return '<div class="field"><label for="ad_' + f + '">' +
-               U.escapeHtml(U.labelFor(f)) + " <span class=\"micro\">(optional)</span></label>" +
-               '<input type="text" id="ad_' + f + '" /></div>';
-      }).join("") + "</div>" +
-      '<div class="btn-row" style="margin-top:14px">' +
-      '<button type="submit" class="btn primary"' + (state.adhoc.busy ? " disabled" : "") + ">Tag</button>" +
-      '<button type="button" class="btn ghost" data-action="adhoc-clear">Clear</button>' +
-      (state.adhoc.result
-        ? '<button type="button" class="btn ghost" data-action="download-json" data-what="adhoc">Download JSON</button>'
-        : "") +
-      "</div>" +
-      (state.adhoc.error
-        ? '<div class="lc-banner" style="margin-top:12px"><span>' +
-          U.escapeHtml(state.adhoc.error) + "</span></div>"
-        : "") +
-      "</form>" +
-      '<div id="adhocResult">' + adhocResultHtml() + "</div>";
-  }
-
-  function adhocResultHtml() {
-    if (!state.adhoc.result) return "";
-    var s = state.adhoc.result;
-    return '<div class="survey-header">' + R.surveyHeader(s) + "</div>" +
-      R.filterBar(state, { questionControls: true, columnControls: true }) +
-      R.projectTags(s, state) +
-      '<h3 style="margin-top:24px">Questions</h3>' +
-      R.questions(s, state);
-  }
-
-  /* ==================================================================
-   * 11. CONTROLLERS
+   * 10. CONTROLLERS
    * ================================================================== */
 
   function validNumber(raw) {
     var v = String(raw == null ? "" : raw).trim();
     return /^\d+$/.test(v) ? Number(v) : null;
+  }
+
+  function loadConfig() {
+    return api(ROUTES.config()).then(function (r) {
+      // Degrade, don't break: the defaults in state.config describe the
+      // Parallel workflow, which is the stricter form of the two.
+      if (!r.ok || !r.data) return;
+      state.config = {
+        profile_source: r.data.profile_source || "parallel",
+        smx_allow_generate: r.data.smx_allow_generate !== false,
+        smx_generate_wait_seconds: r.data.smx_generate_wait_seconds || 90
+      };
+    });
+  }
+
+  /* Who does the server think we are, per the token we just sent? Only used to
+   * answer "which corp?" when nothing else has. Never rejects: no token, or a
+   * token with no corp claim, is the ordinary ops case where the number is
+   * typed in by hand. */
+  function loadMe() {
+    return api(ROUTES.me()).then(function (r) {
+      if (!r.ok || !r.data) return;
+      state.tokenCorpNo = validNumber(r.data.corp_no);
+    });
   }
 
   function loadTaxonomy() {
@@ -827,9 +909,13 @@ window.ST = window.ST || {};
   function loadSurveyList(opts) {
     opts = opts || {};
     if (!state.corpNo) return Promise.resolve();
-    if (!opts.quiet) setBusy(1);
+    var rib = null;
+    if (!opts.quiet) {
+      setBusy(1);
+      rib = ribbonStart("Fetching surveys for corp " + state.corpNo + "…");
+    }
     return api(ROUTES.surveyList(state.corpNo)).then(guarded).then(function (r) {
-      if (!opts.quiet) setBusy(-1);
+      if (!opts.quiet) { setBusy(-1); ribbonStop(rib); }
       if (r.status === 404) {
         // Empty state, not an error — the corp may simply have no surveys.
         state.surveys = []; state.surveysLoaded = true;
@@ -876,9 +962,10 @@ window.ST = window.ST || {};
     var key = etagKey(no);
     var etag = opts.bustEtag ? null : state.etags[key];
     setBusy(1);
+    var rib = ribbonStart("Loading survey " + no + "…");
     return api(ROUTES.surveyTags(state.corpNo, no, state.includeCandidates), { etag: etag })
       .then(guarded).then(function (r) {
-        setBusy(-1);
+        setBusy(-1); ribbonStop(rib);
         if (r.status === 304) return r;          // cached view is current
         if (r.status === 404) {
           state.survey = null;
@@ -905,14 +992,14 @@ window.ST = window.ST || {};
     });
   }
 
-  function tagSurvey(no, force) {
+  function tagSurvey(no) {
     if (no == null || !state.corpNo) return;
     setBusy(1);
-    var id = toast("info", (force ? "Re-tagging" : "Tagging") + " survey " + no + "…", true);
-    var url = force ? ROUTES.retagSurvey(state.corpNo, no) : ROUTES.tagSurvey(state.corpNo, no);
+    var rib = ribbonStart("Tagging survey " + no + " — this can take 30–90s…");
+    var url = ROUTES.tagSurvey(state.corpNo, no);
     // No timeout: a full LLM pass takes 30-90s.
     return api(url, { method: "POST", timeoutMs: null }).then(guarded).then(function (r) {
-      setBusy(-1); dismissToast(id);
+      setBusy(-1); ribbonStop(rib);
       if (!r.ok) {
         toast("err", "Tag failed: " + (r.detail || r.status), true);
         state.surveyError = { status: r.status, detail: r.detail };
@@ -960,8 +1047,9 @@ window.ST = window.ST || {};
 
   function loadTenantTags() {
     setBusy(1);
+    var rib = ribbonStart("Loading tenant tags for corp " + state.corpNo + "…");
     return api(ROUTES.tenantTags(state.corpNo)).then(guarded).then(function (r) {
-      setBusy(-1);
+      setBusy(-1); ribbonStop(rib);
       state.tenantTags = r.ok ? r.data : null;
       state.tenantTagsError = r.ok ? null : { status: r.status, detail: r.detail };
       renderTenant();
@@ -970,10 +1058,10 @@ window.ST = window.ST || {};
 
   function buildTenantTags() {
     setBusy(1);
-    var id = toast("info", "Building tenant tags…", true);
+    var rib = ribbonStart("Building tenant tags for corp " + state.corpNo + "…");
     return api(ROUTES.tenantTagsBuild(state.corpNo), { method: "POST", timeoutMs: null })
       .then(guarded).then(function (r) {
-        setBusy(-1); dismissToast(id);
+        setBusy(-1); ribbonStop(rib);
         if (!r.ok) {
           state.tenantTagsError = { status: r.status, detail: r.detail };
           state.tenantTags = null;
@@ -1006,9 +1094,13 @@ window.ST = window.ST || {};
 
   function loadProfile(opts) {
     opts = opts || {};
-    if (!opts.quiet) setBusy(1);
+    var rib = null;
+    if (!opts.quiet) {
+      setBusy(1);
+      rib = ribbonStart("Loading tenant profile for corp " + state.corpNo + "…");
+    }
     return api(ROUTES.profile(state.corpNo)).then(guarded).then(function (r) {
-      if (!opts.quiet) setBusy(-1);
+      if (!opts.quiet) { setBusy(-1); ribbonStop(rib); }
       state.profile = r.ok ? r.data : null;
       state.profileError = r.ok ? null : { status: r.status, detail: r.detail };
       if (r.ok) {
@@ -1036,36 +1128,80 @@ window.ST = window.ST || {};
     });
   }
 
+  // Which step of the share -> apismx -> generate cascade produced the profile.
+  // Worth surfacing: "found on the share" and "generated fresh research" cost
+  // wildly different things, and the counts alone cannot tell them apart.
+  var RESOLVED_VIA = {
+    disk:      "already on the image server",
+    smx:       "read from apismx",
+    generated: "generated via apismx"
+  };
+
+  function profileOutcomeText(d, c) {
+    var via = RESOLVED_VIA[d.resolved_via];
+    return "Profile ready" + (via ? " — " + via : "") + ". " +
+           "Fetched " + (c.fetched || 0) + ", cached " + (c.cache_hits || 0) +
+           ", failed " + (c.failures || 0) + ".";
+  }
+
   function collectProfileForm() {
     var website = (document.getElementById("pfWebsite") || {}).value || "";
     var agents = Array.prototype.slice
       .call(document.querySelectorAll(".pfAgent:checked"))
       .map(function (n) { return n.value; });
     var force = !!(document.getElementById("pfForce") || {}).checked;
-    return { website: website.trim(), agents: agents, force: force };
+    var genBox = document.getElementById("pfGenerate");
+    return {
+      website: website.trim(), agents: agents, force: force,
+      // Absent checkbox (generation disabled server-side) must read as false,
+      // not as the default-true the API would otherwise apply.
+      allowGenerate: !!(genBox && genBox.checked)
+    };
   }
 
   function startProfileFetch(background) {
+    var isSmx = state.config.profile_source === "smx";
     var f = collectProfileForm();
-    if (f.website.length < 4) { toast("err", "Enter the tenant website first.", true); return; }
+    if (!isSmx && f.website.length < 4) {
+      toast("err", "Enter the tenant website first.", true); return;
+    }
     if (!f.agents.length) { toast("err", "Pick at least one agent.", true); return; }
-    if (!background && !window.confirm(
+    if (!background && !isSmx && !window.confirm(
       "Run synchronously? This blocks for up to 30 minutes. Background mode is " +
       "usually what you want.")) return;
+    if (!background && isSmx && f.allowGenerate && !window.confirm(
+      "If this tenant has no profile on the share or in SMX, research will be " +
+      "generated for it. Continue?")) return;
 
-    var body = { website: f.website, agents: f.agents, force: f.force };
+    var body = { website: f.website, agents: f.agents, force: f.force,
+                 allow_generate: isSmx ? f.allowGenerate : true };
 
     if (!background) {
       setBusy(1);
-      var id = toast("info", "Profile fetch running synchronously — this can take 30 minutes…", true);
+      var msg = isSmx
+        ? "Resolving profile — share, then apismx, then generate…"
+        : "Profile fetch running synchronously — this can take 30 minutes…";
+      var rib = ribbonStart(msg);
       return api(ROUTES.profileFetch(state.corpNo, false),
                  { method: "POST", json: body, timeoutMs: null })
         .then(guarded).then(function (r) {
-          setBusy(-1); dismissToast(id);
+          setBusy(-1); ribbonStop(rib);
           if (!r.ok) { toast("err", "Fetch failed: " + r.detail, true); return; }
-          var c = (r.data && r.data.counts) || {};
-          toast("ok", "Fetched " + (c.fetched || 0) + ", cached " + (c.cache_hits || 0) +
-                      ", failed " + (c.failures || 0) + ".");
+          var d = r.data || {};
+          if (d.pending) {
+            // Generation started but did not finish inside the server's wait
+            // window. It is still running there, so hand off to the same poller
+            // the background path uses instead of reporting a failure.
+            toast("info", d.detail || "Generation still running — watching for artifacts…", true);
+            state.profileJob = { corpNo: state.corpNo, startedAt: Date.now(),
+                                 agents: f.agents, polls: 0 };
+            persist();
+            startProfilePoll();
+            renderAll();
+            return;
+          }
+          var c = d.counts || {};
+          toast("ok", profileOutcomeText(d, c));
           state.profileAgents = {};
           return loadProfile();
         });
@@ -1140,10 +1276,9 @@ window.ST = window.ST || {};
 
   // ---- batch ----
 
-  function runBatch(force) {
+  function runBatch() {
     if (state.batch.running) return;
     state.batch.running = true;
-    state.batch.force = force;
     state.batch.startedAt = Date.now();
     state.batch.result = null;
     state.batch.progress = { tagged: state.surveys.filter(function (s) { return s.tagged; }).length,
@@ -1155,7 +1290,7 @@ window.ST = window.ST || {};
     // real determinate progress bar with no backend support needed.
     state.batch.timer = setInterval(pollBatchProgress, POLL_BATCH_MS);
 
-    var url = force ? ROUTES.batchRetag(state.corpNo) : ROUTES.batchTag(state.corpNo);
+    var url = ROUTES.batchTag(state.corpNo);
     return api(url, { method: "POST", timeoutMs: null }).then(guarded).then(function (r) {
       stopBatchPoll(true);
       state.batch.running = false;
@@ -1192,83 +1327,6 @@ window.ST = window.ST || {};
     }
   }
 
-  // ---- scheduler ----
-
-  function loadScheduler() {
-    setBusy(1);
-    return api(ROUTES.autoretag()).then(function (r) {
-      setBusy(-1);
-      state.scheduler = r.ok ? r.data : null;
-      state.schedulerError = r.ok ? null : { status: r.status, detail: r.detail };
-      renderTenant();
-    });
-  }
-
-  function runScanNow() {
-    if (!window.confirm(
-      "Run a change-scan now? This walks EVERY tenant on the share, not just " +
-      "corp " + state.corpNo + ".")) return;
-    setBusy(1);
-    var id = toast("info", "Scanning…", true);
-    return api(ROUTES.autoretagRun(), { method: "POST", timeoutMs: null })
-      .then(guarded).then(function (r) {
-        setBusy(-1); dismissToast(id);
-        if (!r.ok) { toast(r.status === 503 ? "info" : "err", r.detail || "Scan failed", true); return; }
-        toast("ok", "Scan complete.");
-        state.scheduler = r.data;
-        renderTenant();
-      });
-  }
-
-  // ---- ad-hoc ----
-
-  function submitAdhoc() {
-    var text = (document.getElementById("adhocText") || {}).value || "";
-    var fileInput = document.getElementById("adhocFile");
-    var file = fileInput && fileInput.files && fileInput.files[0];
-
-    if (!file && !text.trim()) {
-      state.adhoc.error = "Paste JSON or choose a file first.";
-      renderAdhoc(); return;
-    }
-    if (!file && text.trim()) {
-      // Catch obvious syntax errors client-side rather than round-tripping.
-      try { JSON.parse(text); }
-      catch (e) { state.adhoc.error = "Invalid JSON: " + e.message; renderAdhoc(); return; }
-    }
-
-    var fd = new FormData();
-    if (file) fd.append("survey_file", file);
-    if (text.trim()) fd.append("survey_text", text);
-    ["industry", "company_name", "department", "purpose", "country"].forEach(function (f) {
-      var node = document.getElementById("ad_" + f);
-      if (node && node.value.trim()) fd.append(f, node.value.trim());
-    });
-
-    state.adhoc.busy = true; state.adhoc.error = null;
-    setBusy(1);
-    return api(ROUTES.adhoc(), { method: "POST", form: fd, timeoutMs: null })
-      .then(function (r) {
-        setBusy(-1);
-        state.adhoc.busy = false;
-        if (!r.ok) {
-          state.adhoc.error = r.detail || ("Request failed (" + r.status + ")");
-          state.adhoc.result = null;
-          toast("err", state.adhoc.error, true);
-        } else {
-          state.adhoc.result = normalizeTagged(r.data);
-          state.adhoc.error = null;
-          toast("ok", "Tagged.");
-        }
-        renderAdhoc();
-      });
-  }
-
-  function resetAdhoc() {
-    state.adhoc = { busy: false, result: null, error: null };
-    renderAdhoc();
-  }
-
   // ---- download ----
 
   function downloadJson(what) {
@@ -1280,8 +1338,6 @@ window.ST = window.ST || {};
       payload = state.tenantTags; name = "tenant_tags_" + state.corpNo + ".json";
     } else if (what === "profile" && state.profile) {
       payload = state.profile; name = "tenant_profile_" + state.corpNo + ".json";
-    } else if (what === "adhoc" && state.adhoc.result) {
-      payload = state.adhoc.result; name = "adhoc_tagged.json";
     }
     if (!payload) { toast("info", "Nothing to download yet."); return; }
 
@@ -1306,7 +1362,7 @@ window.ST = window.ST || {};
   }
 
   /* ==================================================================
-   * 12. DISPATCH
+   * 11. DISPATCH
    * ================================================================== */
 
   var ACTIONS = {
@@ -1329,11 +1385,11 @@ window.ST = window.ST || {};
     "retry-share": function () {
       checkShare().then(function (ok) { if (ok && state.corpNo) loadSurveyList(); });
     },
+    "reload-page": function () { window.location.reload(); },
     "retry-survey": function () { loadSurveyView(state.activeSurveyNo, { bustEtag: true }); },
     "reload-taxonomy": function () { loadTaxonomy().then(renderAll); },
 
-    "tag-survey": function (n) { tagSurvey(Number(n.dataset.surveyNo), false); },
-    "retag-survey": function (n) { tagSurvey(Number(n.dataset.surveyNo), true); },
+    "tag-survey": function (n) { tagSurvey(Number(n.dataset.surveyNo)); },
     "delete-survey-tags": function (n) { deleteSurveyTags(Number(n.dataset.surveyNo)); },
     "toggle-candidates": function () {
       state.includeCandidates = !state.includeCandidates;
@@ -1357,9 +1413,14 @@ window.ST = window.ST || {};
     "set-cols": function (n) { state.tableCols = n.dataset.cols; renderTabBody(); },
     "toggle-q": function (n) {
       var q = n.dataset.q;
-      if (state.expandedQuestions.has(q)) state.expandedQuestions.delete(q);
-      else state.expandedQuestions.add(q);
-      renderTabBody();
+      var open = !state.expandedQuestions.has(q);
+      if (open) state.expandedQuestions.add(q);
+      else state.expandedQuestions.delete(q);
+      // Toggle the card in place. Re-rendering the whole list would rebuild
+      // every sibling and drop the scroll position back to the top.
+      var card = n.closest(".question-card");
+      if (card) card.classList.toggle("expanded", open);
+      else renderTabBody();
     },
     "expand-all": function () {
       var list = currentSurvey().question_tags || [];
@@ -1368,9 +1429,9 @@ window.ST = window.ST || {};
         state.expandedQuestions.add(
           String(q.question_id != null ? q.question_id : (q.question_no == null ? "" : q.question_no)));
       });
-      renderTabBody();
+      applyExpansion(true);
     },
-    "collapse-all": function () { state.expandedQuestions.clear(); renderTabBody(); },
+    "collapse-all": function () { state.expandedQuestions.clear(); applyExpansion(false); },
 
     "build-tenant-tags": function () { buildTenantTags(); },
     "tag-tenant": function () { buildTenantTags(); },
@@ -1387,15 +1448,10 @@ window.ST = window.ST || {};
     "profile-delete": function () { deleteProfile(); },
     "load-agent": function (n) { loadAgent(n.dataset.agent); },
 
-    "batch-tag": function () { runBatch(false); },
-    "batch-retag": function () { runBatch(true); },
+    "batch-tag": function () { runBatch(); },
     "batch-stop-watch": function () { stopBatchPoll(false); },
 
-    "scheduler-refresh": function () { loadScheduler(); },
-    "scheduler-run-now": function () { runScanNow(); },
-
     "download-json": function (n) { downloadJson(n.dataset.what); },
-    "adhoc-clear": function () { resetAdhoc(); },
     "toast-dismiss": function (n) { dismissToast(Number(n.dataset.toastId)); }
   };
 
@@ -1404,7 +1460,6 @@ window.ST = window.ST || {};
     var s = state.tenantSection;
     if (s === "tags" && !state.tenantTags && !state.tenantTagsError) loadTenantTags();
     else if (s === "profile" && !state.profile && !state.profileError) loadProfile();
-    else if (s === "scheduler" && !state.scheduler && !state.schedulerError) loadScheduler();
   }
 
   function wire() {
@@ -1446,10 +1501,6 @@ window.ST = window.ST || {};
       }
     });
 
-    document.addEventListener("submit", function (e) {
-      if (e.target && e.target.id === "adhocForm") { e.preventDefault(); submitAdhoc(); }
-    });
-
     // `toggle` does not bubble — capture phase is required. This is what makes
     // the profile accordions fetch their envelope lazily.
     document.addEventListener("toggle", function (e) {
@@ -1465,7 +1516,7 @@ window.ST = window.ST || {};
   }
 
   /* ==================================================================
-   * 13. BOOT
+   * 12. BOOT
    * ================================================================== */
 
   function boot() {
@@ -1474,22 +1525,29 @@ window.ST = window.ST || {};
     wire();
     renderAll();
 
-    loadTaxonomy().then(function () {
-      checkShare().then(function () {
+    // Config first: it decides the shape of the profile panel, and rendering
+    // the Parallel form in an SMX deployment would ask for a website that is
+    // ignored. It never rejects, so a failure just leaves the defaults.
+    loadConfig()
+      .then(loadMe)
+      .then(loadTaxonomy)
+      .then(checkShare)
+      .then(function () {
+        // Precedence: the corp last worked on, then whatever the token says.
+        // Explicit beats implied — someone who typed 75885 into the box last
+        // session means it, even when their own account is a different corp,
+        // and share-only tenants have no account to be signed in as at all.
         var saved = null;
         try { saved = localStorage.getItem(LS.corp); } catch (e) {}
         var n = validNumber(saved);
-        if (n != null) {
-          el.corpInput.value = String(n);
-          loadTenant(n).then(function () {
-            // A background profile fetch survives a reload.
-            if (state.profileJob && state.profileJob.corpNo === n) startProfilePoll();
-          });
-        } else {
-          renderAll();
-        }
+        if (n == null) n = state.tokenCorpNo;
+        if (n == null) { renderAll(); return; }
+        el.corpInput.value = String(n);
+        return loadTenant(n).then(function () {
+          // A background profile fetch survives a reload.
+          if (state.profileJob && state.profileJob.corpNo === n) startProfilePoll();
+        });
       });
-    });
   }
 
   if (document.readyState === "loading") {

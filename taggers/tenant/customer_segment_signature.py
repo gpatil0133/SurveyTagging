@@ -9,6 +9,7 @@ Allowed values: B2B-Enterprise / B2B-SMB / B2C / B2B2C / Mixed / N/A
 
 from __future__ import annotations
 
+from models import evidence as ev
 from models.tags import TagResult
 from models.tenant_profile import TenantProfile
 from taggers.tenant.base import TenantTagger
@@ -48,7 +49,12 @@ class CustomerSegmentSignatureTagger(TenantTagger):
                 value="N/A",
                 source="deterministic",
                 confidence=0.40,
-                evidence="No tenant_profile CX data available",
+                evidence=ev.fallback(
+                    "tenant.segment.no_cx_profile",
+                    "No CX intelligence artifact on disk, so there was no customer-segment "
+                    "statement to classify. N/A here means unknown, not 'no segment'.",
+                    inputs={"has_cx": False},
+                ),
             )
 
         primary = tenant_profile.primary_customer_segment or ""
@@ -71,7 +77,18 @@ class CustomerSegmentSignatureTagger(TenantTagger):
                 value="Mixed" if "B2B2C" not in all_signals else "B2B2C",
                 source="deterministic",
                 confidence=conf_base,
-                evidence=f"Multiple segments — primary={primary!r}, secondary={secondary!r}",
+                evidence=ev.profile(
+                    "tenant.segment.multiple_signals",
+                    f"The primary and secondary segment statements resolve to "
+                    f"{len(all_signals)} different segment classes "
+                    f"({', '.join(sorted(all_signals))}), so no single class describes "
+                    "this tenant. B2B-Enterprise plus B2B-SMB alone would not count — "
+                    "that is one class at two sizes.",
+                    field="cx.primary_customer_segment",
+                    inputs={"primary": primary or "(none)",
+                            "secondary": list(secondary),
+                            "resolved_classes": sorted(all_signals)},
+                ),
             )
 
         if primary_signal:
@@ -79,7 +96,15 @@ class CustomerSegmentSignatureTagger(TenantTagger):
                 value=primary_signal,
                 source="deterministic",
                 confidence=conf_base,
-                evidence=f"Primary segment={primary!r}",
+                evidence=ev.profile(
+                    "tenant.segment.primary",
+                    f"The profile's primary customer segment classifies as "
+                    f"{primary_signal}, and nothing in the secondary segments "
+                    "contradicts it.",
+                    field="cx.primary_customer_segment",
+                    inputs={"primary": primary or "(none)"},
+                    quote=primary or None,
+                ),
             )
 
         if secondary_signals:
@@ -88,14 +113,29 @@ class CustomerSegmentSignatureTagger(TenantTagger):
                 value=value,
                 source="deterministic",
                 confidence=conf_base * 0.85,
-                evidence=f"Inferred from secondary segments={secondary!r}",
+                evidence=ev.profile(
+                    "tenant.segment.secondary_only",
+                    f"The primary segment statement was missing or unclassifiable, so "
+                    f"{value} was inferred from the secondary segments instead — hence "
+                    "the discounted confidence.",
+                    field="cx.secondary_customer_segments",
+                    inputs={"primary": primary or "(none)",
+                            "secondary": list(secondary)},
+                ),
             )
 
         return TagResult(
             value="N/A",
             source="deterministic",
             confidence=0.50,
-            evidence=f"Unrecognized segment labels — primary={primary!r}, secondary={secondary!r}",
+            evidence=ev.profile(
+                "tenant.segment.unrecognized_labels",
+                "The CX profile does carry segment text, but none of it matched the "
+                "B2B / B2C / enterprise / SMB vocabulary this tagger recognizes.",
+                field="cx.primary_customer_segment",
+                inputs={"primary": primary or "(none)",
+                        "secondary": list(secondary)},
+            ),
         )
 
 

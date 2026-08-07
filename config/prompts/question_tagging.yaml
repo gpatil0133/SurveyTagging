@@ -5,7 +5,7 @@
 # rendered per survey with the questions payload and is NEVER cached. Bump
 # `version` whenever the cached_preamble shape changes.
 
-version: "6.0"
+version: "7.0"
 description: "Question-level classification — topic_theme, sensitivity, flow, journey {stage,sub_stage}, visualization, dashboard, display_role."
 
 cached_preamble: |
@@ -34,6 +34,12 @@ cached_preamble: |
   - For non-metric questions (`is_journey_metric=false`), set the entire `journey` to null.
   - Dashboard names MUST be chosen from the project-level dashboard routing list provided. Only add a custom dashboard name if NO provided dashboard is suitable.
 
+  Rules for `reasoning` (REQUIRED on every question):
+  - One or two sentences explaining why you assigned the tags you did for THIS question. It is stored verbatim against every tag you assigned on the question and shown to humans auditing the tagging, so write it for a reader who can see the question and the assigned values but not your thinking.
+  - Cite what in the question actually drove the call — its wording, its scale, its section, its role in the survey. Do not restate the values you already emitted ("topic is Service Quality because it is about service quality" is useless).
+  - Where two tags came from the same signal, say so once. Where one tag was a close call, say which alternative you rejected and why.
+  - Keep it under 40 words. Plain sentences, no JSON, no bullet points, no markdown.
+
   Always respond with a single valid JSON object with a "questions" array. No other text.
 
   For each question output:
@@ -52,7 +58,8 @@ cached_preamble: |
     },
     "visualization_type": "{{ viz | join(' | ') }}",
     "dashboard_names": ["pick from project-level dashboards; do not invent"],
-    "display_role": "{{ display_roles | join(' | ') }}"
+    "display_role": "{{ display_roles | join(' | ') }}",
+    "reasoning": "<1-2 sentences, <40 words: what in this question drove these assignments>"
   }
 
 user_prompt: |

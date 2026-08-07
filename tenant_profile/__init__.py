@@ -16,6 +16,14 @@ Phase 2+ will wire the artifacts into the tagging pipeline.
 from tenant_profile.runner import run_org, run_cx, run_ex, ArtifactExists, FetchResult
 from tenant_profile.batch import run_batch, BatchResult
 from tenant_profile.parallel_client import ParallelClient, ParallelClientError
+from tenant_profile.smx_client import (
+    AccountRow,
+    ProfileRow,
+    SmxClient,
+    SmxClientError,
+    PROFILE_TYPE_TO_AGENT,
+)
+from tenant_profile.smx_runner import adapt_payload, build_client, fetch_tenant_profile
 
 __all__ = [
     "run_org",
@@ -27,4 +35,13 @@ __all__ = [
     "BatchResult",
     "ParallelClient",
     "ParallelClientError",
+    # profile_source="smx"
+    "SmxClient",
+    "SmxClientError",
+    "AccountRow",
+    "ProfileRow",
+    "PROFILE_TYPE_TO_AGENT",
+    "fetch_tenant_profile",
+    "adapt_payload",
+    "build_client",
 ]

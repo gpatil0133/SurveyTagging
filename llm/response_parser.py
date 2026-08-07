@@ -150,6 +150,14 @@ class ResponseParser:
 
             # Role intent refinement (preserved from v1)
             parsed["role_intent_refined"] = q_data.get("role_intent_refined")
+
+            # V7: one free-text rationale per question, stamped onto every tag
+            # this question's LLM pass assigns. Optional — older cached
+            # responses (prompt version < 7.0) simply won't carry it.
+            reasoning = q_data.get("reasoning")
+            if isinstance(reasoning, str) and reasoning.strip():
+                parsed["reasoning"] = reasoning.strip()
+
             results.append(parsed)
 
         logger.debug("parse_question_response_done",

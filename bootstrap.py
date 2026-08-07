@@ -80,18 +80,27 @@ def build_context(settings: Settings | None = None, *, skip_llm: bool | None = N
     """Load taxonomy + taggers + industry stages + LLM client once."""
     settings = settings or Settings()
 
-    # Before anything can touch the share. A UNC root authenticates here rather
-    # than at first use, so a wrong password fails startup instead of showing up
-    # as an empty tenant list — every discovery function swallows OSError and
-    # cannot tell "no surveys" from "cannot log in".
+    # Record share credentials before anything can touch the share. This is
+    # pure local state — it opens no socket, so it cannot fail or hang.
+    #
+    # The SMB session itself is established lazily, on the first share read
+    # (sharefs.connect is memoized per server). Startup deliberately does NO
+    # network I/O: the image server is often unreachable from a dev machine or
+    # during a deploy window, and a 21-second TCP timeout there used to take the
+    # whole process down before a single route was registered — including
+    # /docs, the static UI and /api/health/share, the one endpoint whose job is
+    # to report that the share is down.
+    #
+    # What the eager connect bought was diagnosis: a wrong password otherwise
+    # surfaces as an empty tenant list, because every discovery function
+    # swallows OSError and cannot tell "no surveys" from "cannot log in". That
+    # is now `sharefs.probe()` behind GET /api/health/share, which reports the
+    # underlying error instead of hiding it. `check_share.py` still probes
+    # eagerly for the pre-flight check.
     sharefs.configure(settings.image_user, settings.image_pass)
     if sharefs.is_unc(settings.share_root or ""):
-        try:
-            sharefs.connect(settings.share_root)
-        except Exception as e:  # noqa: BLE001
-            logger.error("share_connect_failed",
-                         extra={"root": str(settings.share_root), "error": str(e)})
-            raise
+        logger.info("share_root_is_unc_lazy_connect",
+                    extra={"root": str(settings.share_root)})
 
     taxonomy = TaxonomyRegistry.from_yaml(CONFIG_DIR / "taxonomy.yaml")
     logger.info("taxonomy_loaded", extra={"dimensions": len(taxonomy.all_dimensions)})

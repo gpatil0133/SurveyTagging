@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from models import evidence as ev
 from models.tags import TagResult
 from models.tenant_profile import TenantProfile
 from taggers.tenant.base import TenantTagger
@@ -46,7 +47,12 @@ class KeyExLifecycleStagesTagger(TenantTagger):
                 value=[],
                 source="deterministic",
                 confidence=0.40,
-                evidence="No tenant_profile EX data available",
+                evidence=ev.fallback(
+                    "tenant.ex_stages.no_ex_profile",
+                    "No EX intelligence artifact on disk, so there were no lifecycle "
+                    "stages to extract. Empty list is 'unknown', not 'no stages'.",
+                    inputs={"has_ex": False},
+                ),
             )
 
         raw = tenant_profile.ex_lifecycle_stages
@@ -56,7 +62,13 @@ class KeyExLifecycleStagesTagger(TenantTagger):
                 value=[],
                 source="deterministic",
                 confidence=0.50,
-                evidence=f"No stages found in lifecycle_analysis.stages ({len(raw)} raw entries)",
+                evidence=ev.profile(
+                    "tenant.ex_stages.none_extracted",
+                    f"The lifecycle analysis holds {len(raw)} raw entr(ies) but none "
+                    "carried a usable stage name under name / stage_name / stage.",
+                    field="ex.lifecycle_analysis.stages",
+                    inputs={"raw_entry_count": len(raw)},
+                ),
             )
 
         conf_label = (
@@ -69,7 +81,17 @@ class KeyExLifecycleStagesTagger(TenantTagger):
             value=stages,
             source="deterministic",
             confidence=conf_base,
-            evidence=f"Extracted {len(stages)} lifecycle stages (confidence={conf_label or 'unknown'})",
+            evidence=ev.profile(
+                "tenant.ex_stages.extracted",
+                f"Read {len(stages)} named lifecycle stage(s) straight off the EX "
+                f"profile; confidence mirrors the agent's own rating of that section "
+                f"({conf_label or 'unrated'}).",
+                field="ex.lifecycle_analysis.stages",
+                inputs={"stage_count": len(stages),
+                        "raw_entry_count": len(raw),
+                        "agent_confidence": conf_label or "unknown"},
+                quote=", ".join(stages[:8]),
+            ),
         )
 
 

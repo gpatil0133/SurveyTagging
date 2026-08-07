@@ -27,9 +27,20 @@ Surface (all under /api):
   Catalog / admin
     GET    /taxonomy
     GET    /surveys
+    GET    /me                     caller identity from the Bearer token
     GET    /admin/autoretag        (see scheduler.py)
     POST   /admin/autoretag/run-now
     GET    /                       static UI
+
+Every `/tenants/{t}/…` route above is also registered without the `/tenants/{t}`
+prefix (`POST /api/surveys/{s}/tag`, `GET /api/tags`, `GET /api/profile`, …).
+On those forms the tenant comes from the caller's JWT — see the note above
+`capture_bearer_token`. The one that is not a straight prefix-drop is
+`POST /api/tenants/{t}/tag`, whose short form is `POST /api/tags`, because
+`POST /api/tag` already means "tag this uploaded survey JSON".
+
+Nothing here is authenticated: `auth_enabled` is False by default and the token
+is read for tenant resolution and outbound forwarding only.
 """
 
 from __future__ import annotations
@@ -54,13 +65,15 @@ except ImportError:
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import auth
 import discovery
+import request_context
 import service
 import sharefs
 from bootstrap import build_context
@@ -99,13 +112,50 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def capture_bearer_token(request: Request, call_next):
+    """Put the caller's JWT in the request context for the life of the request.
+
+    The UI reads the platform's `access_token` out of localStorage and sends it
+    on every call; this is what lets anything downstream (apismx today) forward
+    that same token outbound without every intermediate signature having to
+    carry it. Absent header → empty string → callers fall back to
+    SURVEY_TAGGER_SMX_TOKEN, exactly as before.
+
+    This does not authenticate anything. Enforcement is still `auth.require_auth`
+    behind `SURVEY_TAGGER_AUTH_ENABLED`.
+    """
+    handle = request_context.set_token(auth.bearer_token(request.headers.get("authorization")))
+    try:
+        return await call_next(request)
+    finally:
+        request_context.reset_token(handle)
+
+
+# `tenant_id` is optional on every tenant route below. Each is registered twice:
+#
+#     /api/tenants/{tenant_id}/surveys/{s}/tags     tenant in the path
+#     /api/surveys/{s}/tags                         tenant from the token
+#
+# On the short form FastAPI reads `tenant_id` as a query param instead, so
+# `?tenant_id=` works there too. The URL always wins and is never cross-checked
+# against the token: tenants that exist only on the net-share have no platform
+# account for a token to agree with. See auth.resolve_tenant_id.
+
+
 # ====================================================================
 # Survey tagging
 # ====================================================================
 
 @app.post("/api/tenants/{tenant_id}/surveys/{survey_no}/tag")
-async def tag_survey(tenant_id: int, survey_no: int) -> dict:
+@app.post("/api/surveys/{survey_no}/tag")
+async def tag_survey(
+    survey_no: int,
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Tag one survey (incremental — skips if inputs unchanged)."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     try:
         return await asyncio.to_thread(service.tag_survey, _ctx, tenant_id, survey_no, force=False)
     except FileNotFoundError as e:
@@ -116,8 +166,14 @@ async def tag_survey(tenant_id: int, survey_no: int) -> dict:
 
 
 @app.post("/api/tenants/{tenant_id}/surveys/{survey_no}/retag")
-async def retag_survey(tenant_id: int, survey_no: int) -> dict:
+@app.post("/api/surveys/{survey_no}/retag")
+async def retag_survey(
+    survey_no: int,
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Force re-tag one survey (ignore change detection)."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     try:
         return await asyncio.to_thread(service.tag_survey, _ctx, tenant_id, survey_no, force=True)
     except FileNotFoundError as e:
@@ -135,17 +191,20 @@ def _survey_view_etag(path: Path, include_journey_candidates: bool) -> str:
 
 
 @app.get("/api/tenants/{tenant_id}/surveys/{survey_no}/tags")
+@app.get("/api/surveys/{survey_no}/tags")
 async def get_survey_tags(
-    tenant_id: int,
     survey_no: int,
+    tenant_id: int | None = None,
     include_journey_candidates: bool = False,
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
+    authorization: str | None = Header(default=None),
 ) -> Response:
     """Unified per-survey view: project tags + question tags + journey rollup.
 
     `include_journey_candidates=true` surfaces the per-question coverage_metadata
     (ranked canon candidates with scores). ETag/`If-None-Match` → 304.
     """
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     path = service.tagged_output_path(_ctx, tenant_id, survey_no)
     if not sharefs.exists(path):
         raise HTTPException(
@@ -171,8 +230,14 @@ async def get_survey_tags(
 
 
 @app.delete("/api/tenants/{tenant_id}/surveys/{survey_no}/tags")
-async def delete_survey_tags(tenant_id: int, survey_no: int) -> dict:
+@app.delete("/api/surveys/{survey_no}/tags")
+async def delete_survey_tags(
+    survey_no: int,
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Delete tagged output for one survey."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     result = service.delete_tagged(_ctx, tenant_id, survey_no)
     if not result["tagged_removed"]:
         raise HTTPException(404, f"No tagged output for tenant={tenant_id} survey={survey_no}")
@@ -222,20 +287,35 @@ async def tag_uploaded(
 # ====================================================================
 
 @app.post("/api/tenants/{tenant_id}/tag-surveys")
-async def tag_tenant_surveys(tenant_id: int) -> dict:
+@app.post("/api/tag-surveys")
+async def tag_tenant_surveys(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Tag every survey under a tenant (bounded-parallel; incremental)."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     return await asyncio.to_thread(service.tag_tenant_surveys, _ctx, tenant_id, force=False)
 
 
 @app.post("/api/tenants/{tenant_id}/retag-surveys")
-async def retag_tenant_surveys(tenant_id: int) -> dict:
+@app.post("/api/retag-surveys")
+async def retag_tenant_surveys(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Force re-tag every survey under a tenant."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     return await asyncio.to_thread(service.tag_tenant_surveys, _ctx, tenant_id, force=True)
 
 
 @app.get("/api/tenants/{tenant_id}/tag-surveys")
-async def tenant_tag_status(tenant_id: int) -> dict:
+@app.get("/api/tag-surveys")
+async def tenant_tag_status(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """List the tenant's surveys and whether each has tagged output on disk."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     surveys = []
     for sno in discovery.list_survey_nos(_settings.data_dir, tenant_id):
         tagged = sharefs.exists(service.tagged_output_path(_ctx, tenant_id, sno))
@@ -250,8 +330,17 @@ async def tenant_tag_status(tenant_id: int) -> dict:
 # ====================================================================
 
 @app.post("/api/tenants/{tenant_id}/tag")
-async def tag_tenant(tenant_id: int) -> dict:
-    """Build + persist tenant-level tags (tenant taggers + Parallel.ai profile)."""
+@app.post("/api/tags")
+async def tag_tenant(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    """Build + persist tenant-level tags (tenant taggers + Parallel.ai profile).
+
+    The tenant-less form is `POST /api/tags`, not `/api/tag` — that one is
+    already the ad-hoc "tag this uploaded survey JSON" endpoint.
+    """
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     result = await asyncio.to_thread(service.tag_tenant_tags, _ctx, tenant_id)
     if result.get("tenant_tags") is None:
         raise HTTPException(
@@ -263,8 +352,13 @@ async def tag_tenant(tenant_id: int) -> dict:
 
 
 @app.get("/api/tenants/{tenant_id}/tags")
-async def get_tenant_tags(tenant_id: int) -> dict:
+@app.get("/api/tags")
+async def get_tenant_tags(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Read tenant_tags.json."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     artifact = service.read_tenant_tags(_ctx, tenant_id)
     if artifact is None:
         raise HTTPException(
@@ -276,8 +370,13 @@ async def get_tenant_tags(tenant_id: int) -> dict:
 
 
 @app.delete("/api/tenants/{tenant_id}/tags")
-async def delete_tenant_tags(tenant_id: int) -> dict:
+@app.delete("/api/tags")
+async def delete_tenant_tags(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Delete tenant_tags.json."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     result = service.delete_tenant_tags(_ctx, tenant_id)
     if not result["removed"]:
         raise HTTPException(404, f"No tenant tags for tenant={tenant_id}")
@@ -292,12 +391,20 @@ _PARALLEL_AGENTS = ("org", "cx", "ex")
 
 
 class TenantProfileFetchRequest(BaseModel):
-    website: str = Field(..., min_length=4,
-                         description="Tenant website URL (e.g. https://acme.com)")
+    website: str = Field(
+        "", description="Tenant website URL (e.g. https://acme.com). Required when "
+                        "profile_source='parallel'; ignored for 'smx', which reads a "
+                        "profile the Research API already generated.",
+    )
     agents: list[str] | None = Field(
         None, description="Subset of ['org','cx','ex']. None or empty = all three.",
     )
     force: bool = False
+    allow_generate: bool = Field(
+        True, description="smx only: when the share and apismx both come up empty, "
+                          "trigger /AIAccountProfile/Generate and wait for it. "
+                          "Set false to look only, never start research.",
+    )
 
 
 def _build_parallel_client():
@@ -356,23 +463,113 @@ def _run_parallel_fetch(tenant_id: int, website: str, agents: tuple[str, ...], f
     return _summarize_batch(result)
 
 
+def _run_smx_fetch(tenant_id: int, website: str, agents: tuple[str, ...],
+                   force: bool, token: str, allow_generate: bool) -> dict:
+    """Resolve the tenant's profile: share -> apismx /Details -> /Generate.
+
+    Same artifacts, same paths as the Parallel path — only the producer differs.
+    """
+    from tenant_profile.smx_client import SmxClientError
+    from tenant_profile.smx_runner import build_client, resolve_tenant_profile
+
+    try:
+        client = build_client(_settings, token)
+    except SmxClientError as e:
+        raise HTTPException(400, str(e)) from e
+
+    try:
+        with client:
+            outcome = resolve_tenant_profile(
+                tenant_id, Path(_settings.output_dir), client,
+                website_url=website, agents=agents, force=force,
+                allow_generate=allow_generate and _settings.smx_allow_generate,
+                poll_attempts=_settings.smx_generate_poll_attempts,
+                poll_interval=_settings.smx_generate_poll_interval,
+            )
+    except SmxClientError as e:
+        raise HTTPException(502, f"apismx fetch failed: {e}") from e
+
+    if outcome.source == "generating":
+        # Not a failure: research is running server-side. 202 tells the UI to
+        # poll rather than to show an error.
+        return {
+            "source": "smx", "resolved_via": outcome.source, "pending": True,
+            "detail": outcome.detail, "generate": outcome.generate_summary,
+            "fetched": [], "cache_hits": [], "failures": [],
+            "counts": {"fetched": 0, "cache_hits": 0, "failures": 0},
+        }
+    if not outcome.ok:
+        raise HTTPException(404, outcome.detail or (
+            f"apismx has no profile for tenant {tenant_id} and generation was "
+            f"not attempted."))
+
+    fetched = [r for r in outcome.results if not r.cached]
+    cached = [r for r in outcome.results if r.cached]
+    return {
+        "source": "smx",
+        "resolved_via": outcome.source,
+        "pending": False,
+        "generate": outcome.generate_summary,
+        "fetched": [{"tenant_id": r.tenant_id, "agent": r.agent,
+                     "artifact_path": str(r.artifact_path)} for r in fetched],
+        "cache_hits": [{"tenant_id": r.tenant_id, "agent": r.agent,
+                        "artifact_path": str(r.artifact_path)} for r in cached],
+        "failures": [],
+        "counts": {"fetched": len(fetched), "cache_hits": len(cached), "failures": 0},
+    }
+
+
+def _run_profile_fetch(tenant_id: int, website: str, agents: tuple[str, ...],
+                       force: bool, token: str = "",
+                       allow_generate: bool = True) -> dict:
+    """Dispatch to whichever producer `profile_source` selects."""
+    if _settings.profile_source == "smx":
+        return _run_smx_fetch(tenant_id, website, agents, force, token, allow_generate)
+    if not website or len(website) < 4:
+        raise HTTPException(
+            400, "profile_source='parallel' needs a `website` to research.",
+        )
+    return _run_parallel_fetch(tenant_id, website, agents, force)
+
+
+def _bearer(authorization: str | None) -> str:
+    """The caller's raw JWT, for forwarding to apismx. Empty when absent.
+
+    Still passed explicitly on the fetch route rather than read from
+    `request_context`: the `?background=true` branch outlives the request, and
+    an explicit capture is what makes that safe to read at a glance.
+    """
+    return auth.bearer_token(authorization)
+
+
 def _agent_artifact_path(tenant_id: int, agent: str) -> Path:
     from tenant_profile.runner import artifact_path
     return artifact_path(tenant_id, agent, Path(_settings.output_dir))
 
 
 @app.post("/api/tenants/{tenant_id}/profile/fetch")
+@app.post("/api/profile/fetch")
 async def tenant_profile_fetch(
-    tenant_id: int, req: TenantProfileFetchRequest, background: bool = False,
+    req: TenantProfileFetchRequest,
+    tenant_id: int | None = None, background: bool = False,
+    authorization: str | None = Header(default=None),
 ) -> JSONResponse:
-    """Fetch the Parallel.ai tenant profile (org/cx/ex). Sync by default;
-    `?background=true` returns 202 and runs fire-and-forget."""
+    """Fetch the tenant profile (org/cx/ex) from whichever producer
+    `profile_source` selects. Sync by default; `?background=true` returns 202
+    and runs fire-and-forget.
+
+    Under profile_source='smx' the caller's Bearer token is forwarded to apismx
+    (shared issuer), falling back to SURVEY_TAGGER_SMX_TOKEN.
+    """
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     agents = _normalize_agents(req.agents)
+    token = _bearer(authorization)
 
     if background:
         async def _run():
             try:
-                await asyncio.to_thread(_run_parallel_fetch, tenant_id, req.website, agents, req.force)
+                await asyncio.to_thread(_run_profile_fetch, tenant_id, req.website,
+                                        agents, req.force, token, req.allow_generate)
                 logger.info("tenant_profile_background_fetch_done", extra={"tenant_id_": tenant_id})
             except Exception as e:  # noqa: BLE001
                 logger.exception("tenant_profile_background_fetch_failed",
@@ -380,12 +577,14 @@ async def tenant_profile_fetch(
         asyncio.create_task(_run())
         return JSONResponse(status_code=202, content={
             "status": "accepted", "tenant_id": tenant_id, "agents": list(agents),
+            "source": _settings.profile_source,
             "force": req.force, "poll_url": f"/api/tenants/{tenant_id}/profile",
             "note": "Fetch running in background. Server restart will lose the job.",
         })
 
     try:
-        summary = await asyncio.to_thread(_run_parallel_fetch, tenant_id, req.website, agents, req.force)
+        summary = await asyncio.to_thread(_run_profile_fetch, tenant_id, req.website,
+                                          agents, req.force, token, req.allow_generate)
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001
@@ -395,8 +594,13 @@ async def tenant_profile_fetch(
 
 
 @app.get("/api/tenants/{tenant_id}/profile")
-async def get_tenant_profile(tenant_id: int) -> dict:
+@app.get("/api/profile")
+async def get_tenant_profile(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Summary of on-disk Parallel.ai artifacts for a tenant."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     from models.tenant_profile import TenantProfile
     profile = TenantProfile.load(tenant_id, Path(_settings.output_dir))
     if profile is None or profile.is_empty:
@@ -438,8 +642,14 @@ async def get_tenant_profile(tenant_id: int) -> dict:
 
 
 @app.get("/api/tenants/{tenant_id}/profile/{agent}")
-async def get_tenant_profile_agent(tenant_id: int, agent: str) -> dict:
+@app.get("/api/profile/{agent}")
+async def get_tenant_profile_agent(
+    agent: str,
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Raw envelope JSON for a single Parallel.ai agent (org/cx/ex)."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     norm = agent.strip().lower()
     if norm not in _PARALLEL_AGENTS:
         raise HTTPException(400, f"Unknown agent: {agent!r}. Allowed: {list(_PARALLEL_AGENTS)}")
@@ -457,8 +667,13 @@ async def get_tenant_profile_agent(tenant_id: int, agent: str) -> dict:
 
 
 @app.delete("/api/tenants/{tenant_id}/profile")
-async def delete_tenant_profile(tenant_id: int) -> dict:
+@app.delete("/api/profile")
+async def delete_tenant_profile(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Delete all Parallel.ai artifacts for a tenant."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     profile_dir = Path(_settings.output_dir) / str(tenant_id) / "tenant_profile"
     removed: list[str] = []
     if not sharefs.exists(profile_dir):
@@ -495,10 +710,18 @@ async def get_taxonomy() -> dict:
 async def list_surveys() -> list[dict]:
     """List all tenants and their surveys discovered under the local data dir.
 
-    Walks the whole data root — expensive over a network share. The UI does not
-    use it; prefer GET /api/tenants/{t}/tag-surveys, which is one dir listing.
+    Walks the whole data root — expensive over a network share (minutes, not
+    seconds). The current UI does not call it; prefer
+    GET /api/tenants/{t}/tag-surveys, which is one directory listing.
+
+    Offloaded to a thread even though it is the only caller's own problem how
+    long it takes: run inline in the event loop, one request to this route
+    freezes the entire server for everyone — no other route answers, not even
+    /api/health/share, and the process looks hung rather than busy. A stale
+    browser tab still holding the pre-v7 UI calls this on load, which is exactly
+    how that happens in practice.
     """
-    return discovery.discover_catalog(_settings.data_dir)
+    return await asyncio.to_thread(discovery.discover_catalog, _settings.data_dir)
 
 
 @app.get("/api/health/share")
@@ -506,6 +729,41 @@ async def share_health() -> dict:
     """Is the data root reachable? Lets the UI distinguish a downed share from
     a tenant that simply has no surveys (both otherwise look like an empty list)."""
     return await asyncio.to_thread(discovery.probe_root, _settings.data_dir)
+
+
+@app.get("/api/me")
+async def whoami(authorization: str | None = Header(default=None)) -> dict:
+    """What the caller's Bearer token says about them.
+
+    `{corp_no, subject, has_token, verified, auth_enabled}`. The UI calls this
+    once at boot: when it is embedded in the platform shell there is a token in
+    localStorage but no corp number typed into the box, and this is how it
+    learns which tenant to open. A typed corp number always overrides it.
+
+    `verified` is False when the signature could not be checked (no/again wrong
+    public key) but the claims were read anyway — see auth._decode_verified. It
+    is advisory while `auth_enabled` is False.
+    """
+    return {**auth.principal(authorization), "auth_enabled": _settings.auth_enabled}
+
+
+@app.get("/api/config")
+async def ui_config() -> dict:
+    """Server config the UI needs to shape itself.
+
+    `profile_source` decides the whole tenant-profile panel: the Parallel path
+    needs a website and blocks for 10-30 minutes, the SMX path needs neither and
+    can trigger generation on a miss. The browser has no other way to know which
+    is configured.
+    """
+    return {
+        "profile_source": _settings.profile_source,
+        "smx_allow_generate": _settings.smx_allow_generate,
+        "smx_generate_wait_seconds": int(
+            _settings.smx_generate_poll_attempts * _settings.smx_generate_poll_interval
+        ),
+        "skip_llm": _settings.skip_llm,
+    }
 
 
 @app.get("/api/admin/autoretag")
@@ -529,15 +787,42 @@ async def autoretag_run_now() -> dict:
 # ---------- Static UI ----------
 
 static_dir = Path(__file__).parent / "static"
+
+
+class _RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles that makes the browser check before reusing a cached asset.
+
+    Starlette sends ETag and Last-Modified but no Cache-Control, which leaves
+    Chrome free to apply *heuristic* freshness: it reuses a cached response for
+    a fraction of its age without asking the server at all. For files that are
+    edited in place under stable names — app.js, app.css, render.js, none of
+    which carry a content hash — that means a tab can keep rendering a UI from
+    weeks ago against a server that has moved on, and a plain reload will not
+    dislodge it.
+
+    `no-cache` does not disable caching; it requires revalidation. The browser
+    still sends If-None-Match and still gets a 304 with an empty body when
+    nothing changed, so the cost is one conditional request per asset and the
+    UI can never silently be a version behind the server.
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers.setdefault("Cache-Control", "no-cache")
+        return resp
+
+
 if static_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    app.mount("/static", _RevalidatingStaticFiles(directory=str(static_dir)), name="static")
 
 
 @app.get("/")
 async def index():
+    """The UI shell. Same no-cache reasoning as the static mount above — this
+    one matters most, since a stale index.html pins every asset it references."""
     index_file = static_dir / "index.html"
     if index_file.exists():
-        return FileResponse(str(index_file))
+        return FileResponse(str(index_file), headers={"Cache-Control": "no-cache"})
     return {"message": "Survey Tagger API is running. See /docs."}
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from models import evidence as ev
 from models.tags import TagResult
 from models.tenant_profile import TenantProfile
 from taggers.tenant.base import TenantTagger
@@ -71,7 +72,13 @@ class KeyCxTouchpointsTagger(TenantTagger):
                 value=[],
                 source="deterministic",
                 confidence=0.40,
-                evidence="No tenant_profile CX data available",
+                evidence=ev.fallback(
+                    "tenant.cx_touchpoints.no_cx_profile",
+                    "No CX intelligence artifact on disk for this tenant, so there were "
+                    "no journeys to read touchpoints from. Empty list is 'unknown', not "
+                    "'this tenant has no touchpoints'.",
+                    inputs={"has_cx": False},
+                ),
             )
 
         journeys = tenant_profile.cx_journeys
@@ -81,7 +88,13 @@ class KeyCxTouchpointsTagger(TenantTagger):
                 value=[],
                 source="deterministic",
                 confidence=0.50,
-                evidence=f"No touchpoints found across {len(journeys)} CX journeys",
+                evidence=ev.profile(
+                    "tenant.cx_touchpoints.none_extracted",
+                    f"The CX profile has {len(journeys)} journey(s) but none of them "
+                    "carried stage names or touchpoints in any recognized shape.",
+                    field="cx.journeys[].stages[].touchpoints",
+                    inputs={"journey_count": len(journeys)},
+                ),
             )
 
         conf_label = (
@@ -94,7 +107,18 @@ class KeyCxTouchpointsTagger(TenantTagger):
             value=touchpoints,
             source="deterministic",
             confidence=conf_base,
-            evidence=f"Extracted from {len(journeys)} CX journeys (confidence={conf_label or 'unknown'})",
+            evidence=ev.profile(
+                "tenant.cx_touchpoints.extracted",
+                f"Collected {len(touchpoints)} distinct touchpoint(s) from "
+                f"{len(journeys)} CX journey(s) in the tenant profile; confidence "
+                f"tracks the agent's own rating of that section "
+                f"({conf_label or 'unrated'}).",
+                field="cx.journeys[].stages[].touchpoints",
+                inputs={"journey_count": len(journeys),
+                        "touchpoint_count": len(touchpoints),
+                        "agent_confidence": conf_label or "unknown"},
+                quote=", ".join(touchpoints[:8]),
+            ),
         )
 
 

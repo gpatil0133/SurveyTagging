@@ -10,6 +10,7 @@ Allowed values: Foundational / Developing / Established / Advanced / N/A
 
 from __future__ import annotations
 
+from models import evidence as ev
 from models.tags import TagResult
 from models.tenant_profile import TenantProfile
 from taggers.tenant.base import TenantTagger
@@ -46,7 +47,13 @@ class ExMaturitySignatureTagger(TenantTagger):
                 value="N/A",
                 source="deterministic",
                 confidence=0.40,
-                evidence="No tenant_profile EX data available",
+                evidence=ev.fallback(
+                    "tenant.ex_maturity.no_ex_profile",
+                    "No EX intelligence artifact on disk, so there was no maturity "
+                    "statement to normalize. Downstream should read N/A as unknown "
+                    "and fall back to a simple dashboard.",
+                    inputs={"has_ex": False},
+                ),
             )
 
         raw = tenant_profile.ex_maturity_level or ""
@@ -55,7 +62,12 @@ class ExMaturitySignatureTagger(TenantTagger):
                 value="N/A",
                 source="deterministic",
                 confidence=0.50,
-                evidence="ex_maturity.level absent from profile",
+                evidence=ev.profile(
+                    "tenant.ex_maturity.field_absent",
+                    "The EX profile exists but its maturity level field is empty — the "
+                    "agent did not report one.",
+                    field="ex.ex_maturity.level",
+                ),
             )
 
         conf_base = {"High": 0.95, "Medium": 0.85, "Low": 0.65}.get(
@@ -70,14 +82,27 @@ class ExMaturitySignatureTagger(TenantTagger):
                     value=canon,
                     source="deterministic",
                     confidence=conf_base,
-                    evidence=f"ex_maturity.level={raw!r}",
+                    evidence=ev.profile(
+                        "tenant.ex_maturity.keyword_match",
+                        f"The profile's maturity statement contains \"{needle}\", which "
+                        f"this tagger maps to the {canon} tier.",
+                        field="ex.ex_maturity.level",
+                        inputs={"matched_keyword": needle, "mapped_tier": canon},
+                        quote=raw,
+                    ),
                 )
 
         return TagResult(
             value="N/A",
             source="deterministic",
             confidence=0.50,
-            evidence=f"Unrecognized maturity label: {raw!r}",
+            evidence=ev.profile(
+                "tenant.ex_maturity.unrecognized_label",
+                "The profile reports a maturity level, but its wording matched none of "
+                "the Foundational / Developing / Established / Advanced keywords.",
+                field="ex.ex_maturity.level",
+                quote=raw,
+            ),
         )
 
 

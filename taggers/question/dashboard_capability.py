@@ -21,6 +21,7 @@ registry auto-registers them from this single module.
 
 from __future__ import annotations
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
@@ -153,6 +154,82 @@ def derive_capability(q: QuestionContext) -> dict[str, object]:
     }
 
 
+def explain_capability(q: QuestionContext, dimension: str, value: object) -> str:
+    """One sentence saying why `dimension` came out as `value` for this question.
+
+    All six dimensions cascade off `response_format`, so each explanation names
+    that anchor rather than repeating the raw type codes — a reader following
+    the chain can see where a wrong answer entered it.
+    """
+    fmt = _response_format(q)
+    anchor = (f"rs_type={q.rs_type}" if q.rs_type in (2, 3, 4)
+              else f"question_type={q.question_type!r}")
+
+    if dimension == "response_format":
+        return (f"The canonical answer shape is {value}, read off {anchor}. A platform "
+                "metric flag (rs_type) always wins over the question type, because the "
+                "same widget type is used for both scored and unscored questions. "
+                "Every other capability dimension cascades off this one.")
+    if dimension == "scale_of_measurement":
+        if value == "Unstructured":
+            return (f"A {fmt} answer is prose — it has no measurement scale, so nothing "
+                    "can be ordered or averaged.")
+        if value == "N/A":
+            return (f"A {fmt} answer carries no measurement at all (identity capture, "
+                    "or an unrecognized question type).")
+        return (f"A {fmt} answer is {value}: "
+                + {"Interval": "its points are evenly spaced, so differences are "
+                               "meaningful and a mean is valid",
+                   "Ordinal": "its points are ordered but not evenly spaced, so "
+                              "medians and rank tests are valid but means are a "
+                              "convenient approximation",
+                   "Nominal": "its options are labels with no order, so only counts "
+                              "and proportions are valid"}.get(str(value), str(value))
+                + ". This is what decides which statistics a widget may show.")
+    if dimension == "cardinality_class":
+        if value == "Continuous":
+            return (f"A {fmt} answer rolls up to a score rather than falling into "
+                    "buckets, so it is treated as continuous for widget selection.")
+        if value == "Free-Text":
+            return f"A {fmt} answer is unbounded prose — there is no option count."
+        if value == "N/A":
+            return f"A {fmt} answer has no option set to count."
+        return (f"The question has {q.option_count} answer option(s), which puts it in "
+                f"the {value} band (2 = Binary, 3-7 = Low, 8+ = High). Cardinality is "
+                "what decides whether a chart stays readable.")
+    if dimension == "widget_compatibility":
+        widgets = value if isinstance(value, list) else []
+        if not widgets:
+            return (f"A {fmt} answer supports no dashboard widget — there is nothing to "
+                    "plot.")
+        return (f"A {fmt} answer can be rendered as any of {len(widgets)} widget(s): "
+                f"{', '.join(str(w) for w in widgets)}. This is the structural "
+                "shortlist only; the dashboard service still checks whether the "
+                "response volume and distinct-value count make each one worth showing.")
+    if dimension == "control_role":
+        roles = value if isinstance(value, list) else []
+        if not roles:
+            return (f"A {fmt} answer cannot drive a dashboard control — it is something "
+                    "you filter, not something you filter by.")
+        return (f"A {fmt} answer can act as {', '.join(str(r) for r in roles)}. "
+                "Segment-Control additionally requires unweighted options and 2-15 of "
+                "them, so the buckets stay populated; a routing question always "
+                "qualifies.")
+    if dimension == "crosstab_axis_role":
+        return {
+            "Both": (f"A {fmt} answer both measures something and groups respondents, "
+                     "so it can sit on either axis of a cross-tab."),
+            "Column-Eligible": (f"A {fmt} answer is a measure, so it belongs in the "
+                                "cells/columns of a cross-tab — it is what gets "
+                                "compared, not what does the comparing."),
+            "Row-Eligible": (f"A {fmt} answer groups respondents, so it belongs on the "
+                             "row axis — it is what other questions get broken out by."),
+            "None": (f"A {fmt} answer neither measures nor groups, so it has no place "
+                     "in a cross-tab."),
+        }.get(str(value), f"Derived from response_format {fmt}.")
+    return f"Derived from response_format {fmt} ({anchor})."
+
+
 class _CapabilityTagger(QuestionTagger):
     """Base for the six capability taggers. Each subclass sets `tag_dimension`
     and whether its value is multi-label (list) or scalar."""
@@ -174,11 +251,21 @@ class _CapabilityTagger(QuestionTagger):
         if question.is_content_message:
             empty = [] if self._multi else None
             return TagResult(value=empty, source="deterministic", status="skipped",
-                             evidence="Content message")
+                             evidence=ev.content_message(self.tag_dimension, stage=3))
         value = derive_capability(question)[self.tag_dimension]
-        return TagResult(value=value, source="deterministic", confidence=1.0,
-                         evidence=f"Derived from question_type={question.question_type}, "
-                                  f"rs_type={question.rs_type}")
+        return TagResult(
+            value=value, source="deterministic", confidence=1.0,
+            evidence=ev.rule(
+                f"question.{self.tag_dimension}.derived_capability",
+                explain_capability(question, self.tag_dimension, value),
+                stage=3,
+                inputs={"question_type": question.question_type,
+                        "rs_type": question.rs_type,
+                        "is_multi": question.is_multi,
+                        "option_count": question.option_count,
+                        "response_format": _response_format(question)},
+            ),
+        )
 
 
 class ResponseFormatTagger(_CapabilityTagger):

@@ -26,10 +26,17 @@ def assemble_tagged_survey(
             "source": tag.source,
             "confidence": tag.confidence,
         }
+        # Only non-default statuses are worth the bytes; "assigned" is implied.
+        if tag.status != "assigned":
+            entry["status"] = tag.status
+        # Provenance is source-dependent and never both: non-LLM taggers emit a
+        # typed `evidence` dict, the LLM emits free-text `reasoning`.
         if tag.evidence:
             entry["evidence"] = tag.evidence
         if tag.reasoning:
             entry["reasoning"] = tag.reasoning
+        if tag.failure_reason:
+            entry["failure_reason"] = tag.failure_reason
         if tag.apply_method != "System-applied":
             entry["apply_method"] = tag.apply_method
         project_tags[dim] = entry
@@ -45,8 +52,20 @@ def assemble_tagged_survey(
             t_entry: dict = {"value": tag.value, "source": tag.source}
             if tag.confidence < 1.0:
                 t_entry["confidence"] = tag.confidence
+            if tag.status != "assigned":
+                t_entry["status"] = tag.status
+            # Same split as project tags: typed `evidence` from rule-based
+            # taggers, free-text `reasoning` from the LLM. `reasoning` used to
+            # be dropped here, which is why LLM-assigned question tags looked
+            # unexplained in the UI even though the model had explained itself.
             if tag.evidence:
                 t_entry["evidence"] = tag.evidence
+            if tag.reasoning:
+                t_entry["reasoning"] = tag.reasoning
+            if tag.failure_reason:
+                t_entry["failure_reason"] = tag.failure_reason
+            if tag.apply_method != "System-applied":
+                t_entry["apply_method"] = tag.apply_method
             # Preserve LLM-grounded candidates/confidence on journey_stage /
             # sub_stage_name so the survey-view endpoint can expose "why this
             # stage". No-op for tags that don't carry coverage_metadata.

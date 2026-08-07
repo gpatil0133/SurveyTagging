@@ -9,6 +9,7 @@ Allowed values: None / GDPR / HIPAA / SOC2 / FERPA / PCI / Multi-Regulatory
 
 from __future__ import annotations
 
+from models import evidence as ev
 from models.tags import TagResult
 from models.tenant_profile import TenantProfile
 from taggers.tenant.base import TenantTagger
@@ -51,7 +52,12 @@ class CompliancePostureTagger(TenantTagger):
                 value="None",
                 source="deterministic",
                 confidence=0.40,
-                evidence="No tenant_profile org data available",
+                evidence=ev.fallback(
+                    "tenant.compliance.no_org_profile",
+                    "No org profile on disk for this tenant, so no compliance signal "
+                    "could be read. Defaulted to None — run the profile fetcher to improve this.",
+                    inputs={"has_org": False},
+                ),
             )
 
         frameworks = tenant_profile.regulatory_frameworks
@@ -62,11 +68,20 @@ class CompliancePostureTagger(TenantTagger):
         conf_base = {"High": 0.95, "Medium": 0.85, "Low": 0.70}.get(intensity, 0.75)
 
         if len(canonical) >= 2:
+            named = sorted(canonical)
             return TagResult(
                 value="Multi-Regulatory",
                 source="deterministic",
                 confidence=conf_base,
-                evidence=f"Multiple frameworks present: {sorted(canonical)} (intensity={intensity or 'unknown'})",
+                evidence=ev.profile(
+                    "tenant.compliance.multi_framework",
+                    f"The org profile names {len(named)} distinct regulatory frameworks "
+                    f"({', '.join(named)}), which is the definition of a multi-regulatory posture.",
+                    field="org.regulatory_frameworks",
+                    inputs={"frameworks": named,
+                            "regulatory_intensity": intensity or "unknown"},
+                    quote=", ".join(frameworks),
+                ),
             )
         if len(canonical) == 1:
             value = next(iter(canonical))
@@ -74,7 +89,15 @@ class CompliancePostureTagger(TenantTagger):
                 value=value,
                 source="deterministic",
                 confidence=conf_base,
-                evidence=f"Framework {value} from {frameworks!r} (intensity={intensity or 'unknown'})",
+                evidence=ev.profile(
+                    "tenant.compliance.single_framework",
+                    f"Exactly one recognized framework ({value}) appears in the org "
+                    f"profile's regulatory frameworks.",
+                    field="org.regulatory_frameworks",
+                    inputs={"matched_framework": value,
+                            "regulatory_intensity": intensity or "unknown"},
+                    quote=", ".join(frameworks),
+                ),
             )
 
         if intensity == "High":
@@ -82,14 +105,29 @@ class CompliancePostureTagger(TenantTagger):
                 value="Multi-Regulatory",
                 source="deterministic",
                 confidence=0.55,
-                evidence="Regulatory intensity=High but no recognized framework labels — inferred multi-regulatory posture",
+                evidence=ev.profile(
+                    "tenant.compliance.intensity_only",
+                    "None of the framework labels matched a known regime, but the profile "
+                    "rates regulatory intensity as High — inferred a multi-regulatory posture "
+                    "from intensity alone, hence the reduced confidence.",
+                    field="org.regulatory_intensity",
+                    inputs={"regulatory_intensity": "High",
+                            "unmatched_labels": list(frameworks)},
+                ),
             )
 
         return TagResult(
             value="None",
             source="deterministic",
             confidence=0.70,
-            evidence=f"No recognized frameworks (raw={frameworks!r}, intensity={intensity or 'unknown'})",
+            evidence=ev.profile(
+                "tenant.compliance.no_framework_match",
+                "No label in the org profile matched a known regulatory regime and "
+                "intensity is not High, so the tenant is treated as unregulated.",
+                field="org.regulatory_frameworks",
+                inputs={"raw_labels": list(frameworks),
+                        "regulatory_intensity": intensity or "unknown"},
+            ),
         )
 
 

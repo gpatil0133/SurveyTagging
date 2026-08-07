@@ -5,6 +5,7 @@ Stage 3, deterministic. No tag dependencies.
 
 from __future__ import annotations
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
@@ -30,15 +31,34 @@ class IsFilterableTagger(QuestionTagger):
 
         if q.is_content_message:
             return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence="Content message")
+                             evidence=ev.content_message("is_filterable", stage=3))
 
         if q.question_type in _FILTERABLE_TYPES:
-            return TagResult(value="Yes", source="deterministic", confidence=1.0,
-                             evidence=f"Categorical type {q.question_type}")
+            return TagResult(
+                value="Yes", source="deterministic", confidence=1.0,
+                evidence=ev.rule(
+                    "question.is_filterable.categorical_type",
+                    f"Question type {q.question_type} produces a bounded set of discrete "
+                    "answer choices, which is exactly what a report filter needs to "
+                    "build a facet from.",
+                    stage=3,
+                    inputs={"question_type": q.question_type},
+                ),
+            )
 
         # Explicit No for text/rating/grid/contact/signature
-        return TagResult(value="No", source="deterministic", confidence=1.0,
-                         evidence=f"Non-categorical type {q.question_type}")
+        return TagResult(
+            value="No", source="deterministic", confidence=1.0,
+            evidence=ev.rule(
+                "question.is_filterable.non_categorical_type",
+                f"Question type {q.question_type} is free text, a rating, a grid, a "
+                "contact block or a signature — none of which yields the discrete, "
+                "bounded answer set a filter facet requires.",
+                stage=3,
+                inputs={"question_type": q.question_type,
+                        "filterable_types": sorted(_FILTERABLE_TYPES)},
+            ),
+        )
 
 
 def create_tagger() -> IsFilterableTagger:

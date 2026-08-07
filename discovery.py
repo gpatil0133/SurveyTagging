@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import sharefs
+
 
 def _as_int(name: str) -> int | None:
     try:
@@ -85,17 +87,13 @@ def probe_root(data_dir: Path) -> dict:
     makes "the share is down / credentials expired" indistinguishable from "this
     tenant has no surveys". The UI needs to tell those apart, so this reports the
     failure instead of hiding it.
+
+    Goes through `sharefs` rather than `Path.is_dir` so that a UNC root is
+    checked over the same authenticated SMB session the readers use — and so
+    that this is the first thing to open that session, since startup no longer
+    connects eagerly.
     """
-    root = Path(data_dir)
-    try:
-        reachable = root.is_dir()
-    except OSError as e:
-        return {"root": str(root), "reachable": False, "error": str(e)}
-    return {
-        "root": str(root),
-        "reachable": reachable,
-        "error": None if reachable else "root does not exist or is not a directory",
-    }
+    return sharefs.probe(data_dir)
 
 
 def discover_catalog(data_dir: Path) -> list[dict]:

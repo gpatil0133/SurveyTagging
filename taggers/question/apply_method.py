@@ -1,5 +1,6 @@
 """Apply method tagger: always System-applied for automated tags."""
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
@@ -22,6 +23,14 @@ class ApplyMethodTagger(QuestionTagger):
             value="System-applied",
             source="deterministic",
             confidence=1.0,
+            evidence=ev.rule(
+                "question.apply_method.always_system",
+                "Every tag this pipeline writes is machine-assigned, so apply_method "
+                "is System-applied by construction. It flips to User-applied only when "
+                "a human overrides a tag downstream — it is not an inference about the "
+                "question.",
+                stage=3,
+            ),
         )
 
 

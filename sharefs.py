@@ -35,7 +35,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import IO, Any
 
 logger = logging.getLogger("survey_tagging.sharefs")
@@ -80,9 +80,24 @@ def normalize(path: Any) -> Path:
     return Path(s)
 
 
+def unc_parts(path: Any) -> tuple[str, ...]:
+    """Components of a normalized UNC root, server first: `('server', 'share', ...)`.
+
+    `Path.parts` cannot be used for this. On Windows the flavour is
+    `WindowsPath`, which folds the whole `//server/share/` anchor into a single
+    part, so a valid root yields `('\\\\server\\share\\', 'dir')` — the server is
+    not addressable and the component count is 2 short of the POSIX flavour's.
+    Reading it with the posix flavour keeps the answer identical on every
+    platform.
+    """
+    posix = PurePosixPath(normalize(path).as_posix())
+    # Leading '//' is its own anchor part under the posix flavour; drop it.
+    return tuple(p for p in posix.parts if p not in ("/", "//"))
+
+
 def server_of(path: Any) -> str:
     """Server component of a UNC path (`//server/share/x` -> `server`)."""
-    return normalize(path).parts[1]
+    return unc_parts(path)[0]
 
 
 def _s(path: Any) -> str:
@@ -139,6 +154,37 @@ def connect(path: Any) -> None:
     smbclient.register_session(server, username=_username, password=_password)
     _registered.add(server)
     logger.info("sharefs_session_registered", extra={"server": server})
+
+
+def probe(path: Any) -> dict:
+    """Can we actually reach and list `path` right now? Never raises.
+
+    Returns `{root, reachable, error}`. This is the diagnosis that used to
+    happen at startup: because the process no longer connects eagerly (see
+    bootstrap.build_context), a bad password or an unreachable server would
+    otherwise only ever show up as an empty tenant list — every discovery
+    function swallows OSError and cannot tell "no surveys" from "cannot log in".
+
+    `connect()` runs first for a UNC root so a credential failure is reported as
+    itself rather than as a missing directory: smbclient surfaces a rejected
+    logon from `is_dir` as a bare OSError that reads like a bad path.
+    """
+    root = normalize(path)
+    try:
+        if is_unc(root):
+            connect(root)
+        reachable = is_dir(root)
+    except Exception as e:  # noqa: BLE001
+        # ValueError (transport refused), OSError (SMB status), RuntimeError
+        # (no credentials configured) all land here and all mean the same thing
+        # to a caller: the root is not usable, and here is why.
+        return {"root": str(root), "reachable": False,
+                "error": f"{type(e).__name__}: {e}"}
+    return {
+        "root": str(root),
+        "reachable": reachable,
+        "error": None if reachable else "root does not exist or is not a directory",
+    }
 
 
 def reset() -> None:

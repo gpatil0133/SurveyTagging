@@ -44,7 +44,6 @@
     <div class="top-tabs" id="topTabs">
       <div class="top-tab" data-action="set-topview" data-topview="surveys">Surveys</div>
       <div class="top-tab" data-action="set-topview" data-topview="tenant">Tenant</div>
-      <div class="top-tab" data-action="set-topview" data-topview="adhoc">Ad-hoc</div>
     </div>
 
     <input type="text" id="navSearch" class="nav-search" placeholder="Filter surveys…"
@@ -60,6 +59,11 @@
   </main>
 
 </div>
+
+<!-- Floating activity ribbon. Deliberately outside .app: a fixed element here
+     cannot take part in the shell grid, so showing it can never move the
+     topbar or sidebar. -->
+<div id="ribbon" role="status" aria-live="polite" hidden></div>
 
 <div id="toasts" aria-live="polite"></div>
 

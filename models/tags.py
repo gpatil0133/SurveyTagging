@@ -14,8 +14,15 @@ class TagResult(BaseModel):
     value: Any = None  # str, list[str], or None
     source: Literal["deterministic", "statistical", "hybrid", "llm", "heuristic"] = "deterministic"
     confidence: float = 1.0
-    evidence: str | None = None
-    reasoning: str | None = None  # LLM reasoning (for auditability)
+    # Why this value was assigned, for non-LLM sources. Non-LLM taggers build
+    # this with `models.evidence` helpers → a typed dict
+    # {type, rule_id, stage, detail, inputs?, quote?, measure?, components?}.
+    # `str` stays accepted so pre-existing artifacts still validate on read;
+    # use `models.evidence.detail_of()` rather than assuming either shape.
+    evidence: str | dict[str, Any] | None = None
+    # Free-text model rationale, for `source="llm"` tags only. The two fields
+    # are complementary, never redundant: `source` tells a consumer which to read.
+    reasoning: str | None = None
     # V5: low_confidence_assigned is for journey_stage / sub_stage_name when
     # the LLM was uncertain or punted to a top-K candidate. The value is set
     # (NEVER null) so downstream coverage can count it; consumers may flag

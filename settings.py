@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path, PureWindowsPath
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 import sharefs
@@ -107,6 +107,38 @@ class Settings(BaseSettings):
     parallel_api_timeout: int = 1800         # 30 min, generous ceiling for `pro`
     parallel_max_retries: int = 1            # extra attempts on empty/malformed agent output (each is a paid run)
 
+    # Where tenant_profile artifacts come from.
+    #
+    #   "parallel" — this service calls Parallel.ai itself (parallel_* above)
+    #                and owns the prompts in tenant_profile/prompts/.
+    #   "smx"      — read profiles the SoGo Research API already generated
+    #                (apismx /AIAccountProfile). Same three agents, so the
+    #                artifacts written to the share are identical either way;
+    #                no Parallel.ai key is needed in this mode.
+    #
+    # The on-disk contract does not change with this setting — only the producer.
+    profile_source: str = "parallel"
+
+    # Bearer token for apismx. Every Research API route requires one.
+    #
+    # Leave empty in a request-scoped context: the caller's own verified JWT is
+    # forwarded instead (same issuer — see auth.py). This static value exists for
+    # headless paths (CLI backfill, the auto-retag scheduler) that have no
+    # inbound request to borrow a token from.
+    smx_token: str = ""
+    smx_request_timeout: float = 60.0
+
+    # When a tenant has no profile on the share AND none in SMX, trigger
+    # /AIAccountProfile/Generate and wait for it. Generation is a write that
+    # starts paid research, so it is gated here as well as per-request.
+    smx_allow_generate: bool = True
+    # Post-generate polling. The observed run produced all three agents in ~44s;
+    # the default window (6 x 15s) leaves generous headroom. Overrunning it is
+    # not an error — generation continues server-side and the next fetch picks
+    # it up from the /Details step.
+    smx_generate_poll_attempts: int = 6
+    smx_generate_poll_interval: float = 15.0
+
     # Logging
     log_level: str = "DEBUG"
     log_format: str = "console"
@@ -144,6 +176,10 @@ class Settings(BaseSettings):
     sogo_host: str = ""
     sogo_apicx_base_url: str = "https://sogolyticsintuc.sevenpv.com/apicx"
     sogo_apipmx_base_url: str = "https://sogolyticsintuc.sevenpv.com/apipmx"
+    # Research API — /AIAccountProfile lives here (profile_source="smx").
+    # apismx responses come back encrypted; apipmx /dcdata decrypts them, which
+    # is why both URLs must track the same host.
+    sogo_apismx_base_url: str = "https://sogolyticsintuc.sevenpv.com/apismx"
     sogo_request_timeout: float = 30.0
     sogo_max_retries: int = 3
     sogo_concurrency: int = 5
@@ -186,6 +222,19 @@ class Settings(BaseSettings):
     sogo_verify_ssl: bool = True
     sogo_ca_bundle_path: str = ""
 
+    @field_validator("share_root", mode="before")
+    @classmethod
+    def _blank_share_root_is_unset(cls, value: object) -> object:
+        """`SURVEY_TAGGER_SHARE_ROOT=` (blank) must mean "not configured".
+
+        Pydantic would otherwise coerce the empty string to `Path('.')`, which is
+        not None and so takes over `data_dir` and `output_dir` below — silently
+        repointing every read and write at the current working directory.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @model_validator(mode="after")
     def _derive_roots_from_share(self) -> "Settings":
         """One share root drives both the input and output trees.
@@ -209,7 +258,7 @@ class Settings(BaseSettings):
             # onto. Judge shape with PureWindowsPath, whose UNC parsing is
             # platform-independent.
             unc = sharefs.normalize(raw)
-            if len(unc.parts) < 3:
+            if len(sharefs.unc_parts(unc)) < 2:
                 raise ValueError(
                     f"SURVEY_TAGGER_SHARE_ROOT={raw!r} names a server but no share. "
                     "A UNC root needs at least //server/share."
@@ -275,9 +324,24 @@ class Settings(BaseSettings):
         defaults = {
             "sogo_apicx_base_url": "https://sogolyticsintuc.sevenpv.com/apicx",
             "sogo_apipmx_base_url": "https://sogolyticsintuc.sevenpv.com/apipmx",
+            "sogo_apismx_base_url": "https://sogolyticsintuc.sevenpv.com/apismx",
         }
         if self.sogo_apicx_base_url == defaults["sogo_apicx_base_url"]:
             self.sogo_apicx_base_url = f"https://{host}/apicx"
         if self.sogo_apipmx_base_url == defaults["sogo_apipmx_base_url"]:
             self.sogo_apipmx_base_url = f"https://{host}/apipmx"
+        if self.sogo_apismx_base_url == defaults["sogo_apismx_base_url"]:
+            self.sogo_apismx_base_url = f"https://{host}/apismx"
+        return self
+
+    @model_validator(mode="after")
+    def _check_profile_source(self) -> "Settings":
+        allowed = {"parallel", "smx"}
+        value = (self.profile_source or "").strip().lower()
+        if value not in allowed:
+            raise ValueError(
+                f"SURVEY_TAGGER_PROFILE_SOURCE={self.profile_source!r} is not one of "
+                f"{sorted(allowed)}."
+            )
+        self.profile_source = value
         return self

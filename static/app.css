@@ -40,7 +40,13 @@ body {
 }
 [hidden] { display: none !important; }
 
-/* ===== LAYOUT SHELL ===== */
+/* ===== LAYOUT SHELL =====
+   Every shell child is placed EXPLICITLY. #busybar is a definitely-placed item
+   that fills row 1, so any auto-placed sibling would be bumped out of row 1 the
+   moment the bar switches from display:none to display:block — which pushed the
+   topbar into the 1fr row and the sidebar into an implicit third row on every
+   click that set the busy flag. Explicit rows/columns make placement
+   independent of whether the bar is showing. */
 .app {
   display: grid;
   grid-template-columns: 300px 1fr;
@@ -48,21 +54,28 @@ body {
   height: 100vh;
 }
 aside.sidebar {
+  grid-column: 1;
+  grid-row: 2;
   background: var(--surface);
   border-right: 1px solid var(--border);
   overflow-y: auto;
+  min-height: 0;
   padding: 12px;
   display: flex;
   flex-direction: column;
 }
 main.workspace {
+  grid-column: 2;
+  grid-row: 2;
   overflow-y: auto;
+  min-height: 0;
   padding: 24px 32px 60px;
 }
 
 /* ===== TOPBAR + ENTRY FORMS ===== */
 header.topbar {
   grid-column: 1 / -1;
+  grid-row: 1;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -385,6 +398,18 @@ header.topbar {
 .src.unknown       { background: var(--src-unknown-bg);       color: var(--src-unknown-fg);       }
 .src.derived       { background: var(--src-unknown-bg);       color: var(--src-unknown-fg);       font-style: italic; }
 
+/* Non-default tag statuses. Outlined rather than filled so they read as a
+   caveat on the value next to them, not as a second source badge. */
+.src[class*="status-"] {
+  background: transparent;
+  border: 1px dashed currentColor;
+  opacity: 0.85;
+}
+.src.status-pending_llm             { color: var(--src-llm-fg); }
+.src.status-low_confidence_assigned { color: var(--conf-low, #b45309); }
+.src.status-failed                  { color: var(--danger, #b91c1c); }
+.src.status-skipped                 { color: var(--src-unknown-fg); }
+
 /* ===== CONFIDENCE ===== */
 .conf {
   display: flex;
@@ -429,17 +454,20 @@ header.topbar {
   user-select: none;
 }
 .question-head:hover { background: #fafbfc; }
-/* the middle column (title + summary) is the one that grows */
-.question-head > div { flex: 1; min-width: 0; }
+/* Only the middle column (title + summary) grows. `.qid` is a div too, so a
+   bare `> div` selector also stretched the number cell to half the row and
+   pushed the question text far off the left edge. */
+.question-head > .qbody { flex: 1 1 auto; min-width: 0; }
 .question-card.expanded .question-head { border-bottom: 1px solid var(--border); }
-.question-head .qid {
+.question-head > .qid {
+  flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
   color: var(--text-faint);
   font-weight: 600;
-  min-width: 36px;
+  min-width: 28px;
+  text-align: right;
 }
 .question-head .qtitle {
-  flex: 1;
   font-weight: 500;
   color: var(--text);
 }
@@ -757,6 +785,48 @@ textarea.code {
 .dot.untagged { background: var(--text-faint); }
 .dot.unknown  { background: transparent; border: 1px solid var(--border-strong); }
 
+/* ===== FLOATING ACTIVITY RIBBON =====
+   Lives outside .app (fixed), so it can never disturb the shell grid. Says what
+   the app is waiting on — the 2px busybar alone does not. */
+#ribbon {
+  position: fixed;
+  top: 68px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100vw - 32px));
+  padding: 8px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 6px 20px rgba(16, 24, 40, .12);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  animation: ribbon-in 160ms ease;
+}
+#ribbon .ribbon-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#ribbon .ribbon-more {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+#ribbon .spinner { flex-shrink: 0; color: var(--accent); }
+#ribbon.slow { border-color: #fde68a; background: #fffbeb; color: var(--warn); }
+@keyframes ribbon-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(-8px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
 /* ===== TOASTS ===== */
 #toasts {
   position: fixed;
@@ -899,11 +969,12 @@ details.ev-reasoning > div {
 /* ===== RESPONSIVE ===== */
 @media (max-width: 900px) {
   .app { grid-template-columns: 1fr; grid-template-rows: 56px auto auto 1fr; }
-  header.topbar { grid-row: 1; flex-wrap: wrap; padding: 8px 14px; }
+  header.topbar { grid-column: 1; grid-row: 1; flex-wrap: wrap; padding: 8px 14px; }
   .topbar-left { flex-wrap: wrap; gap: 12px; }
-  #busybar { grid-row: 2; align-self: stretch; }
-  aside.sidebar { grid-row: 3; max-height: 40vh; }
-  main.workspace { grid-row: 4; padding: 16px; }
+  #busybar { grid-column: 1; grid-row: 2; align-self: stretch; }
+  aside.sidebar { grid-column: 1; grid-row: 3; max-height: 40vh; }
+  main.workspace { grid-column: 1; grid-row: 4; padding: 16px; }
+  #ribbon { top: auto; bottom: 16px; left: 16px; right: 16px; transform: none; }
 }
 
 /* ===== REDUCED-MOTION ===== */
@@ -916,4 +987,5 @@ details.ev-reasoning > div {
   #busybar::after { animation: none; width: 100%; background: var(--accent); }
   .spinner { animation: none; }
   .toast { animation: none; }
+  #ribbon { animation: none; }
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.tags import TagAccumulator, TagResult
 from taggers.base import ProjectTagger
@@ -38,7 +39,16 @@ class RelationshipTagger(ProjectTagger):
                 value="Journey-based",
                 source="hybrid",
                 confidence=0.85,
-                evidence=f"Multiple survey sections: {cm_sections[:4]}",
+                evidence=ev.rule(
+                    "project.relationship.multi_section",
+                    f"The survey is split into {len(cm_sections)} content-message "
+                    "sections. Three or more named sections means the survey walks the "
+                    "respondent through distinct stages rather than asking about one "
+                    "moment — that is a journey design.",
+                    stage=4,
+                    inputs={"section_count": len(cm_sections),
+                            "sections": cm_sections[:4]},
+                ),
             )
 
         # Pulse: short + recurring
@@ -48,7 +58,15 @@ class RelationshipTagger(ProjectTagger):
                 value="Pulse",
                 source="hybrid",
                 confidence=0.80,
-                evidence=f"Short survey ({len(non_cm)} questions) with recurring cadence",
+                evidence=ev.rule(
+                    "project.relationship.short_and_recurring",
+                    f"Only {len(non_cm)} real questions, and the cadence tagger already "
+                    "found a recurring fielding pattern. Short plus repeated is the "
+                    "definition of a pulse.",
+                    stage=4,
+                    inputs={"question_count": len(non_cm),
+                            "survey_cadence": "Recurring"},
+                ),
             )
 
         # Transactional signals: recent event references
@@ -65,7 +83,14 @@ class RelationshipTagger(ProjectTagger):
                 value="Transactional",
                 source="hybrid",
                 confidence=0.80,
-                evidence=f"Transactional keywords: {trans_matches[:3]}",
+                evidence=ev.rule(
+                    "project.relationship.event_anchor",
+                    "The title or opening questions anchor to a specific event the "
+                    'respondent just had ("your recent visit", "after your..."). '
+                    "Surveys tied to one transaction are transactional, not relational.",
+                    stage=4,
+                    inputs={"matched_phrases": trans_matches[:3]},
+                ),
             )
 
         # Relational signals: NPS, overall satisfaction, no event anchor
@@ -79,7 +104,22 @@ class RelationshipTagger(ProjectTagger):
                 value="Relational",
                 source="hybrid",
                 confidence=0.75,
-                evidence="NPS + overall satisfaction without event anchor",
+                evidence=ev.hybrid(
+                    "project.relationship.relational_signals",
+                    "Two signals point the same way and a third rules out the "
+                    "alternative: the survey asks NPS and an overall-satisfaction "
+                    "question, and nothing anchors it to a single event. That is a "
+                    "standing measure of the whole relationship.",
+                    components=[
+                        ev.component("NPS question", "brand-level loyalty measure"),
+                        ev.component("overall satisfaction question",
+                                     "asks about the relationship, not one visit"),
+                        ev.component("no event anchor",
+                                     "no transactional phrasing matched"),
+                    ],
+                    stage=4,
+                    inputs={"has_nps": True, "has_overall_satisfaction": True},
+                ),
             )
 
         # Phase 4 prior: when no deterministic signal fires, fall back to
@@ -98,9 +138,18 @@ class RelationshipTagger(ProjectTagger):
                 value=mapped,
                 source="hybrid",
                 confidence=0.70,
-                evidence=(
-                    f"Parallel.ai cx.relationship_type={profile.relationship_type!r} "
-                    f"(High confidence) → {mapped}"
+                evidence=ev.profile(
+                    "project.relationship.tenant_profile_high_conf",
+                    f"No signal in the survey itself decided this, so the tenant "
+                    f'profile is used: the CX agent reports a "'
+                    f'{profile.relationship_type}" commercial relationship, which maps '
+                    f"to {mapped}. Only High-confidence agent output is trusted this "
+                    "far — Medium and Low fall through to the LLM instead.",
+                    field="cx.relationship_type",
+                    stage=4,
+                    inputs={"agent_value": profile.relationship_type,
+                            "mapped_to": mapped,
+                            "agent_confidence": "High"},
                 ),
             )
 
@@ -109,7 +158,16 @@ class RelationshipTagger(ProjectTagger):
             value="Relational",
             source="llm",
             confidence=0.50,
-            evidence="Requires LLM classification",
+            evidence=ev.fallback(
+                "project.relationship.deferred_to_llm",
+                "Nothing fired: fewer than three sections, not short-and-recurring, no "
+                "event anchor, no NPS-plus-overall pair, and no High-confidence tenant "
+                "profile. Relational is a placeholder at 0.50 for LLM Call 1 to "
+                "overwrite — seeing it in the output means that call did not answer.",
+                stage=4,
+                inputs={"section_count": len(cm_sections),
+                        "question_count": len(non_cm)},
+            ),
             status="assigned",
         )
 

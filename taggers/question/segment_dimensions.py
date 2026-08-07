@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 
+from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
@@ -73,12 +74,22 @@ class SegmentDimensionsTagger(QuestionTagger):
 
         if q.is_content_message:
             return TagResult(value=[], source="deterministic", status="skipped",
-                             evidence="Content message")
+                             evidence=ev.content_message("segment_dimensions", stage=4))
 
         segmentable = accumulator.get_question_tag_value(q.question_id, "is_segmentable")
         if segmentable != "Yes":
-            return TagResult(value=[], source="deterministic", confidence=1.0,
-                             evidence="Not segmentable")
+            return TagResult(
+                value=[], source="deterministic", confidence=1.0,
+                evidence=ev.rule(
+                    "question.segment_dimensions.not_segmentable",
+                    f"is_segmentable is {segmentable or 'unset'}, so there is nothing "
+                    "to enumerate. The empty list is deliberate — this dimension stays "
+                    "present in the schema rather than being skipped, so consumers can "
+                    "tell 'no dimensions' from 'never evaluated'.",
+                    stage=4,
+                    inputs={"is_segmentable": segmentable or "(unset)"},
+                ),
+            )
 
         dims: set[str] = set()
 
@@ -95,12 +106,40 @@ class SegmentDimensionsTagger(QuestionTagger):
                     dims.add(dim)
 
         if dims:
-            return TagResult(value=sorted(dims), source="deterministic",
-                             confidence=0.85, evidence=f"Extracted from title/options")
+            title_hits = sorted({d for p, d in _TITLE_PATTERNS if p.search(q.title)})
+            return TagResult(
+                value=sorted(dims), source="deterministic", confidence=0.85,
+                evidence=ev.hybrid(
+                    "question.segment_dimensions.extracted",
+                    f"Recognized {len(dims)} standard segmentation dimension(s) in this "
+                    "question — from its wording, from its answer options, or both. "
+                    "Each is listed below with where it was found.",
+                    components=(
+                        [ev.component(d, "matched the question title") for d in title_hits]
+                        + [ev.component(d, "matched the answer options")
+                           for d in sorted(dims - set(title_hits))]
+                    ),
+                    stage=4,
+                    inputs={"dimension_count": len(dims)},
+                    quote=q.title,
+                ),
+            )
 
         # Segmentable but dimension not inferred — return empty list, not skip
-        return TagResult(value=[], source="deterministic", confidence=0.60,
-                         evidence="Segmentable but dimension unclear")
+        return TagResult(
+            value=[], source="deterministic", confidence=0.60,
+            evidence=ev.fallback(
+                "question.segment_dimensions.unrecognized",
+                "The question IS segmentable, but neither its wording nor its answer "
+                "options matched any of the standard dimensions this tagger knows "
+                "(department, region, age, tenure, plan...). It probably segments by "
+                "something tenant-specific — worth a human look, which is what "
+                "separates this empty list from the not-segmentable one above.",
+                stage=4,
+                inputs={"is_segmentable": "Yes",
+                        "option_count": len(q.answer_options)},
+            ),
+        )
 
 
 def create_tagger() -> SegmentDimensionsTagger:
