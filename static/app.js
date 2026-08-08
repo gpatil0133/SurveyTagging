@@ -35,7 +35,8 @@ window.ST = window.ST || {};
   var GET_TIMEOUT_MS = 30000;
   var TOAST_MS = 6000;
 
-  var LS = { corp: "st.corp", topView: "st.topview", profileJob: "st.profilejob" };
+  var LS = { corp: "st.corp", topView: "st.topview", profileJob: "st.profilejob",
+             tab: "st.tab", theme: "st.theme", density: "st.density" };
   var SS = { taxonomy: "st.taxonomy.v1" };
 
   /* The platform shell's access token, written to same-origin localStorage on
@@ -72,6 +73,59 @@ window.ST = window.ST || {};
   var SHARE_ERR_RE = /\[WinError (53|64|67|1231|1326)\]|network path was not found|network name cannot be found|semaphore timeout|no such file or directory/i;
 
   /* ==================================================================
+   * 1b. THEME + DENSITY
+   *
+   * Two attributes on <html>; app.css hangs every alias token off them.
+   * Deliberately NOT part of the persist()/restore() app-state blob: restore()
+   * runs inside boot(), which is one DOMContentLoaded away, and by then the
+   * shell has already painted — a dark-mode user would see a white flash on
+   * every reload. So these read their own keys and apply themselves at script
+   * evaluation, before anything renders. Same localStorage convention as the
+   * rest of the file (an `LS` key, writes wrapped in try/catch because private
+   * mode throws), just on an earlier schedule.
+   *
+   * Manual toggle only: prefers-color-scheme is deliberately not consulted.
+   * ================================================================== */
+
+  var THEMES = ["light", "dark"];
+  var DENSITIES = ["comfortable", "compact"];
+
+  var ui = { theme: "light", density: "comfortable" };
+
+  function readChoice(key, allowed, dflt) {
+    try {
+      var v = localStorage.getItem(key);
+      return allowed.indexOf(v) >= 0 ? v : dflt;
+    } catch (e) { return dflt; }        // private mode / storage disabled
+  }
+
+  function applyChrome() {
+    var root = document.documentElement;
+    root.setAttribute("data-theme", ui.theme);
+    root.setAttribute("data-density", ui.density);
+  }
+
+  function persistChrome() {
+    try {
+      localStorage.setItem(LS.theme, ui.theme);
+      localStorage.setItem(LS.density, ui.density);
+    } catch (e) { /* private mode — the attributes still hold for this session */ }
+  }
+
+  /* The buttons live in the static topbar and are never re-rendered, so their
+   * pressed state is pushed rather than pulled. */
+  function syncChromeButtons() {
+    var t = document.getElementById("themeBtn");
+    var d = document.getElementById("densityBtn");
+    if (t) t.setAttribute("aria-pressed", ui.theme === "dark" ? "true" : "false");
+    if (d) d.setAttribute("aria-pressed", ui.density === "compact" ? "true" : "false");
+  }
+
+  ui.theme = readChoice(LS.theme, THEMES, "light");
+  ui.density = readChoice(LS.density, DENSITIES, "comfortable");
+  applyChrome();
+
+  /* ==================================================================
    * 2. STATE
    * ================================================================== */
 
@@ -90,7 +144,7 @@ window.ST = window.ST || {};
     survey: null,                    // normalized payload
     surveyError: null,
     etags: {},                       // {"<no>|jc": etag}
-    activeTab: "project",            // project | questions | journey | raw
+    activeTab: "summary",            // summary | project | questions | journey | raw
     includeCandidates: false,
 
     sourceFilter: new Set(U.ALL_SOURCES),
@@ -131,6 +185,7 @@ window.ST = window.ST || {};
     try {
       if (state.corpNo) localStorage.setItem(LS.corp, String(state.corpNo));
       localStorage.setItem(LS.topView, state.topView);
+      localStorage.setItem(LS.tab, state.activeTab);
       if (state.profileJob) localStorage.setItem(LS.profileJob, JSON.stringify(state.profileJob));
       else localStorage.removeItem(LS.profileJob);
     } catch (e) { /* private mode / disabled storage — not worth surfacing */ }
@@ -140,6 +195,12 @@ window.ST = window.ST || {};
     try {
       var v = localStorage.getItem(LS.topView);
       if (v === "surveys" || v === "tenant") state.topView = v;
+      // A stored tab naming something SURVEY_TABS no longer defines (a renamed
+      // or dropped tab from an older build) must land on Summary, not on a key
+      // that renders nothing.
+      var tab = localStorage.getItem(LS.tab);
+      state.activeTab = SURVEY_TABS.some(function (t) { return t.key === tab; })
+        ? tab : "summary";
       var job = localStorage.getItem(LS.profileJob);
       if (job) state.profileJob = JSON.parse(job);
       var tax = sessionStorage.getItem(SS.taxonomy);
@@ -154,7 +215,8 @@ window.ST = window.ST || {};
   var el = {};
   function grabDom() {
     ["corpForm","corpInput","corpBtn","surveyForm","surveyInput","surveyBtn",
-     "topStatus","busybar","ribbon","topTabs","navSearch","navFilters","sidebarHeading",
+     "topStatus","themeBtn","densityBtn","busybar","ribbon","topTabs","navSearch",
+     "navFilters","sidebarHeading",
      "nav","workspace","banner","content","toasts"].forEach(function (id) {
       el[id] = document.getElementById(id);
     });
@@ -481,6 +543,21 @@ window.ST = window.ST || {};
     { key: "taxonomy", label: "Taxonomy" }
   ];
 
+  /* The rows the sidebar is actually showing, given the filter chips and the
+   * search box. Split out of renderNav because j/k step through exactly this
+   * set — two copies of the predicate would drift the moment either changes. */
+  function filteredSurveys() {
+    var needle = state.navSearch.toLowerCase().trim();
+    return state.surveys.filter(function (s) {
+      if (state.navFilter === "tagged" && !s.tagged) return false;
+      if (state.navFilter === "untagged" && s.tagged) return false;
+      if (!needle) return true;
+      var name = state.surveyNames[s.survey_no] || "";
+      return String(s.survey_no).indexOf(needle) >= 0 ||
+             name.toLowerCase().indexOf(needle) >= 0;
+    });
+  }
+
   function renderNav() {
     var surveys = state.topView === "surveys";
     el.navSearch.hidden = !surveys;
@@ -490,7 +567,8 @@ window.ST = window.ST || {};
       el.sidebarHeading.textContent = "Tenant";
       el.nav.innerHTML = TENANT_SECTIONS.map(function (s) {
         return '<li class="survey-item' + (state.tenantSection === s.key ? " active" : "") +
-               '" data-action="set-tenant-section" data-section="' + s.key + '">' +
+               '" role="button" tabindex="0"' +
+               ' data-action="set-tenant-section" data-section="' + s.key + '">' +
                '<span class="stitle">' + s.label + "</span></li>";
       }).join("");
       return;
@@ -504,8 +582,9 @@ window.ST = window.ST || {};
     el.navFilters.innerHTML =
       '<div class="filter-group" style="margin-bottom:10px">' +
       ["all", "tagged", "untagged"].map(function (f) {
-        return '<span class="chip toggle ' + (state.navFilter === f ? "on" : "off") +
-               '" data-action="set-nav-filter" data-filter="' + f + '">' +
+        return '<span class="toggle ' + (state.navFilter === f ? "on" : "off") +
+               '" role="button" tabindex="0"' +
+               ' data-action="set-nav-filter" data-filter="' + f + '">' +
                f.charAt(0).toUpperCase() + f.slice(1) + "</span>";
       }).join("") + "</div>";
 
@@ -519,15 +598,7 @@ window.ST = window.ST || {};
       return;
     }
 
-    var needle = state.navSearch.toLowerCase().trim();
-    var rows = state.surveys.filter(function (s) {
-      if (state.navFilter === "tagged" && !s.tagged) return false;
-      if (state.navFilter === "untagged" && s.tagged) return false;
-      if (!needle) return true;
-      var name = state.surveyNames[s.survey_no] || "";
-      return String(s.survey_no).indexOf(needle) >= 0 ||
-             name.toLowerCase().indexOf(needle) >= 0;
-    });
+    var rows = filteredSurveys();
 
     if (!rows.length) {
       el.nav.innerHTML = '<li class="survey-item" style="cursor:default"><span class="stitle">' +
@@ -542,7 +613,8 @@ window.ST = window.ST || {};
       var name = state.surveyNames[s.survey_no] || "";
       return '<li class="survey-item' +
         (state.activeSurveyNo === s.survey_no ? " active" : "") +
-        '" data-action="select-survey" data-survey-no="' + s.survey_no + '"' +
+        '" role="button" tabindex="0"' +
+        ' data-action="select-survey" data-survey-no="' + s.survey_no + '"' +
         (name ? ' title="' + U.escapeHtml(name) + '"' : "") + ">" +
         '<span class="dot ' + dot + '"></span>' +
         '<span class="sno">' + s.survey_no + "</span>" +
@@ -568,6 +640,7 @@ window.ST = window.ST || {};
   }
 
   var SURVEY_TABS = [
+    { key: "summary",   label: "Summary" },
     { key: "project",   label: "Project Tags" },
     { key: "questions", label: "Questions" },
     { key: "journey",   label: "Journey" },
@@ -577,9 +650,25 @@ window.ST = window.ST || {};
   function tabsHtml(tabs, active, action) {
     return '<div class="tabs">' + tabs.map(function (t) {
       return '<div class="tab' + (active === t.key ? " active" : "") +
-             '" data-action="' + action + '" data-tab="' + t.key + '">' +
+             '" role="button" tabindex="0"' +
+             ' data-action="' + action + '" data-tab="' + t.key + '">' +
              U.escapeHtml(t.label) + "</div>";
     }).join("") + "</div>";
+  }
+
+  /* Loading placeholders. A sentence tells you to wait; a skeleton tells you
+   * what is coming, and holds the layout so nothing jumps when it lands.
+   * `.skel` / `.skel--line` / `.skel--card` are the only two shapes the design
+   * contract defines; the shimmer itself is pure CSS. */
+  function skeletonHtml(lines, cards) {
+    var out = [], i;
+    for (i = 0; i < lines; i++) out.push('<div class="skel skel--line"></div>');
+    if (cards) {
+      var boxes = [];
+      for (i = 0; i < cards; i++) boxes.push('<div class="skel skel--card"></div>');
+      out.push('<div class="tag-grid">' + boxes.join("") + "</div>");
+    }
+    return out.join("");
   }
 
   function renderSurveys() {
@@ -592,11 +681,10 @@ window.ST = window.ST || {};
     }
 
     if (state.activeSurveyNo == null) {
-      el.content.innerHTML = R.emptyState(
-        "Corp " + state.corpNo,
-        state.surveysLoaded
-          ? "Pick a survey from the sidebar, or type a survey number in the topbar."
-          : "Loading surveys…", "");
+      el.content.innerHTML = state.surveysLoaded
+        ? R.emptyState("Corp " + state.corpNo,
+            "Pick a survey from the sidebar, or type a survey number in the topbar.", "")
+        : skeletonHtml(2, 6);
       return;
     }
 
@@ -620,7 +708,7 @@ window.ST = window.ST || {};
     }
 
     if (!state.survey) {
-      el.content.innerHTML = R.emptyState("Loading survey " + state.activeSurveyNo + "…", "", "");
+      el.content.innerHTML = skeletonHtml(3, 8);
       return;
     }
 
@@ -628,7 +716,12 @@ window.ST = window.ST || {};
       return t.key !== "journey" || !!state.survey.survey_journey;
     });
     var active = tabs.some(function (t) { return t.key === state.activeTab; })
-      ? state.activeTab : "project";
+      ? state.activeTab : "summary";
+    // Keep the state in step with what is on screen: renderTabBody() repaints
+    // from state.activeTab, so leaving a dropped tab (journey, on a survey with
+    // no journey) in there would make the next filter keystroke render a body
+    // no tab is highlighting.
+    state.activeTab = active;
 
     el.content.innerHTML =
       '<div class="section-head"><div class="survey-header">' +
@@ -643,6 +736,13 @@ window.ST = window.ST || {};
 
   function surveyTabBody(tab) {
     var s = state.survey;
+    // Summary is a read-out of the whole survey, so it takes no filter bar —
+    // filtering it would mean summarising a subset and calling it the total.
+    if (tab === "summary") {
+      return typeof R.summary === "function"
+        ? R.summary(s, state)
+        : R.emptyState("Summary unavailable", "This build of render.js has no summary view.", "");
+    }
     if (tab === "raw") return R.rawJson(s);
     if (tab === "journey") {
       return R.filterBar(state, { journeyToggle: true }) + R.journey(s, state);
@@ -692,6 +792,84 @@ window.ST = window.ST || {};
     cards.forEach(function (card) { card.classList.toggle("expanded", open); });
   }
 
+  /* `e` is a single toggle, so it has to read the screen rather than a flag:
+   * anything still closed means "open everything", otherwise close everything. */
+  function toggleExpandAll() {
+    var cards = questionCardNodes();
+    if (!cards.length) return;
+    var anyClosed = cards.some(function (c) { return !c.classList.contains("expanded"); });
+    if (anyClosed) ACTIONS["expand-all"]();
+    else ACTIONS["collapse-all"]();
+  }
+
+  /* Scroll a node to the top of the workspace by adjusting the container's own
+   * scrollTop. scrollIntoView() would be shorter, but it also scrolls every
+   * scrollable ancestor including the document, which on a narrow viewport
+   * drags the topbar off screen. The sticky filter bar is measured rather than
+   * assumed so the target never lands underneath it. */
+  function scrollIntoWorkspace(node) {
+    if (!node || !el.workspace) return;
+    var bar = el.workspace.querySelector(".filters");
+    var pad = (bar ? bar.getBoundingClientRect().height : 0) + 16;
+    var top = node.getBoundingClientRect().top - el.workspace.getBoundingClientRect().top;
+    el.workspace.scrollTop += top - pad;
+  }
+
+  /* Find the project tag card for a dimension. render.js does not promise a
+   * data-dim on .tag-card, so the label text is the fallback route in — it is
+   * the same string ST.dims produced, not a guess. */
+  function projectCardFor(dim) {
+    var body = document.getElementById("tabBody");
+    if (!body || !dim) return null;
+    var direct = body.querySelector('.tag-card[data-dim="' + dim + '"]');
+    if (direct) return direct;
+    var label = D.meta(dim).label;
+    var cards = body.querySelectorAll(".tag-card");
+    for (var i = 0; i < cards.length; i++) {
+      var name = cards[i].querySelector(".tag-name");
+      if (name && name.textContent.indexOf(label) === 0) return cards[i];
+    }
+    return null;
+  }
+
+  /* Secondary dimensions live inside <details class="dim-more">; a card the
+   * user cannot see is not a destination. */
+  function revealAncestors(node) {
+    var d = node && node.parentNode;
+    while (d && d !== document.body) {
+      if (d.tagName === "DETAILS") d.open = true;
+      d = d.parentNode;
+    }
+  }
+
+  /* Summary → the tag itself. A question row switches to Questions, narrows the
+   * search to that question and opens its card; a project row switches to
+   * Project Tags. Either way the tab body is rebuilt first, then scrolled —
+   * the node does not exist until the swap has happened. */
+  function gotoTag(dim, qkey) {
+    if (!state.survey) return;
+    var node;
+
+    if (qkey) {
+      state.activeTab = "questions";
+      state.questionSearch = String(qkey);
+      state.questionView = "cards";        // the table has no card to expand
+      state.expandedQuestions.add(String(qkey));
+      persist();
+      renderWorkspace();
+      node = document.querySelector('.question-card[data-q="' +
+             String(qkey).replace(/"/g, '\\"') + '"]');
+      if (node) node.classList.add("expanded");
+    } else {
+      state.activeTab = "project";
+      persist();
+      renderWorkspace();
+      node = projectCardFor(dim);
+    }
+
+    if (node) { revealAncestors(node); scrollIntoWorkspace(node); }
+  }
+
   /* ==================================================================
    * 9. TENANT SECTIONS
    * ================================================================== */
@@ -730,7 +908,7 @@ window.ST = window.ST || {};
       return head + R.errorState("Could not load tenant tags",
         state.tenantTagsError.detail, "reload-tenant-tags");
     }
-    if (!state.tenantTags) return head + R.emptyState("Loading…", "", "");
+    if (!state.tenantTags) return head + skeletonHtml(1, 6);
     return head + R.tenantTags(state.tenantTags, state);
   }
 
@@ -801,7 +979,7 @@ window.ST = window.ST || {};
     } else if (state.profileError) {
       body = R.errorState("Could not load profile", state.profileError.detail, "profile-reload");
     } else if (!state.profile) {
-      body = R.emptyState("Loading…", "", "");
+      body = skeletonHtml(1, 4);
     } else {
       body = R.profileSummary(state.profile) + R.profileAgents(state.profileAgents);
     }
@@ -1372,7 +1550,18 @@ window.ST = window.ST || {};
       renderAll();
       if (state.topView === "tenant") loadTenantSection();
     },
-    "set-tab": function (n) { state.activeTab = n.dataset.tab; renderWorkspace(); },
+    "set-tab": function (n) { state.activeTab = n.dataset.tab; persist(); renderWorkspace(); },
+    "goto-tag": function (n) { gotoTag(n.dataset.dim, n.dataset.qkey); },
+
+    "toggle-theme": function () {
+      ui.theme = ui.theme === "dark" ? "light" : "dark";
+      applyChrome(); persistChrome(); syncChromeButtons();
+    },
+    "toggle-density": function () {
+      ui.density = ui.density === "compact" ? "comfortable" : "compact";
+      applyChrome(); persistChrome(); syncChromeButtons();
+    },
+
     "set-tenant-section": function (n) {
       state.topView = "tenant";
       state.tenantSection = n.dataset.section;
@@ -1462,6 +1651,112 @@ window.ST = window.ST || {};
     else if (s === "profile" && !state.profile && !state.profileError) loadProfile();
   }
 
+  /* ==================================================================
+   * 11b. KEYBOARD
+   * ================================================================== */
+
+  function isTypingTarget(n) {
+    if (!n || !n.tagName) return false;
+    return n.tagName === "INPUT" || n.tagName === "TEXTAREA" ||
+           n.tagName === "SELECT" || n.isContentEditable === true;
+  }
+
+  // The two boxes `/` and Esc act on. The corp / survey entry fields are not
+  // filters — clearing what someone is halfway through typing is not a service.
+  function isFilterInput(n) {
+    return !!n && (n.id === "qSearch" || n === el.navSearch);
+  }
+
+  /* Whichever filter box is on screen. The question search only exists while
+   * the Questions tab is rendered, so it wins when present. */
+  function visibleFilterInput() {
+    var qs = document.getElementById("qSearch");
+    if (qs) return qs;
+    if (el.navSearch && !el.navSearch.hidden) return el.navSearch;
+    return null;
+  }
+
+  function clearFilterInput(box) {
+    box.value = "";
+    if (box.id === "qSearch") { state.questionSearch = ""; renderTabBody(); }
+    else {
+      state.navSearch = "";
+      if (state.topView === "tenant" && state.tenantSection === "taxonomy") renderTenant();
+      else renderNav();
+    }
+  }
+
+  /* j / k walk the list the sidebar is actually showing — the filter chips and
+   * the search box narrow it, and the keyboard must not teleport to a row that
+   * is not on screen. Stops at both ends rather than wrapping: silently
+   * jumping from the last survey to the first reads as a bug. */
+  function stepSurvey(delta) {
+    if (state.topView !== "surveys") return;
+    var rows = filteredSurveys();
+    if (!rows.length) return;
+    var i = -1;
+    for (var k = 0; k < rows.length; k++) {
+      if (rows[k].survey_no === state.activeSurveyNo) { i = k; break; }
+    }
+    var next = i < 0 ? (delta > 0 ? 0 : rows.length - 1) : i + delta;
+    if (next < 0 || next >= rows.length) return;
+    selectSurvey(rows[next].survey_no);
+    var li = el.nav.querySelector('.survey-item[data-survey-no="' + rows[next].survey_no + '"]');
+    if (li && li.scrollIntoView) {
+      try { li.scrollIntoView({ block: "nearest" }); } catch (e) { li.scrollIntoView(); }
+    }
+  }
+
+  function onKeydown(e) {
+    if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+    var typing = isTypingTarget(e.target);
+    var key = e.key;
+
+    // Esc is the one shortcut that works from inside a field — that is the
+    // whole point of it.
+    if (key === "Escape" || key === "Esc") {
+      var box = isFilterInput(e.target) ? e.target : visibleFilterInput();
+      if (box && box.value) { e.preventDefault(); clearFilterInput(box); }
+      return;
+    }
+
+    // render.js marks .toggle / .tab / .top-tab / .survey-item as
+    // role="button" tabindex="0"; a focusable control that ignores the keyboard
+    // is worse than one that is not focusable at all. The action itself may sit
+    // on the element or on an ancestor, so it is looked up the same way the
+    // click handler does it.
+    if (key === "Enter" || key === " " || key === "Spacebar") {
+      if (typing) return;
+      var hit = e.target && e.target.closest
+        ? e.target.closest(".toggle,.tab,.top-tab,.survey-item")
+        : null;
+      if (!hit) return;
+      e.preventDefault();          // Space would otherwise scroll the workspace
+      var act = hit.closest("[data-action]");
+      var fn = act && ACTIONS[act.dataset.action];
+      if (fn) fn(act, e);
+      return;
+    }
+
+    if (typing) return;
+
+    if (key === "/") {
+      var target = visibleFilterInput();
+      if (!target) return;
+      e.preventDefault();          // otherwise "/" lands in the box we just focused
+      target.focus();
+      try { target.select(); } catch (e2) {}
+      return;
+    }
+    if (key === "j") { e.preventDefault(); stepSurvey(1); return; }
+    if (key === "k") { e.preventDefault(); stepSurvey(-1); return; }
+    if (key === "e") { e.preventDefault(); toggleExpandAll(); }
+  }
+
+  /* ==================================================================
+   * 11c. WIRING
+   * ================================================================== */
+
   function wire() {
     document.addEventListener("click", function (e) {
       var node = e.target.closest("[data-action]");
@@ -1471,6 +1766,8 @@ window.ST = window.ST || {};
       e.preventDefault();
       fn(node, e);
     });
+
+    document.addEventListener("keydown", onKeydown);
 
     el.corpForm.addEventListener("submit", function (e) {
       e.preventDefault();
@@ -1521,6 +1818,10 @@ window.ST = window.ST || {};
 
   function boot() {
     grabDom();
+    // The attributes were set at script evaluation (section 1b) so the first
+    // paint is already correct; this only tells the buttons what they are
+    // showing.
+    syncChromeButtons();
     restore();
     wire();
     renderAll();

@@ -35,15 +35,45 @@
       </form>
     </div>
 
-    <div class="totals" id="topStatus"></div>
+    <!-- Right-hand group. The wrapper is deliberately class-less and inline
+         styled: header.topbar is `justify-content: space-between`, so leaving
+         three bare children here would strand the status text in the middle of
+         the bar. Grouping keeps the topbar a two-child flex row exactly as the
+         shell grid expects. -->
+    <div style="display:flex;align-items:center;gap:12px">
+      <div class="totals" id="topStatus"></div>
+
+      <button class="icon-btn" id="themeBtn" type="button" aria-pressed="false"
+              data-action="toggle-theme" title="Toggle dark mode"
+              aria-label="Toggle dark mode">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+             aria-hidden="true" focusable="false">
+          <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+        </svg>
+      </button>
+
+      <button class="icon-btn" id="densityBtn" type="button" aria-pressed="false"
+              data-action="toggle-density" title="Toggle compact density"
+              aria-label="Toggle compact density">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true" focusable="false">
+          <line x1="4" y1="6" x2="20" y2="6" />
+          <line x1="4" y1="12" x2="20" y2="12" />
+          <line x1="4" y1="18" x2="20" y2="18" />
+        </svg>
+      </button>
+    </div>
   </header>
 
   <div id="busybar" aria-hidden="true"></div>
 
   <aside class="sidebar">
     <div class="top-tabs" id="topTabs">
-      <div class="top-tab" data-action="set-topview" data-topview="surveys">Surveys</div>
-      <div class="top-tab" data-action="set-topview" data-topview="tenant">Tenant</div>
+      <div class="top-tab" data-action="set-topview" data-topview="surveys"
+           role="button" tabindex="0">Surveys</div>
+      <div class="top-tab" data-action="set-topview" data-topview="tenant"
+           role="button" tabindex="0">Tenant</div>
     </div>
 
     <input type="text" id="navSearch" class="nav-search" placeholder="Filter surveys…"
