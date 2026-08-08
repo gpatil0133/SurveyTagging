@@ -246,6 +246,26 @@ def iterdir(path: Any) -> list[Path]:
     return [base / name for name in smbclient.listdir(_s(path))]
 
 
+def list_dirs(path: Any) -> list[Path]:
+    """Directory children only, from a single listing.
+
+    Separate from `iterdir` because the SMB directory listing already carries
+    the file/dir flag: filtering afterwards with `is_dir()` costs one extra
+    round trip per entry, which tenant/survey discovery would pay on every
+    request. Raises like `iterdir` when the directory is missing/unreachable.
+    """
+    if not is_unc(path):
+        return [p for p in Path(path).iterdir() if p.is_dir()]
+    import smbclient
+
+    base = normalize(path)
+    return [
+        base / entry.name
+        for entry in smbclient.scandir(_s(path))
+        if entry.name not in (".", "..") and entry.is_dir()
+    ]
+
+
 def _has_magic(part: str) -> bool:
     return any(c in part for c in "*?[")
 
