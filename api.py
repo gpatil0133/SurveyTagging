@@ -49,6 +49,8 @@ import asyncio
 import json
 import logging
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure the package modules are importable when running from this folder.
@@ -79,10 +81,12 @@ import sharefs
 from bootstrap import build_context
 from projections.survey_view import build_survey_view
 
-from log_config import configure_logging
+import usage_log
+from log_config import attach_uvicorn_handlers, configure_logging
 from settings import Settings
 
-configure_logging(Settings().log_level)
+_boot_settings = Settings()
+configure_logging(_boot_settings.log_level, settings=_boot_settings)
 logger = logging.getLogger("survey_tagging.api")
 
 # Single composition root for the whole process.
@@ -92,6 +96,12 @@ _settings = _ctx.settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Re-assert the file handler on uvicorn's loggers. When the server is
+    # started as `python api.py`, uvicorn installs its own logging config
+    # *after* this module was imported and would otherwise leave app.log with
+    # no access lines in it.
+    attach_uvicorn_handlers()
+
     # Start the env-gated periodic auto-retag scheduler (OFF by default).
     from scheduler import AutoRetagScheduler
     app.state.scheduler = AutoRetagScheduler(_ctx)
@@ -110,6 +120,64 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def track_request(request: Request, call_next):
+    """Give every request an id, and write one `api_request` ledger line for it.
+
+    The id is the join key for the whole ledger: a `POST /tag-surveys` that tags
+    40 surveys produces 1 `api_request` record, 40 `survey` records and 1
+    `tenant` record, all carrying it. `SUM(llm.cost_usd) GROUP BY request_id`
+    is then the cost of an API call, and the same query grouped by `survey_no`
+    is the cost of a survey.
+
+    An inbound `X-Request-ID` is honoured so the platform's own correlation id
+    wins when there is one; the id is echoed back on the response either way.
+
+    Only `/api/*` is recorded. Static asset hits would swamp the ledger and are
+    already visible in uvicorn's access log in app.log.
+    """
+    request_id = request.headers.get("x-request-id") or usage_log.new_request_id()
+    handle = usage_log.bind_request(request_id)
+    tracked = request.url.path.startswith("/api/")
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        if tracked:
+            usage_log.write({
+                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "kind": "api_request",
+                "request_id": request_id,
+                "method": request.method,
+                # Group latency by handler, not by concrete path — otherwise
+                # every tenant id splinters into its own bucket. The handler
+                # name also merges the two URL forms of each route
+                # (/api/tenants/{t}/surveys/{s}/tag and /api/surveys/{s}/tag are
+                # one endpoint). Null on a 404, which matches no route.
+                "endpoint": _endpoint_name(request),
+                "path": request.url.path,
+                "status_code": status_code,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "client": request.client.host if request.client else None,
+            })
+        usage_log.reset_request(handle)
+
+
+def _endpoint_name(request: Request) -> str | None:
+    """Handler name for the matched route.
+
+    Starlette 0.27 puts `endpoint` (the function) on the scope during routing
+    but not `route`, so there is no path template to read — the function's name
+    is the stable grouping key available here.
+    """
+    endpoint = request.scope.get("endpoint")
+    return getattr(endpoint, "__name__", None)
 
 
 @app.middleware("http")

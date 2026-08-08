@@ -19,8 +19,10 @@ import asyncio
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
+import usage_log
 from llm.cache import LLMCache
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,14 @@ class LLMClient:
                 logger.info("llm_response_cache_hit",
                             extra={"cache_key": cache_key, "call_type": call_type,
                                    "prompt_version": prompt_version})
+                # Recorded, not skipped: the ledger must be able to explain why
+                # a re-tagged survey cost $0 instead of looking like a run that
+                # never called the model.
+                usage_log.record_llm_call(
+                    call_type=call_type, model=self.model,
+                    cached=True, ok=True, cost_usd=0.0,
+                    input_tokens=0, output_tokens=0,
+                )
                 return cached
             logger.debug("llm_response_cache_miss",
                          extra={"cache_key": cache_key, "call_type": call_type,
@@ -98,7 +108,8 @@ class LLMClient:
             try:
                 async with self._semaphore:
                     response = await self._call_llm(
-                        prompt, system_prompt, cached_system_preamble
+                        prompt, system_prompt, cached_system_preamble,
+                        call_type=call_type, attempt=attempt + 1,
                     )
 
                 if response is None:
@@ -145,8 +156,16 @@ class LLMClient:
         prompt: str,
         system_prompt: str,
         cached_system_preamble: str | None = None,
+        call_type: str = "general",
+        attempt: int = 1,
     ) -> str | None:
-        """Make the actual LLM API call via litellm with optional prompt caching."""
+        """Make the actual LLM API call via litellm with optional prompt caching.
+
+        `call_type`/`attempt` are carried purely for the usage ledger — every
+        provider round-trip, successful or not, is recorded here because this is
+        the only frame where both the response usage block and the wall time of
+        the round-trip exist.
+        """
         try:
             import litellm
 
@@ -204,21 +223,44 @@ class LLMClient:
                        and bool(cached_system_preamble),
                        "max_tokens": self.max_tokens, "temperature": self.temperature},
             )
-            response = await litellm.acompletion(**kwargs)
+            started = time.perf_counter()
+            try:
+                response = await litellm.acompletion(**kwargs)
+            except Exception as e:
+                usage_log.record_llm_call(
+                    call_type=call_type, model=self.model, ok=False, attempt=attempt,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    error=f"{type(e).__name__}: {e}",
+                )
+                raise
+            duration_ms = int((time.perf_counter() - started) * 1000)
 
-            # Log prompt cache stats if available
+            # Usage + cost. Never let accounting break a tagging run: a provider
+            # that omits `usage`, or a model litellm cannot price, degrades to
+            # nulls in the ledger rather than an exception here.
+            in_tok = out_tok = cache_read = cache_write = 0
             try:
                 usage = response.usage
+                in_tok = getattr(usage, "prompt_tokens", 0) or 0
+                out_tok = getattr(usage, "completion_tokens", 0) or 0
                 cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
                 cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
                 if cache_read or cache_write:
                     logger.info("llm_prompt_cache_stats",
                                 extra={"cache_read_tokens": cache_read,
                                        "cache_write_tokens": cache_write,
-                                       "input_tokens": getattr(usage, "prompt_tokens", 0),
-                                       "output_tokens": getattr(usage, "completion_tokens", 0)})
-            except Exception:
+                                       "input_tokens": in_tok,
+                                       "output_tokens": out_tok})
+            except Exception:  # noqa: BLE001
                 pass
+
+            usage_log.record_llm_call(
+                call_type=call_type, model=self.model, ok=True, attempt=attempt,
+                duration_ms=duration_ms,
+                input_tokens=in_tok, output_tokens=out_tok,
+                cache_read_tokens=cache_read, cache_write_tokens=cache_write,
+                cost_usd=usage_log.estimate_cost(response, in_tok, out_tok),
+            )
 
             return response.choices[0].message.content
 

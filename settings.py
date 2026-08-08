@@ -143,6 +143,31 @@ class Settings(BaseSettings):
     log_level: str = "DEBUG"
     log_format: str = "console"
 
+    # Observability. Both sinks live under `log_dir`, which stays LOCAL for the
+    # same reason `cache_dir` does — these are written on every request and every
+    # survey, and a network hop per line would show up in the numbers we are
+    # trying to measure.
+    #
+    #   {log_dir}/app.log                    rotating text log (app + uvicorn)
+    #   {log_dir}/usage-YYYY-MM-DD.jsonl     one JSON record per unit of work
+    log_dir: Path = Field(default=Path("./logs"))
+    # Write the JSONL usage/cost ledger. Off → the scopes still run, they just
+    # emit nothing (no partial ledger to reason about).
+    usage_log_enabled: bool = True
+    # app.log rotation. 10 MB x 10 keeps roughly a week of DEBUG at current volume.
+    app_log_max_bytes: int = 10 * 1024 * 1024
+    app_log_backup_count: int = 10
+    # Mirror app.log to stderr as well. False in a service host where stderr
+    # goes nowhere; True in dev so `uvicorn --reload` still prints.
+    log_to_stderr: bool = True
+
+    # Per-million-token price overrides for cost accounting. Leave at 0.0 to use
+    # litellm's built-in price map (which knows both Anthropic and OpenAI model
+    # ids). Set them when running a model litellm prices as $0 — a negotiated
+    # rate, a self-hosted endpoint, or a model newer than the installed litellm.
+    llm_price_input_per_mtok: float = 0.0
+    llm_price_output_per_mtok: float = 0.0
+
     # JWT (RS256, Research.Auth keypair) — see jwt-rs256-auth skill.
     # The PEM ships in the repo at survey_tagging/keys/public.pem.
     #

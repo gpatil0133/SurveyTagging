@@ -71,6 +71,21 @@ class AutoRetagScheduler:
         return result
 
     def _scan(self) -> dict:
+        import usage_log
+
+        # A scan has no inbound request, so it mints its own correlation id —
+        # otherwise every survey it re-tags lands in the ledger with a blank
+        # request_id and a scan cannot be costed as a unit. When the scan was
+        # triggered through /api/admin/autoretag/run-now the caller's id is
+        # already in context (asyncio.to_thread copied it) and wins.
+        request_id = usage_log.current_request_id() or f"autoretag-{usage_log.new_request_id()}"
+        handle = usage_log.bind_request(request_id)
+        try:
+            return self._scan_inner()
+        finally:
+            usage_log.reset_request(handle)
+
+    def _scan_inner(self) -> dict:
         from datetime import datetime, timezone
 
         data_dir = Path(self.settings.data_dir)

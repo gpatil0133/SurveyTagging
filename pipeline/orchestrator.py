@@ -8,6 +8,7 @@ from pathlib import Path
 
 import sharefs
 import discovery
+import usage_log
 from config_loaders.industry_stages import IndustryStagesRegistry
 from fs_utils import write_json_atomic
 from llm.client import LLMClient
@@ -145,23 +146,38 @@ class PipelineOrchestrator:
                 },
             )
 
-        # V5: load tenant canon + embeddings for BOTH journey types. The right
-        # one is selected per survey by project_type (EX surveys use the EX
-        # canon, everything else uses CX) inside the LLM enhancement step.
-        tenant_canon, canon_embeddings = self._load_tenant_canon(tenant_id, tenant_profile, "CX")
-        tenant_canon_ex, canon_embeddings_ex = self._load_tenant_canon(tenant_id, tenant_profile, "EX")
-
-        # V6: produce tenant-shape tags (compliance_posture, workforce_signature,
-        # key_cx_touchpoints, etc.) once per tenant. Writes
-        # output/{tenant_id}/tenant_tags.json. Best-effort — a failure here must
-        # not block per-survey processing.
-        try:
-            self._tag_tenant(tenant_id, tenant_profile)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "tenant_tags_failed",
-                extra={"tenant_id": tenant_id, "error": str(e)},
+        # One `kind="tenant"` ledger record covers everything charged to the
+        # tenant rather than to a survey: the canon-derivation LLM calls (up to
+        # one per journey type) and the tenant taggers. It is closed BEFORE the
+        # survey loop opens its own scopes, so the two never nest and each
+        # survey's cost stays its own.
+        with usage_log.scope("tenant", tenant_id=tenant_id, unit="tenant_tags"):
+            # V5: load tenant canon + embeddings for BOTH journey types. The right
+            # one is selected per survey by project_type (EX surveys use the EX
+            # canon, everything else uses CX) inside the LLM enhancement step.
+            tenant_canon, canon_embeddings = self._load_tenant_canon(tenant_id, tenant_profile, "CX")
+            tenant_canon_ex, canon_embeddings_ex = self._load_tenant_canon(tenant_id, tenant_profile, "EX")
+            usage_log.annotate(
+                has_canon_cx=tenant_canon is not None,
+                has_canon_ex=tenant_canon_ex is not None,
+                has_profile=tenant_profile is not None,
             )
+
+            # V6: produce tenant-shape tags (compliance_posture, workforce_signature,
+            # key_cx_touchpoints, etc.) once per tenant. Writes
+            # output/{tenant_id}/tenant_tags.json. Best-effort — a failure here must
+            # not block per-survey processing.
+            try:
+                self._tag_tenant(tenant_id, tenant_profile)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "tenant_tags_failed",
+                    extra={"tenant_id": tenant_id, "error": str(e)},
+                )
+                # Swallowed for control flow, but the ledger should not call this
+                # tenant a clean success.
+                usage_log.set_status("partial")
+                usage_log.annotate(tenant_tags_error=str(e))
 
         # Discover surveys
         survey_dir_base = tenant_dir / "SurveyData"
@@ -201,7 +217,15 @@ class PipelineOrchestrator:
         tenant_canon_ex=None, canon_embeddings_ex=None,
     ) -> list[dict]:
         """Dispatch survey tagging sequentially or in a bounded thread pool."""
+        # Captured on THIS thread, which is still inside the request's context.
+        # ThreadPoolExecutor hands workers raw callables and does not copy
+        # context, so without this every survey tagged in parallel would land in
+        # the ledger with an empty request_id and a tenant-wide batch could not
+        # be reassembled from its parts.
+        ambient = usage_log.snapshot()
+
         def work(survey_no):
+            usage_log.restore(ambient)
             return self._tag_one_survey(
                 survey_no, survey_dir_base, tenant_dir, tenant_id,
                 dir_signals, config_dir,
@@ -237,45 +261,58 @@ class PipelineOrchestrator:
         tenant_profile, tenant_canon, canon_embeddings, force,
         tenant_canon_ex=None, canon_embeddings_ex=None,
     ) -> dict:
-        """Tag one survey: change-check, process, write, mark. Returns a record."""
+        """Tag one survey: change-check, process, write, mark. Returns a record.
+
+        The whole body runs inside one `kind="survey"` ledger scope, so every
+        LLM call the survey makes — however deep — is attributed to it, and the
+        record is emitted on the skip and failure paths too. A survey that
+        failed after its first LLM call still spent money.
+        """
         survey_dir = survey_dir_base / str(survey_no)
         output_dir = Path(self.settings.output_dir)
 
-        if not force and self.change_detector.is_unchanged(
-            tenant_id, survey_no, survey_dir,
-            tenant_dir=tenant_dir, output_dir=output_dir,
-        ):
-            logger.info("survey_unchanged", extra={"tenant": tenant_id, "survey": survey_no})
-            return {"survey_no": survey_no, "status": "skipped"}
+        with usage_log.scope("survey", tenant_id=tenant_id, survey_no=survey_no,
+                             forced=bool(force)):
+            if not force and self.change_detector.is_unchanged(
+                tenant_id, survey_no, survey_dir,
+                tenant_dir=tenant_dir, output_dir=output_dir,
+            ):
+                logger.info("survey_unchanged", extra={"tenant": tenant_id, "survey": survey_no})
+                usage_log.set_status("skipped")
+                return {"survey_no": survey_no, "status": "skipped"}
 
-        try:
-            result = self._process_survey(
-                tenant_dir, tenant_id, survey_no, dir_signals, config_dir,
-                tenant_profile, tenant_canon=tenant_canon,
-                canon_embeddings=canon_embeddings,
-                tenant_canon_ex=tenant_canon_ex,
-                canon_embeddings_ex=canon_embeddings_ex,
-                llm_client=self._worker_llm_client(),
-            )
-            output_path = self._write_output(tenant_id, survey_no, result)
-            # Only mark processed AFTER tagged_output.json is on disk, else the
-            # survey re-tags next run instead of being silently skipped.
-            if output_path is not None and sharefs.exists(output_path):
-                self.change_detector.mark_processed(
-                    tenant_id, survey_no, survey_dir,
-                    tenant_dir=tenant_dir, output_dir=output_dir,
+            try:
+                result = self._process_survey(
+                    tenant_dir, tenant_id, survey_no, dir_signals, config_dir,
+                    tenant_profile, tenant_canon=tenant_canon,
+                    canon_embeddings=canon_embeddings,
+                    tenant_canon_ex=tenant_canon_ex,
+                    canon_embeddings_ex=canon_embeddings_ex,
+                    llm_client=self._worker_llm_client(),
                 )
-            else:
-                logger.warning(
-                    "tagged_output_missing_after_write_skip_mark_processed",
-                    extra={"tenant": tenant_id, "survey": survey_no,
-                           "expected_path": str(output_path)},
-                )
-            return {"survey_no": survey_no, "status": "success"}
-        except Exception as e:  # noqa: BLE001
-            logger.error("survey_failed",
-                         extra={"tenant": tenant_id, "survey": survey_no, "error": str(e)})
-            return {"survey_no": survey_no, "status": "failed", "error": str(e)}
+                output_path = self._write_output(tenant_id, survey_no, result)
+                # Only mark processed AFTER tagged_output.json is on disk, else the
+                # survey re-tags next run instead of being silently skipped.
+                if output_path is not None and sharefs.exists(output_path):
+                    self.change_detector.mark_processed(
+                        tenant_id, survey_no, survey_dir,
+                        tenant_dir=tenant_dir, output_dir=output_dir,
+                    )
+                else:
+                    logger.warning(
+                        "tagged_output_missing_after_write_skip_mark_processed",
+                        extra={"tenant": tenant_id, "survey": survey_no,
+                               "expected_path": str(output_path)},
+                    )
+                return {"survey_no": survey_no, "status": "success"}
+            except Exception as e:  # noqa: BLE001
+                logger.error("survey_failed",
+                             extra={"tenant": tenant_id, "survey": survey_no, "error": str(e)})
+                # Caught here, so the scope's own except path never sees it —
+                # set the outcome explicitly.
+                usage_log.set_status("failed")
+                usage_log.annotate(error=f"{type(e).__name__}: {e}")
+                return {"survey_no": survey_no, "status": "failed", "error": str(e)}
 
     def _worker_llm_client(self):
         """Per-thread LLM client. Sequential runs reuse the shared client; each
@@ -336,14 +373,16 @@ class PipelineOrchestrator:
         """
         from projections.tenant_tags_io import load_tenant_tags
 
-        tenant_dir = Path(self.settings.data_dir) / str(tenant_id)
-        tenant_profile = TenantProfile.load(tenant_id, Path(self.settings.output_dir))
-        self._tag_tenant(tenant_id, tenant_profile)
-        self.change_detector.tenant_mark_processed(
-            tenant_id, tenant_dir, Path(self.settings.output_dir)
-        )
-        artifact = load_tenant_tags(tenant_id, Path(self.settings.output_dir))
-        return artifact.model_dump() if artifact else None
+        with usage_log.scope("tenant", tenant_id=tenant_id, unit="tenant_tags_only"):
+            tenant_dir = Path(self.settings.data_dir) / str(tenant_id)
+            tenant_profile = TenantProfile.load(tenant_id, Path(self.settings.output_dir))
+            usage_log.annotate(has_profile=tenant_profile is not None)
+            self._tag_tenant(tenant_id, tenant_profile)
+            self.change_detector.tenant_mark_processed(
+                tenant_id, tenant_dir, Path(self.settings.output_dir)
+            )
+            artifact = load_tenant_tags(tenant_id, Path(self.settings.output_dir))
+            return artifact.model_dump() if artifact else None
 
     def _load_tenant_canon(
         self,
@@ -487,6 +526,13 @@ class PipelineOrchestrator:
                 "has_responses": context.has_responses,
                 "has_tenant_canon": context.tenant_canon is not None,
             },
+        )
+        # Enough shape on the ledger record to explain an outlier cost without
+        # having to open tagged_output.json.
+        usage_log.annotate(
+            survey_title=context.survey_meta.title,
+            questions=len(context.questions),
+            non_cm_questions=len(context.non_cm_questions),
         )
 
         return process_single_survey(
