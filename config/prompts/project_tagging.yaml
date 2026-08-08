@@ -5,7 +5,7 @@
 # is NEVER cached. Bump `version` whenever the cached_preamble shape changes —
 # the on-disk LLM response cache uses it as part of the key.
 
-version: "7.0"
+version: "7.1"
 description: "Project-level survey classification — relationship_type, project_purpose, industry_vertical, audience_type, survey_sub_type, dashboard_routing."
 
 cached_preamble: |
@@ -28,13 +28,22 @@ cached_preamble: |
     "audience_type_refined": "{{ audiences | join(' | ') }}",
     "survey_sub_type": "{{ sub_types | join(' | ') }}",
     "dashboard_names": ["array — pick from canonical dashboards below; can add ONE custom name only if needed"],
-    "reasoning": "2-4 sentences: the signals behind each dimension above"
+    "why": {
+      "<dimension key from above>": "<one line, max 20 words: the signal that decided THIS value>"
+    },
+    "reasoning": "2-4 sentences: how the calls above hang together"
   }
 
+  Rules for `why` (REQUIRED — this is the audit trail):
+  - One entry per dimension you actually assigned above, keyed by the SAME key you used in the output ("relationship_type", "project_purpose", "industry_vertical", "audience_type_refined", "survey_sub_type", "dashboard_names"). Omit dimensions you left null.
+  - Each line is shown on its own next to that one tag, to a reader who can see the survey and the assigned value but not your thinking. It must stand alone — do not write "as above" or "same signal as the previous field".
+  - Name the concrete signal that drove THAT call: the survey title, a section header, the question mix, an NPS/CSAT item, the tenant profile, a directory domain. Quote the fragment when a few words carry the decision.
+  - Do not restate the value. "purpose is Engagement because it measures engagement" is useless; "12 of 18 items ask about manager support and growth" is the reason.
+  - Where the call was close, name the alternative you rejected: "Relational over Transactional — no single event anchors it".
+  - Max 20 words per line. Plain sentence, no markdown, no bullets, no JSON.
+
   Rules for `reasoning` (REQUIRED):
-  - It is stored verbatim against EVERY dimension you assigned above and shown to humans auditing the tagging, so it must touch each dimension you actually set — a reader inspecting `survey_sub_type` alone should find the sentence that explains `survey_sub_type`.
-  - Cite the signal that drove each call: the survey title, a section header, the question mix, the tenant profile, a directory domain. Do not restate the value ("purpose is Engagement because it measures engagement" is useless).
-  - Where one call was close, name the alternative you rejected and why.
+  - 2-4 sentences on how the survey reads as a whole and how the calls above fit together. This is the survey-level summary, NOT a substitute for `why` — do not just concatenate the lines above.
   - Keep it under 80 words, plain sentences, no markdown or bullets.
 
   Canonical dashboard list (prefer these exact names):

@@ -22,7 +22,15 @@ class TagResult(BaseModel):
     evidence: str | dict[str, Any] | None = None
     # Free-text model rationale, for `source="llm"` tags only. The two fields
     # are complementary, never redundant: `source` tells a consumer which to read.
+    # V7.1: this is the rationale for THIS dimension, not a per-question blob —
+    # `llm_enhance` stamps the model's per-dimension `why` line here and falls
+    # back to the question/survey summary only when the model gave no line.
     reasoning: str | None = None
+    # V7.1: the assignment this one displaced, when an LLM answer overrode an
+    # earlier deterministic/statistical tag: {value, source, confidence,
+    # evidence?}. Without it the rule's evidence is simply overwritten and the
+    # output cannot answer "a rule looked at this — what did it say?".
+    superseded: dict[str, Any] | None = None
     # V5: low_confidence_assigned is for journey_stage / sub_stage_name when
     # the LLM was uncertain or punted to a top-K candidate. The value is set
     # (NEVER null) so downstream coverage can count it; consumers may flag

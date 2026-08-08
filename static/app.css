@@ -1093,6 +1093,23 @@ table.qtable .src .src-dot { width: 5px; height: 5px; }
    it did not survive the dark theme at all. */
 table.qtable td.qcell--low { box-shadow: inset 3px 0 0 var(--conf-low); }
 
+/* ===== TAXONOMY CATALOG =====
+   Same table, opposite content: the question table is a dense grid of short
+   values and stays nowrap, this one is mostly prose. The explanation columns
+   need a hard max-width — without one the two of them take the whole viewport
+   and every row becomes a single unreadable line. */
+table.qtable--taxonomy td { white-space: normal; }
+table.qtable--taxonomy td.tax-name { white-space: nowrap; }
+table.qtable--taxonomy td.tax-prose {
+  max-width: 380px;
+  min-width: 260px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+table.qtable--taxonomy td.tax-values { max-width: 320px; }
+table.qtable--taxonomy td.tax-values .empty { display: block; margin-top: var(--space-1); }
+.tax-flags { display: flex; gap: var(--space-1); margin-top: var(--space-1); }
+
 
 /* ===== SUMMARY TAB ===== */
 .summary { display: flex; flex-direction: column; gap: var(--space-4); }
@@ -1656,6 +1673,33 @@ details.ev-reasoning summary:hover { text-decoration: underline; }
 details.ev-reasoning > div {
   margin-top: var(--space-1);
   white-space: pre-wrap;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px var(--space-2);
+  color: var(--text-muted);
+}
+
+/* A per-dimension LLM rationale: one line, so it reads inline next to the
+   deterministic `detail` line rather than hiding behind a disclosure. The rule
+   bar marks it as provenance, not as part of the tag value. */
+.ev-reason-line {
+  margin-top: var(--space-1);
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--accent);
+  color: var(--text-muted);
+}
+
+details.ev-superseded { margin-top: 5px; }
+details.ev-superseded summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 11px;
+  user-select: none;
+}
+details.ev-superseded summary:hover { text-decoration: underline; }
+details.ev-superseded > div {
+  margin-top: var(--space-1);
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

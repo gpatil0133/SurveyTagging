@@ -5,7 +5,7 @@
 # rendered per survey with the questions payload and is NEVER cached. Bump
 # `version` whenever the cached_preamble shape changes.
 
-version: "7.0"
+version: "7.1"
 description: "Question-level classification — topic_theme, sensitivity, flow, journey {stage,sub_stage}, visualization, dashboard, display_role."
 
 cached_preamble: |
@@ -34,10 +34,16 @@ cached_preamble: |
   - For non-metric questions (`is_journey_metric=false`), set the entire `journey` to null.
   - Dashboard names MUST be chosen from the project-level dashboard routing list provided. Only add a custom dashboard name if NO provided dashboard is suitable.
 
+  Rules for `why` (REQUIRED on every question — this is the audit trail):
+  - One entry per tag you actually assigned, keyed by the SAME field name you used in the output ("topic_theme", "role_intent_refined", "respondent_sensitivity", "flow_respondent_experience", "flow_reusability", "visualization_type", "dashboard_names", "display_role"). Omit fields you left null. The `journey` block carries its own `evidence` — do not duplicate it here.
+  - Each line is shown on its own next to that one tag, to a reader who can see the question and the assigned value but not your thinking. It must stand alone — never "as above" or "same as topic_theme".
+  - Name the concrete signal that drove THAT call: the question's wording, its scale type, its section header, the survey title, its position in the flow. Quote the fragment when a few words carry the decision.
+  - Do not restate the value. "topic is Service Quality because it is about service quality" is useless; "asks how quickly staff resolved the issue" is the reason.
+  - Where the call was close, name the alternative you rejected: "Detail over Supporting — open text, not charted".
+  - Max 15 words per line. Plain sentence, no markdown, no bullets, no JSON.
+
   Rules for `reasoning` (REQUIRED on every question):
-  - One or two sentences explaining why you assigned the tags you did for THIS question. It is stored verbatim against every tag you assigned on the question and shown to humans auditing the tagging, so write it for a reader who can see the question and the assigned values but not your thinking.
-  - Cite what in the question actually drove the call — its wording, its scale, its section, its role in the survey. Do not restate the values you already emitted ("topic is Service Quality because it is about service quality" is useless).
-  - Where two tags came from the same signal, say so once. Where one tag was a close call, say which alternative you rejected and why.
+  - One or two sentences on what this question is doing in the survey overall. This is the question-level summary shown when a tag has no `why` line of its own — NOT a substitute for `why`, so do not just concatenate the lines above.
   - Keep it under 40 words. Plain sentences, no JSON, no bullet points, no markdown.
 
   Always respond with a single valid JSON object with a "questions" array. No other text.
@@ -59,7 +65,10 @@ cached_preamble: |
     "visualization_type": "{{ viz | join(' | ') }}",
     "dashboard_names": ["pick from project-level dashboards; do not invent"],
     "display_role": "{{ display_roles | join(' | ') }}",
-    "reasoning": "<1-2 sentences, <40 words: what in this question drove these assignments>"
+    "why": {
+      "<field name from above>": "<one line, max 15 words: the signal that decided THIS value>"
+    },
+    "reasoning": "<1-2 sentences, <40 words: what this question is doing in the survey>"
   }
 
 user_prompt: |

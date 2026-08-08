@@ -21,19 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 def _compute_section_for_qid(questions: list[QuestionContext]) -> dict[int, str]:
-    """Single forward walk: each non-CM question is mapped to the title of the
-    most recent preceding `is_content_message=True` question. CM questions
-    map to empty string. Used by V5 question-signature builder."""
-    out: dict[int, str] = {}
-    last_section = ""
-    for q in questions:
-        if q.is_content_message:
-            if q.title:
-                last_section = q.title
-            out[q.question_id] = ""
-        else:
-            out[q.question_id] = last_section
-    return out
+    """Map each question to the title of the most recent preceding content
+    message. The forward walk happens in the loader (CM rows are dropped from
+    the list there), so this just indexes the hoisted `section_header`. Used by
+    the V5 question-signature builder."""
+    return {q.question_id: q.section_header for q in questions}
 
 
 def assemble_context_from_json(

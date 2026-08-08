@@ -22,6 +22,39 @@ logger = logging.getLogger(__name__)
 _CONF_NUMERIC = {"high": 0.85, "medium": 0.75, "low": 0.55, "none": 0.40}
 
 
+def _rationale(why: dict, field: str, summary: str | None) -> str | None:
+    """The explanation stamped on ONE dimension's tag.
+
+    Prefers the model's per-dimension `why` line; falls back to the
+    question/survey summary so a tag is never left unexplained — including for
+    responses replayed from the disk cache under prompt version < 7.1, which
+    predate `why` entirely.
+    """
+    line = why.get(field) if isinstance(why, dict) else None
+    if isinstance(line, str) and line.strip():
+        return line.strip()
+    return summary or None
+
+
+def _superseded(existing) -> dict | None:
+    """Snapshot the tag an LLM answer is about to replace, so the override is
+    visible in the output instead of erasing the rule that ran first.
+
+    Returns None when there is nothing meaningful to record (no prior tag, no
+    prior value, or the prior tag was itself from the LLM).
+    """
+    if existing is None or existing.value is None or existing.source == "llm":
+        return None
+    entry: dict = {
+        "value": existing.value,
+        "source": existing.source,
+        "confidence": existing.confidence,
+    }
+    if existing.evidence:
+        entry["evidence"] = existing.evidence
+    return entry
+
+
 def run_llm_enhancement(
     context,
     accumulator,
@@ -126,6 +159,9 @@ def _apply_project_llm_results(parsed: dict, accumulator) -> None:
         "survey_sub_type": "survey_sub_type",
     }
 
+    why = parsed.get("why") or {}
+    summary = parsed.get("reasoning") or None
+
     for field, dimension in scalar_map.items():
         value = parsed.get(field)
         if not value:
@@ -139,7 +175,8 @@ def _apply_project_llm_results(parsed: dict, accumulator) -> None:
             value=value,
             source="llm",
             confidence=0.85,
-            reasoning=parsed.get("reasoning") or None,
+            reasoning=_rationale(why, field, summary),
+            superseded=_superseded(existing),
         ))
 
     # Multi-label: dashboard_names → dashboard_routing
@@ -156,7 +193,8 @@ def _apply_project_llm_results(parsed: dict, accumulator) -> None:
             value = dashboard_names
         accumulator.set_project_tag("dashboard_routing", TagResult(
             value=value, source="llm", confidence=0.85,
-            reasoning=parsed.get("reasoning") or None,
+            reasoning=_rationale(why, "dashboard_names", summary),
+            superseded=_superseded(existing),
         ))
 
 
@@ -188,9 +226,11 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
 
         question = question_by_id.get(q_id)
 
-        # V7: the model's own rationale for this question, stamped onto every
-        # tag it assigns below so each LLM-sourced dimension can explain itself
-        # in the tagged output and the UI.
+        # V7.1: one rationale line per dimension (`why`), with the question-level
+        # summary (`reasoning`) as the fallback for any dimension the model left
+        # unexplained. Each LLM-sourced tag then explains its own value rather
+        # than repeating a blob that covers seven other dimensions.
+        why = q_data.get("why") or {}
         q_reasoning = q_data.get("reasoning") or None
 
         # -------- Standard scalar fields --------
@@ -203,7 +243,8 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                 continue
             accumulator.set_question_tag(q_id, dimension, TagResult(
                 value=value, source="llm", confidence=0.80,
-                reasoning=q_reasoning,
+                reasoning=_rationale(why, field, q_reasoning),
+                superseded=_superseded(existing),
             ))
 
         # -------- Journey block (atomic stage + sub_stage) --------
@@ -229,13 +270,18 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                 "candidates": j_candidates or [],
             }
 
+            # The journey block carries its own per-assignment sentence
+            # (`journey.evidence`), so that is the rationale here — the generic
+            # question summary is only the last resort.
+            j_reasoning = j_evidence or q_reasoning
+
             if stage_value:
                 existing = accumulator.get_question_tag(q_id, "journey_stage")
                 if not (existing and existing.status == "skipped"):
                     accumulator.set_question_tag(q_id, "journey_stage", TagResult(
                         value=stage_value, source="llm",
                         confidence=conf_numeric, status=tag_status,
-                        evidence=j_evidence, reasoning=q_reasoning,
+                        evidence=j_evidence, reasoning=j_reasoning,
                         coverage_metadata=coverage,
                     ))
             if sub_value:
@@ -244,7 +290,7 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                     accumulator.set_question_tag(q_id, "sub_stage_name", TagResult(
                         value=sub_value, source="llm",
                         confidence=conf_numeric, status=tag_status,
-                        evidence=j_evidence, reasoning=q_reasoning,
+                        evidence=j_evidence, reasoning=j_reasoning,
                         coverage_metadata=coverage,
                     ))
 
@@ -262,7 +308,8 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                 value = dashboard_names
             accumulator.set_question_tag(q_id, "dashboard_placement", TagResult(
                 value=value, source="llm", confidence=0.80,
-                reasoning=q_reasoning,
+                reasoning=_rationale(why, "dashboard_names", q_reasoning),
+                superseded=_superseded(existing),
             ))
 
         # Role intent refinement
@@ -274,7 +321,8 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                     value=refined_role,
                     source="llm",
                     confidence=0.80,
-                    reasoning=q_reasoning,
+                    reasoning=_rationale(why, "role_intent_refined", q_reasoning),
+                    superseded=_superseded(existing_role),
                 ))
 
 

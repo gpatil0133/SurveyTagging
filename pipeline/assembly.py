@@ -35,6 +35,10 @@ def assemble_tagged_survey(
             entry["evidence"] = tag.evidence
         if tag.reasoning:
             entry["reasoning"] = tag.reasoning
+        # What the LLM overrode, if anything — keeps the displaced rule's own
+        # evidence readable instead of erasing it on override.
+        if tag.superseded:
+            entry["superseded"] = tag.superseded
         if tag.failure_reason:
             entry["failure_reason"] = tag.failure_reason
         if tag.apply_method != "System-applied":
@@ -62,6 +66,8 @@ def assemble_tagged_survey(
                 t_entry["evidence"] = tag.evidence
             if tag.reasoning:
                 t_entry["reasoning"] = tag.reasoning
+            if tag.superseded:
+                t_entry["superseded"] = tag.superseded
             if tag.failure_reason:
                 t_entry["failure_reason"] = tag.failure_reason
             if tag.apply_method != "System-applied":

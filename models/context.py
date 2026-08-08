@@ -100,8 +100,13 @@ class UnifiedContext(BaseModel):
 
     @property
     def cm_section_headers(self) -> list[str]:
-        """Titles of CM questions that serve as section headers."""
-        return [q.title for q in self.questions if q.is_content_message and q.title]
+        """Section-header titles, in survey order, without repeats. Sourced from
+        the CM questions the loader folded into `section_header`."""
+        seen: list[str] = []
+        for q in self.questions:
+            if q.section_header and q.section_header not in seen:
+                seen.append(q.section_header)
+        return seen
 
     def section_header_for(self, q: QuestionContext) -> str:
         """Nearest section header (CM question title) preceding `q`. "" if none."""

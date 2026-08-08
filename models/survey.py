@@ -42,6 +42,10 @@ class QuestionContext(BaseModel):
     has_piping_markers: bool = False
     piping_markers: list[str] = Field(default_factory=list)
     is_content_message: bool = False
+    # Title of the nearest preceding content-message (CM) question. CM rows are
+    # dropped from the question list at parse time (they carry no answer and no
+    # tags), so this is where their one useful contribution survives.
+    section_header: str = ""
     effective_position_ratio: float = 0.0  # Position among non-CM questions (0.0 to 1.0)
     matrix_group_size: int = 1             # Number of questions in this matrix group
     scale_fingerprint: str | None = None   # Normalized answer pattern for benchmark detection

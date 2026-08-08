@@ -120,6 +120,12 @@ class IndustryTagger(ProjectTagger):
                 )
 
         # Tier 4: Survey content heuristics
+        #
+        # NOTE: there is no corporate-record tier here. `CorporateContext.industry`
+        # exists and `loaders/corporate.py::load_corporate` can read it, but
+        # nothing calls that loader and `UnifiedContext` has no `corporate`
+        # field — the tenant's self-reported industry never reaches a tagger.
+        # Wiring it back is a deliberate decision, not a drive-by fix.
         title_lower = context.survey_meta.title.lower()
         q_text = " ".join(q.title.lower() for q in context.questions)
         combined = f"{title_lower} {q_text}"

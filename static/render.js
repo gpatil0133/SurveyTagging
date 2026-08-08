@@ -163,8 +163,14 @@ window.ST = window.ST || {};
       statistic: obj && obj.measure
         ? `${obj.measure}: ${obj.observed ?? "?"}${obj.threshold !== undefined ? ` (threshold ${obj.threshold})` : ""}`
         : "",
+      superseded: (tag.superseded && typeof tag.superseded === "object") ? tag.superseded : null,
     };
   }
+
+  // Since v7.1 an LLM tag's `reasoning` is one line about THAT dimension, not a
+  // per-question blob — short enough to read inline. Anything longer (a legacy
+  // blob, a chatty model) still collapses so it can't swamp the card.
+  const INLINE_REASON_MAX = 180;
 
   function evidenceHtml(tag, cls) {
     if (!tag) return "";
@@ -186,22 +192,46 @@ window.ST = window.ST || {};
         chips.push(`<span class="chip chip--mono" title="hybrid component">${escapeHtml((c && (c.source || c.type)) || "?")}</span>`);
       }
     }
+    const isLlm = sourceClass(tag.source) === "llm";
+    const shortReason = p.reasoning && p.reasoning.length <= INLINE_REASON_MAX;
     const bits = [
       chips.length ? `<div class="ev-chips">${chips.join("")}</div>` : "",
       p.statistic ? `<div>${escapeHtml(p.statistic)}</div>` : "",
       p.detail ? `<div>${escapeHtml(p.detail)}</div>` : "",
       p.quote ? `<div class="ev-quote">&ldquo;${escapeHtml(p.quote)}&rdquo;</div>` : "",
-      p.reasoning
-        ? `<details class="ev-reasoning"><summary>${sourceClass(tag.source) === "llm" ? "LLM reasoning" : "Reasoning"}</summary><div>${escapeHtml(p.reasoning)}</div></details>`
-        : "",
+      !p.reasoning ? ""
+        : shortReason
+          // Short enough to read at a glance — never hide the only explanation
+          // an LLM-assigned tag has behind a disclosure triangle.
+          ? `<div class="ev-reason-line">${escapeHtml(p.reasoning)}</div>`
+          : `<details class="ev-reasoning"><summary>${isLlm ? "LLM reasoning" : "Reasoning"}</summary><div>${escapeHtml(p.reasoning)}</div></details>`,
+      supersededHtml(p.superseded),
     ].filter(Boolean);
     return bits.length ? `<div class="${cls}">${bits.join("")}</div>` : "";
+  }
+
+  // "A rule ran first and said X" — shown whenever an LLM answer displaced an
+  // earlier deterministic/statistical assignment.
+  function supersededHtml(sup) {
+    if (!sup) return "";
+    const prior = Array.isArray(sup.value) ? sup.value.join(", ") : String(sup.value ?? "");
+    const detail = (sup.evidence && typeof sup.evidence === "object")
+      ? (sup.evidence.detail || "")
+      : (typeof sup.evidence === "string" ? sup.evidence : "");
+    const head = `Overrode ${escapeHtml(sup.source || "earlier")} value `
+      + `<b>${escapeHtml(prior)}</b>`
+      + (typeof sup.confidence === "number" ? ` (confidence ${sup.confidence})` : "");
+    return `<details class="ev-superseded"><summary>${head}</summary>`
+      + `<div>${escapeHtml(detail || "No evidence was recorded on the displaced tag.")}</div></details>`;
   }
 
   function evidenceTitle(tag) {  // plain-text summary for table-cell tooltips
     if (!tag) return "";
     const p = evidenceParts(tag);
-    return [p.statistic, p.detail, p.reasoning].filter(Boolean).join(" — ");
+    const sup = p.superseded
+      ? `overrode ${p.superseded.source || "earlier"} value "${Array.isArray(p.superseded.value) ? p.superseded.value.join(", ") : p.superseded.value}"`
+      : "";
+    return [p.statistic, p.detail, p.reasoning, sup].filter(Boolean).join(" — ");
   }
 
   /* ---------- small formatters ---------- */
@@ -354,6 +384,9 @@ window.ST = window.ST || {};
     return {
       label: labelFor(key),
       description: dim.description || "",
+      // The plain-language half of the explanation layer. Preferred over
+      // `description` for hover text — `description` is the terse backend line.
+      explanation: dim.explanation || "",
       multi: !!dim.multi_label,
       free: !!dim.user_defined,
       allowed: Array.isArray(dim.allowed_values) ? dim.allowed_values : [],
@@ -615,7 +648,8 @@ window.ST = window.ST || {};
 
   function tagNameHtml(key, cls) {
     const meta = dimMeta(key);
-    const title = meta.description ? ` title="${escapeHtml(meta.description)}"` : "";
+    const hover = meta.explanation || meta.description;
+    const title = hover ? ` title="${escapeHtml(hover)}"` : "";
     const freeChip = meta.free
       ? ` <span class="chip chip--free" title="user-defined dimension: values are not constrained to a taxonomy list">free text</span>`
       : "";
@@ -860,7 +894,8 @@ window.ST = window.ST || {};
     const headHtml = ["#", "Question"].map(h => `<th>${escapeHtml(h)}</th>`).join("")
       + columns.map(k => {
           const meta = dimMeta(k);
-          const title = meta.description ? ` title="${escapeHtml(meta.description)}"` : "";
+          const hover = meta.explanation || meta.description;
+          const title = hover ? ` title="${escapeHtml(hover)}"` : "";
           return `<th${title}>${escapeHtml(meta.label)}</th>`;
         }).join("");
 
@@ -1399,14 +1434,33 @@ window.ST = window.ST || {};
 
   /* ---------- taxonomy ---------- */
 
+  /* What each `strategy` label means. Shown as the chip's tooltip so the
+     one-word label in the column does not have to carry the whole meaning.
+     Mirrors the header comment in config/taxonomy.yaml. */
+  const STRATEGY_HELP = {
+    "deterministic": "Rules over platform signals. Final — no LLM touches it.",
+    "statistical":   "Computed from response data (timestamps, gaps, clusters).",
+    "hybrid":        "Rules plus keyword/regex heuristics over free text. Final.",
+    "llm-refined":   "A rule writes a prior; one of the two per-survey LLM calls may override it.",
+    "llm-only":      "No rule can produce this value — the LLM assigns it.",
+    "placeholder":   "No signal source yet: a constant or an empty value awaiting user input.",
+  };
+
+  /* The taxonomy catalog. Two of these columns are the explanation layer —
+     "What it is" (explanation) and "How it's derived" (derivation), both
+     served straight from config/taxonomy.yaml via GET /api/taxonomy. The
+     multi-label / user-defined / count columns collapsed into chips on the
+     name and values cells to leave those two room to wrap and stay readable. */
   function taxonomyTable(taxonomy, search) {
     const tax = (taxonomy && typeof taxonomy === "object") ? taxonomy : {};
     const needle = String(search || "").toLowerCase().trim();
     const keys = Object.keys(tax).filter(k => {
       if (!needle) return true;
       const dim = tax[k] || {};
-      return k.toLowerCase().includes(needle)
-        || String(dim.description || "").toLowerCase().includes(needle);
+      // Search the prose too: "where does journey_stage come from" is a
+      // derivation-text question, not a dimension-name one.
+      return [k, dim.description, dim.explanation, dim.derivation, dim.strategy, dim.level]
+        .some(s => String(s || "").toLowerCase().includes(needle));
     });
 
     if (!keys.length) {
@@ -1416,21 +1470,42 @@ window.ST = window.ST || {};
     const rows = keys.map(k => {
       const dim = tax[k] || {};
       const allowed = Array.isArray(dim.allowed_values) ? dim.allowed_values : [];
-      const chips = allowed.length
-        ? `<div class="multi-list">${allowed.map(v => `<span class="chip">${escapeHtml(String(v))}</span>`).join("")}</div>`
-        : `<span class="empty">${dim.user_defined ? "free text" : "&mdash;"}</span>`;
+      const canonical = Array.isArray(dim.canonical_values) ? dim.canonical_values : [];
+      // A user_defined dim with canonical_values is not "free text" with
+      // nothing to show — the canon is the suggested vocabulary, so show it
+      // marked as such rather than an em-dash.
+      const shown = allowed.length ? allowed : canonical;
+      const values = shown.length
+        ? `<div class="multi-list">${shown.map(v => `<span class="chip">${escapeHtml(String(v))}</span>`).join("")}</div>
+           <span class="empty">${allowed.length ? `${allowed.length} allowed` : `${canonical.length} suggested (free text)`}</span>`
+        : `<span class="empty">${dim.user_defined ? "free text — not constrained" : "&mdash;"}</span>`;
+
+      const flags = [
+        dim.multi_label ? `<span class="chip" title="value is a list">multi</span>` : "",
+        dim.user_defined ? `<span class="chip chip--free" title="user-defined dimension: values are not constrained to a taxonomy list">free</span>` : "",
+      ].filter(Boolean).join(" ");
+
+      const strategy = String(dim.strategy || "");
+      const strategyCell = strategy
+        ? `<span class="chip chip--mono" title="${escapeHtml(STRATEGY_HELP[strategy] || strategy)}">${escapeHtml(strategy)}</span>`
+        : `<span class="empty">&mdash;</span>`;
+
+      const prose = (text) => text
+        ? escapeHtml(String(text))
+        : `<span class="empty">&mdash;</span>`;
+
       return `<tr>
-        <td class="mono" title="${escapeHtml(String(dim.description || ""))}">${escapeHtml(k)}</td>
+        <td class="mono tax-name">${escapeHtml(k)}${flags ? `<div class="tax-flags">${flags}</div>` : ""}</td>
         <td><span class="status status--info">${escapeHtml(String(dim.level || "—"))}</span></td>
-        <td>${dim.multi_label ? `<span class="status status--ok">multi</span>` : `<span class="empty">&mdash;</span>`}</td>
-        <td>${dim.user_defined ? `<span class="chip chip--free">free</span>` : `<span class="empty">&mdash;</span>`}</td>
-        <td>${allowed.length}</td>
-        <td>${chips}</td>
+        <td>${strategyCell}</td>
+        <td class="tax-prose">${prose(dim.explanation)}</td>
+        <td class="tax-prose">${prose(dim.derivation)}</td>
+        <td class="tax-values">${values}</td>
       </tr>`;
     }).join("");
 
-    const headers = ["Dimension", "Level", "Multi-label", "User-defined", "#", "Allowed values"];
-    return `<div class="question-table-wrap"><table class="qtable">
+    const headers = ["Dimension", "Level", "Strategy", "What it is", "How it's derived", "Values"];
+    return `<div class="question-table-wrap"><table class="qtable qtable--taxonomy">
       <thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>
       <tbody>${rows}</tbody>
     </table></div>`;

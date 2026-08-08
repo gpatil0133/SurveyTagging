@@ -148,20 +148,24 @@ def build_project_prompt(
 
     # Question summary (first 40)
     q_titles = []
+    current_section = ""
     for q in context.questions[:40]:
-        if q.is_content_message:
-            q_titles.append(f"[SECTION: {q.title}]")
-        else:
-            prefix = ""
-            if q.is_nps:
-                prefix = "[NPS] "
-            elif q.is_csat:
-                prefix = "[CSAT] "
-            elif q.is_ces:
-                prefix = "[CES] "
-            elif q.is_key_driver:
-                prefix = "[KEY DRIVER] "
-            q_titles.append(f"{prefix}{q.title}")
+        # Section headers come from the content messages the loader folded into
+        # `section_header`; emit one line each time the section changes.
+        if q.section_header and q.section_header != current_section:
+            current_section = q.section_header
+            q_titles.append(f"[SECTION: {current_section}]")
+
+        prefix = ""
+        if q.is_nps:
+            prefix = "[NPS] "
+        elif q.is_csat:
+            prefix = "[CSAT] "
+        elif q.is_ces:
+            prefix = "[CES] "
+        elif q.is_key_driver:
+            prefix = "[KEY DRIVER] "
+        q_titles.append(f"{prefix}{q.title}")
 
     directory_info = (
         ", ".join(context.directory_signals.domain_keywords[:10])

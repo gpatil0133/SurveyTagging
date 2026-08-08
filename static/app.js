@@ -37,7 +37,11 @@ window.ST = window.ST || {};
 
   var LS = { corp: "st.corp", topView: "st.topview", profileJob: "st.profilejob",
              tab: "st.tab", theme: "st.theme", density: "st.density" };
-  var SS = { taxonomy: "st.taxonomy.v1" };
+  /* Bump the version suffix whenever /api/taxonomy's response shape grows a
+   * field the UI reads — a session that cached the old shape would otherwise
+   * render blank columns until the tab is closed. v2 = the explanation layer
+   * (explanation / derivation / strategy) plus tenant-level dimensions. */
+  var SS = { taxonomy: "st.taxonomy.v2" };
 
   /* The platform shell's access token, written to same-origin localStorage on
    * login and on every silent renewal. We only ever READ it: the shell owns the
@@ -938,8 +942,10 @@ window.ST = window.ST || {};
         '<div class="tenant-panel"><h3>Resolve from SoGo Research API</h3>' +
         '<ol class="micro" style="margin:4px 0 10px 18px">' +
         "<li>Artifacts already on the image server &rarr; used as-is</li>" +
-        "<li>Otherwise read the generated profile from apismx</li>" +
-        "<li>Otherwise trigger generation, then wait ~" +
+        '<li>Otherwise read the generated profile from apismx — ' +
+        '<span class="mono">GET /AIAccountProfile/Details</span></li>' +
+        '<li>Otherwise trigger generation — ' +
+        '<span class="mono">POST /AIAccountProfile/Generate</span> — then wait ~' +
         (state.config.smx_generate_wait_seconds || 90) + "s for it</li></ol>" +
         '<div class="form-grid">' + agentBoxes + forceBox +
         (state.config.smx_allow_generate
@@ -953,6 +959,16 @@ window.ST = window.ST || {};
         (state.profileJob ? " disabled" : "") + ">Resolve profile</button>" +
         '<button class="btn ghost" data-action="profile-fetch"' +
         (state.profileJob ? " disabled" : "") + ">Resolve in background</button>" +
+        // Read-only step 2 on its own: same endpoint, generation forced off, so
+        // it can never start (or be billed for) research.
+        '<button class="btn ghost" data-action="profile-lookup"' +
+        (state.profileJob ? " disabled" : "") +
+        ' title="GET /AIAccountProfile/Details only — never generates">' +
+        "Look up in apismx</button>" +
+        '<p class="micro" style="margin:6px 0 0">' +
+        "&ldquo;Look up&rdquo; checks the share and " +
+        '<span class="mono">GET /AIAccountProfile/Details</span> only — it ' +
+        "reports nothing found rather than starting research.</p>" +
         "</div></div>";
     } else {
       form =
@@ -1337,34 +1353,49 @@ window.ST = window.ST || {};
     };
   }
 
-  function startProfileFetch(background) {
+  /* background: fire-and-forget + poll. lookupOnly: the read-only leg of the
+   * cascade — share and GET /AIAccountProfile/Details, generation forced off
+   * regardless of the checkbox, so a miss is a 404 and never a research run. */
+  function startProfileFetch(background, lookupOnly) {
     var isSmx = state.config.profile_source === "smx";
     var f = collectProfileForm();
     if (!isSmx && f.website.length < 4) {
       toast("err", "Enter the tenant website first.", true); return;
     }
     if (!f.agents.length) { toast("err", "Pick at least one agent.", true); return; }
-    if (!background && !isSmx && !window.confirm(
+    if (!background && !lookupOnly && !isSmx && !window.confirm(
       "Run synchronously? This blocks for up to 30 minutes. Background mode is " +
       "usually what you want.")) return;
-    if (!background && isSmx && f.allowGenerate && !window.confirm(
+    if (!background && !lookupOnly && isSmx && f.allowGenerate && !window.confirm(
       "If this tenant has no profile on the share or in SMX, research will be " +
       "generated for it. Continue?")) return;
 
     var body = { website: f.website, agents: f.agents, force: f.force,
-                 allow_generate: isSmx ? f.allowGenerate : true };
+                 allow_generate: !lookupOnly && (isSmx ? f.allowGenerate : true) };
 
     if (!background) {
       setBusy(1);
-      var msg = isSmx
-        ? "Resolving profile — share, then apismx, then generate…"
-        : "Profile fetch running synchronously — this can take 30 minutes…";
+      var msg = lookupOnly
+        ? "Looking up the profile — share, then GET /AIAccountProfile/Details…"
+        : isSmx
+          ? "Resolving profile — share, then apismx, then generate…"
+          : "Profile fetch running synchronously — this can take 30 minutes…";
       var rib = ribbonStart(msg);
       return api(ROUTES.profileFetch(state.corpNo, false),
                  { method: "POST", json: body, timeoutMs: null })
         .then(guarded).then(function (r) {
           setBusy(-1); ribbonStop(rib);
-          if (!r.ok) { toast("err", "Fetch failed: " + r.detail, true); return; }
+          if (!r.ok) {
+            // A lookup miss is the expected negative answer, not a failure:
+            // the server 404s precisely because it declined to generate.
+            if (lookupOnly && r.status === 404) {
+              toast("warn", "No profile for corp " + state.corpNo +
+                            " on the share or in apismx. Nothing was generated.", true);
+              return;
+            }
+            toast("err", (lookupOnly ? "Lookup failed: " : "Fetch failed: ") + r.detail, true);
+            return;
+          }
           var d = r.data || {};
           if (d.pending) {
             // Generation started but did not finish inside the server's wait
@@ -1630,6 +1661,7 @@ window.ST = window.ST || {};
     "profile-reload": function () { state.profileAgents = {}; loadProfile(); },
     "profile-fetch": function () { startProfileFetch(true); },
     "profile-fetch-sync": function () { startProfileFetch(false); },
+    "profile-lookup": function () { startProfileFetch(false, true); },
     "profile-stop-watch": function () {
       stopProfilePoll();
       toast("info", "Stopped watching. The fetch continues on the server.");

@@ -31,7 +31,8 @@ def load_survey_structure(
         survey_dir: Path to the survey folder (e.g., .../75885/SurveyData/3/)
 
     Returns:
-        Tuple of (SurveyMeta, list of QuestionContext).
+        Tuple of (SurveyMeta, list of QuestionContext). Content-message (CM)
+        entries are excluded — see `parse_survey_data`.
         Returns empty list if questionData is null/missing.
     """
     structure_file = survey_dir / "survey_structure.json"
@@ -55,8 +56,14 @@ def parse_survey_data(
       - {"SurveyData": [{...}]}  (standard file format)
       - {top-level survey object}  (convenience: raw survey object)
 
+    Content-message questions (`questionType == "CM"`) are **dropped** from the
+    returned list: they are static text, not questions, so every question tagger
+    skipped them anyway and they only showed up as empty rows in the output. The
+    one thing they contributed — acting as a section header for the questions
+    beneath them — is preserved on `QuestionContext.section_header`.
+
     Returns:
-        Tuple of (SurveyMeta, list of QuestionContext).
+        Tuple of (SurveyMeta, list of QuestionContext), CM entries excluded.
     """
     # Handle both wrapper and unwrapped formats
     survey_data = data.get("SurveyData")
@@ -94,9 +101,19 @@ def parse_survey_data(
         return survey_meta, []
 
     questions: list[QuestionContext] = []
-    for idx, q_raw in enumerate(question_data):
+    section_header = ""
+    cm_dropped = 0
+    for q_raw in question_data:
         title_result = clean_text(q_raw.get("questionTitle"))
         q_type = str(q_raw.get("questionType", "") or "")
+
+        # Content messages are page text, not questions. Keep the title as the
+        # running section header for what follows, then drop the row itself.
+        if q_type == "CM":
+            if title_result.cleaned:
+                section_header = title_result.cleaned
+            cm_dropped += 1
+            continue
 
         options = []
         for opt in q_raw.get("answerOptions", []):
@@ -109,7 +126,7 @@ def parse_survey_data(
         question = QuestionContext(
             question_id=int(q_raw.get("questionID", 0)),
             question_no=int(q_raw.get("questionNo", 0)),
-            position_index=idx,
+            position_index=len(questions),
             title=title_result.cleaned,
             title_raw=title_result.raw,
             question_type=q_type,
@@ -126,9 +143,17 @@ def parse_survey_data(
             answer_options=options,
             has_piping_markers=title_result.has_piping,
             piping_markers=title_result.piping_markers,
-            is_content_message=(q_type == "CM"),
+            is_content_message=False,
+            section_header=section_header,
         )
         questions.append(question)
+
+    if cm_dropped:
+        logger.debug(
+            "content_messages_filtered",
+            extra={"source": source_label, "dropped": cm_dropped,
+                   "questions": len(questions)},
+        )
 
     return survey_meta, questions
 

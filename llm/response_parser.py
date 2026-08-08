@@ -14,6 +14,39 @@ from models.taxonomy import TaxonomyRegistry
 logger = logging.getLogger(__name__)
 
 
+# V7.1: the output keys each LLM call may attach a per-dimension `why` line to.
+# Anything else in the model's `why` map is dropped — a hallucinated key would
+# otherwise surface as an explanation for a tag that call never assigned.
+_PROJECT_WHY_KEYS = frozenset({
+    "relationship_type", "project_purpose", "industry_vertical",
+    "audience_type_refined", "survey_sub_type", "dashboard_names",
+})
+_QUESTION_WHY_KEYS = frozenset({
+    "topic_theme", "role_intent_refined", "respondent_sensitivity",
+    "flow_respondent_experience", "flow_reusability", "visualization_type",
+    "dashboard_names", "display_role",
+})
+
+# A `why` line is one sentence by contract. Truncate rather than reject so a
+# chatty model still explains itself.
+_WHY_MAX_CHARS = 300
+
+
+def _clean_why(raw, allowed_keys: frozenset[str]) -> dict[str, str]:
+    """Normalize the model's per-dimension `why` map: keep known keys with
+    non-empty string values, collapse whitespace, bound the length."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, line in raw.items():
+        if key not in allowed_keys or not isinstance(line, str):
+            continue
+        collapsed = " ".join(line.split())
+        if collapsed:
+            out[key] = collapsed[:_WHY_MAX_CHARS]
+    return out
+
+
 class ResponseParser:
     """Validates LLM output against taxonomy and extracts structured tags."""
 
@@ -29,6 +62,24 @@ class ResponseParser:
     def _is_word_count_ok(label: str, *, min_w: int = 2, max_w: int = 6) -> bool:
         n = len(label.split())
         return min_w <= n <= max_w
+
+    @staticmethod
+    def _note_normalization(
+        why: dict[str, str], field: str, model_value: str, stored_value: str | None
+    ) -> None:
+        """Append a note to the `why` line when validation rewrote the model's
+        answer. Without this the stored explanation argues for a value the tag
+        no longer holds — the single most misleading thing an audit trail can do.
+        """
+        if stored_value == model_value:
+            return
+        if stored_value:
+            note = (f'Model answered "{model_value}", which is not an allowed value; '
+                    f"snapped to the nearest one.")
+        else:
+            note = (f'Model answered "{model_value}", which matched no allowed value; '
+                    f"the tag was dropped.")
+        why[field] = f"{why[field]} — {note}" if why.get(field) else note
 
     # ---------- Project-level ----------
 
@@ -46,12 +97,17 @@ class ResponseParser:
             "audience_type_refined": "audience_type",
             "survey_sub_type": "survey_sub_type",
         }
+        why = _clean_why(data.get("why"), _PROJECT_WHY_KEYS)
+
         for field, dimension in scalar_map.items():
             value = data.get(field)
             if value:
-                result[field] = self._validate_scalar(dimension, value)
+                validated = self._validate_scalar(dimension, value)
+                result[field] = validated
+                self._note_normalization(why, field, value, validated)
             else:
                 result[field] = None
+                why.pop(field, None)  # explained a dimension it never set
 
         # Multi-label: dashboard_names → dashboard_routing
         dashboard_names = data.get("dashboard_names")
@@ -62,7 +118,9 @@ class ResponseParser:
             result["dashboard_names"] = [v for v in result["dashboard_names"] if v]
         else:
             result["dashboard_names"] = None
+            why.pop("dashboard_names", None)
 
+        result["why"] = why
         result["reasoning"] = data.get("reasoning", "")
         logger.debug(
             "parse_project_response_done",
@@ -125,10 +183,16 @@ class ResponseParser:
                 "visualization_type": "visualization_type",
                 "display_role": "display_role",
             }
+            why = _clean_why(q_data.get("why"), _QUESTION_WHY_KEYS)
+
             for field, dimension in scalar_map.items():
                 value = q_data.get(field)
                 if value:
-                    parsed[field] = self._validate_scalar(dimension, value)
+                    validated = self._validate_scalar(dimension, value)
+                    parsed[field] = validated
+                    self._note_normalization(why, field, value, validated)
+                else:
+                    why.pop(field, None)  # explained a dimension it never set
 
             # ---------- Journey block (V5 atomic OR v4 legacy) ----------
             qid = q_data.get("id")
@@ -147,13 +211,22 @@ class ResponseParser:
                 cleaned = [self._validate_list_item("dashboard_placement", v)
                            for v in dashboard_names]
                 parsed["dashboard_names"] = [v for v in cleaned if v]
+            else:
+                why.pop("dashboard_names", None)
 
             # Role intent refinement (preserved from v1)
             parsed["role_intent_refined"] = q_data.get("role_intent_refined")
+            if not parsed["role_intent_refined"]:
+                why.pop("role_intent_refined", None)
 
-            # V7: one free-text rationale per question, stamped onto every tag
-            # this question's LLM pass assigns. Optional — older cached
-            # responses (prompt version < 7.0) simply won't carry it.
+            # V7.1: one rationale line PER dimension, so a reader inspecting a
+            # single tag gets the signal behind that tag rather than a blob
+            # covering the other seven.
+            parsed["why"] = why
+
+            # V7: the question-level summary. Still carried, now as the fallback
+            # for any dimension the model gave no `why` line for — and for
+            # cached responses from prompt version < 7.1, which have no `why`.
             reasoning = q_data.get("reasoning")
             if isinstance(reasoning, str) and reasoning.strip():
                 parsed["reasoning"] = reasoning.strip()

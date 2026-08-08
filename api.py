@@ -692,12 +692,20 @@ async def delete_tenant_profile(
 
 @app.get("/api/taxonomy")
 async def get_taxonomy() -> dict:
-    """Full taxonomy for populating client dropdowns."""
+    """Full taxonomy — client dropdowns, plus the explanation layer the UI's
+    Taxonomy tab renders (`explanation` / `derivation` / `strategy`).
+
+    Covers all three levels; tenant dims are in here too, so a caller reading a
+    tenant_tags.json artifact can look its dimensions up in the same catalog.
+    """
     dims = {}
     for name, dim in _ctx.taxonomy.all_dimensions.items():
         dims[name] = {
             "level": dim.level,
             "description": dim.description,
+            "explanation": dim.explanation,
+            "derivation": dim.derivation,
+            "strategy": dim.strategy,
             "allowed_values": dim.allowed_values,
             "multi_label": dim.multi_label,
             "user_defined": dim.user_defined,

@@ -12,7 +12,7 @@ class TaxonomyDimension(BaseModel):
     """A single tag dimension with its allowed values."""
 
     name: str
-    level: str  # "project" or "question"
+    level: str  # "tenant", "project" or "question"
     description: str = ""
     allowed_values: list[str] = Field(default_factory=list)
     multi_label: bool = False
@@ -20,6 +20,22 @@ class TaxonomyDimension(BaseModel):
     canonical_values: list[str] = Field(default_factory=list)
     """Preferred values for user_defined dims — shown to LLM as strong suggestions
     but not strictly enforced. Used for dashboard_routing/dashboard_placement."""
+
+    # --- explanation layer (V7) ---------------------------------------------
+    # Documentation only: nothing validates against these and no tagger reads
+    # them. They exist so a reader meeting a tag for the first time can answer
+    # "what is this?" and "where did the value come from?" without opening the
+    # tagger. Served by GET /api/taxonomy and rendered in the UI Taxonomy tab.
+    # Default to "" rather than being required, so a dimension added without
+    # them still loads (it just shows blank columns).
+    explanation: str = ""
+    """What the dimension is, in plain language, and what consumes it."""
+    derivation: str = ""
+    """Which inputs are read, the shape of the logic, the tagger module, and who
+    gets the final say (rule vs LLM call)."""
+    strategy: str = ""
+    """One-word label for the derivation: deterministic | statistical | hybrid |
+    llm-refined | llm-only | placeholder. See config/taxonomy.yaml's header."""
 
     def is_valid_value(self, value: str) -> bool:
         if self.user_defined:
@@ -48,7 +64,11 @@ class TaxonomyRegistry:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
-        for level in ("project_level", "question_level"):
+        # Tenant dims are loaded too, so the catalog can describe all three
+        # levels. They are never validated against (no LLM assigns them) and
+        # `project_dimensions` / `question_dimensions` filter on level, so the
+        # only behavioural change is that they now appear in `all_dimensions`.
+        for level in ("tenant_level", "project_level", "question_level"):
             level_key = level.replace("_level", "")
             for dim_name, dim_config in data.get(level, {}).items():
                 registry._dimensions[dim_name] = TaxonomyDimension(
@@ -59,6 +79,9 @@ class TaxonomyRegistry:
                     multi_label=dim_config.get("multi_label", False),
                     user_defined=dim_config.get("user_defined", False),
                     canonical_values=dim_config.get("canonical_values", []),
+                    explanation=dim_config.get("explanation", ""),
+                    derivation=dim_config.get("derivation", ""),
+                    strategy=dim_config.get("strategy", ""),
                 )
         return registry
 
@@ -74,6 +97,10 @@ class TaxonomyRegistry:
     def get_allowed_values(self, dimension: str) -> list[str]:
         dim = self._dimensions.get(dimension)
         return dim.allowed_values if dim else []
+
+    @property
+    def tenant_dimensions(self) -> list[TaxonomyDimension]:
+        return [d for d in self._dimensions.values() if d.level == "tenant"]
 
     @property
     def project_dimensions(self) -> list[TaxonomyDimension]:
