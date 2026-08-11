@@ -44,6 +44,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import log_retention
+
 logger = logging.getLogger("survey_tagging.usage")
 
 # ---------------------------------------------------------------- config ----
@@ -67,7 +69,11 @@ def configure(settings) -> None:
 
 
 def ledger_path(day: date | None = None) -> Path:
-    """Today's JSONL file. Daily rotation keeps a day's spend greppable as a unit."""
+    """Today's JSONL file. Daily rotation keeps a day's spend greppable as a unit.
+
+    Nothing here deletes the previous days — see log_retention.py, driven from
+    `write()` when the UTC date turns over.
+    """
     root = _log_dir or Path("./logs")
     return root / f"usage-{(day or datetime.now(timezone.utc).date()).isoformat()}.jsonl"
 
@@ -309,9 +315,18 @@ def write(record: dict) -> None:
     are atomic enough on both NTFS and POSIX, and holding a handle open across a
     day boundary would keep writing to yesterday's file. Failures here are
     swallowed to a WARNING — a full disk must not fail a tagging run.
+
+    The first write of each UTC day also carries the retention sweep. This is
+    the ledger's rollover moment — the only one it has, since a new day is a new
+    filename rather than a handler event — and `maybe_sweep` costs a date
+    comparison on every other line.
     """
     if not _enabled:
         return
+    try:
+        log_retention.maybe_sweep()
+    except Exception as e:  # noqa: BLE001 — retention must never lose a record
+        logger.debug("log_retention_sweep_failed", extra={"error": str(e)})
     try:
         line = json.dumps(record, ensure_ascii=False, default=str)
         path = ledger_path()

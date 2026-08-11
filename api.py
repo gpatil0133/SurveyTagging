@@ -15,6 +15,7 @@ Surface (all under /api):
     POST   /tenants/{t}/tag-surveys            tag all surveys (bounded-parallel)
     POST   /tenants/{t}/retag-surveys          force re-tag all surveys
     GET    /tenants/{t}/tag-surveys            tagged-status for the tenant
+    GET    /tenants/{t}/tag-surveys/stream     same, NDJSON, one line per survey
   Tenant tags
     POST   /tenants/{t}/tag                     build tenant_tags.json
     GET    /tenants/{t}/tags                     read tenant_tags.json
@@ -22,6 +23,7 @@ Surface (all under /api):
   Parallel.ai tenant profile
     POST   /tenants/{t}/profile/fetch
     GET    /tenants/{t}/profile
+    GET    /tenants/{t}/profile/diagnose   read-only: why is there no profile?
     GET    /tenants/{t}/profile/{agent}
     DELETE /tenants/{t}/profile
   Catalog / admin
@@ -46,6 +48,7 @@ is read for tenant resolution and outbound forwarding only.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import sys
@@ -69,7 +72,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -382,15 +385,86 @@ async def tenant_tag_status(
     tenant_id: int | None = None,
     authorization: str | None = Header(default=None),
 ) -> dict:
-    """List the tenant's surveys and whether each has tagged output on disk."""
+    """List the tenant's surveys and whether each has tagged output on disk.
+
+    One shot: nothing comes back until every survey has been probed. That is
+    fine for a few hundred surveys and is what non-browser callers want; the UI
+    uses the `/stream` form below, which does not make the client wait on the
+    slowest probe.
+    """
     tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
-    surveys = []
-    for sno in discovery.list_survey_nos(_settings.data_dir, tenant_id):
-        tagged = sharefs.exists(service.tagged_output_path(_ctx, tenant_id, sno))
-        surveys.append({"survey_no": sno, "tagged": tagged})
+    try:
+        surveys = await asyncio.to_thread(service.list_survey_status, _ctx, tenant_id)
+    except OSError:
+        surveys = []          # unreadable tenant dir reads as "nothing there", as before
     if not surveys:
         raise HTTPException(404, f"No surveys on disk for tenant={tenant_id}")
     return {"tenant_id": tenant_id, "surveys": surveys}
+
+
+@app.get("/api/tenants/{tenant_id}/tag-surveys/stream")
+@app.get("/api/tag-surveys/stream")
+async def tenant_tag_status_stream(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> StreamingResponse:
+    """The same listing as NDJSON, one survey per line as its probe lands.
+
+    Why this exists: a tenant with thousands of surveys costs one share round
+    trip per survey, and the one-shot form above answers only after the last of
+    them — long enough that the browser, or a reverse proxy in front of it,
+    times out and the listing can never be loaded at all. Here the first line
+    leaves as soon as the directory listing is in and the rest trickle out, so
+    the connection is never idle and the UI can paint rows as they arrive.
+
+    Lines (`application/x-ndjson`):
+        {"kind":"start","tenant_id":75885,"scanning":1240}
+        {"kind":"survey","survey_no":12,"tagged":true}      ... completion order
+        {"kind":"ping"}                                     ... keepalive only
+        {"kind":"done","count":1187}
+
+    The directory listing happens **before** the response starts so a dead share
+    is still an HTTP 503 — once the first byte is out, the status code is spent
+    and the only way left to report a failure is a line in the body. An empty
+    tenant is a normal 200 with `done.count = 0`, not a 404: that keeps 404
+    meaning "this server has no such route", which is what lets an older client
+    fall back to the one-shot form.
+    """
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
+    try:
+        dirs = await asyncio.to_thread(
+            discovery.list_survey_dirs, _settings.data_dir, tenant_id
+        )
+    except OSError as e:
+        # A tenant dir that simply is not there is an ordinary empty listing —
+        # the same answer the caller gets for a tenant with no surveys. Anything
+        # else (rejected logon, unreachable server, timeout) is the share being
+        # broken and must not be dressed up as "this corp has nothing".
+        # `errno`, not the exception class: smbprotocol raises its own OSError
+        # subclass, which bypasses Python's errno->FileNotFoundError mapping.
+        if e.errno in (errno.ENOENT, errno.ENOTDIR):
+            dirs = []
+        else:
+            raise HTTPException(503, f"Cannot read the data share: {e}")
+    except Exception as e:  # noqa: BLE001 — transport-level refusals are not OSError
+        raise HTTPException(503, f"Cannot read the data share: {type(e).__name__}: {e}")
+
+    async def body():
+        try:
+            async for event in service.stream_survey_status(_ctx, tenant_id, dirs):
+                yield json.dumps(event, separators=(",", ":")).encode() + b"\n"
+        except Exception as e:  # noqa: BLE001 — headers are gone; the body is the channel
+            logger.exception("survey_stream_failed", extra={"tenant_id": tenant_id})
+            yield json.dumps({"kind": "error",
+                              "detail": f"{type(e).__name__}: {e}"}).encode() + b"\n"
+
+    return StreamingResponse(
+        body(),
+        media_type="application/x-ndjson",
+        # A buffering proxy would hold the whole body and undo the point of
+        # this route; nginx/IIS honour X-Accel-Buffering.
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 # ====================================================================
@@ -709,6 +783,131 @@ async def get_tenant_profile(
     }
 
 
+def _run_smx_diagnose(tenant_id: int, token: str) -> dict:
+    """Everything we can learn about one tenant's profile WITHOUT writing anything.
+
+    `/profile/fetch` answers "did it work"; when it did not, this answers why.
+    It reads the three sources the cascade consults — the share, `/Details`, and
+    `/List` — and reports them side by side. `/List` is the one the cascade never
+    looks at and the one that usually holds the answer: `canGenerate`,
+    `errorMessage`, and whether the account has a real `WebsiteUrl` or an
+    `EffectiveUrl` guessed from its email domain. A `/Generate` that 500s for one
+    corp and works for others is nearly always an account with nothing to
+    research.
+
+    Strictly read-only: no Generate, no artifacts written. Safe to hit repeatedly.
+    """
+    from tenant_profile.smx_client import SmxClientError
+    from tenant_profile.smx_runner import build_client
+
+    out: dict = {
+        "tenant_id": tenant_id,
+        "profile_source": _settings.profile_source,
+        "on_disk": {a: sharefs.exists(_agent_artifact_path(tenant_id, a))
+                    for a in _PARALLEL_AGENTS},
+        "apismx": {},
+        "account": None,
+        "next_step": "",
+    }
+    if _settings.profile_source != "smx":
+        out["next_step"] = (f"profile_source={_settings.profile_source!r} — this "
+                            f"diagnostic only covers the smx path.")
+        return out
+
+    try:
+        client = build_client(_settings, token)
+    except SmxClientError as e:
+        # No token is the caller's problem, not the upstream's — same 400 the
+        # fetch route gives, rather than a 502 blaming apismx.
+        raise HTTPException(400, str(e)) from e
+
+    with client:
+        try:
+            rows = client.get_details(tenant_id)
+            out["apismx"]["rows"] = [
+                {"profile_type": r.profile_type, "profile_type_name": r.profile_type_name,
+                 "agent": r.agent, "is_success": r.is_success,
+                 "api_status_message": r.api_status_message,
+                 "payload_parsed": r.payload is not None, "created_at": r.created_at}
+                for r in rows
+            ]
+        except SmxClientError as e:
+            out["apismx"]["error"] = str(e)
+            rows = []
+
+        account = None
+        try:
+            listed, _meta = client.list_accounts(search=str(tenant_id), page_size=50)
+            account = next((r for r in listed if r.corporate_no == tenant_id), None)
+            if account is not None:
+                out["account"] = {
+                    "corporate_no": account.corporate_no,
+                    "corporate_id": account.corporate_id,
+                    "website_url": account.website_url,
+                    "effective_url": account.effective_url,
+                    "website_is_derived": account.website_is_derived,
+                    "package_name": account.package_name,
+                    "account_status": account.account_status,
+                    "status": account.status,
+                    "can_generate": account.can_generate,
+                    "error_message": account.error_message,
+                }
+        except SmxClientError as e:
+            out["list_error"] = str(e)
+
+    out["next_step"] = _diagnose_next_step(tenant_id, out, rows, account)
+    return out
+
+
+def _diagnose_next_step(tenant_id: int, out: dict, rows: list, account) -> str:
+    """The one sentence a reader actually wants out of the three source dumps."""
+    if all(out["on_disk"].values()):
+        return "All three artifacts are already on the share. Nothing to do."
+    if any(r.is_success and r.payload is not None for r in rows):
+        return (f"apismx has a usable profile — POST /api/tenants/{tenant_id}"
+                f"/profile/fetch to persist it to the share.")
+    if rows:
+        return ("apismx has rows but none are usable (isSuccess false or an "
+                "unreadable profileResponse). Regeneration is needed; see "
+                "`apismx.rows[].api_status_message`.")
+    if account is None:
+        return ("No profile in apismx, and /AIAccountProfile/List did not return "
+                f"corp {tenant_id} for that search. Confirm the corp exists in "
+                "this environment (SOGO_HOST) and that the token can see it.")
+    if not account.can_generate:
+        return (f"No profile, and the account reports canGenerate=false"
+                f"{': ' + account.error_message if account.error_message else ''}. "
+                "Generation must be fixed on the SoGo side.")
+    if not account.website_url.strip():
+        return ("No profile, and the account has no WebsiteUrl — the service "
+                f"would research {account.effective_url or 'nothing'}, guessed "
+                "from the email domain. Set a real website on the account before "
+                "generating.")
+    return ("No profile, but the account looks generatable. If /Generate is "
+            "still returning 500, the failure is inside the Research API — quote "
+            "the smx_http_error line from app.log to that team.")
+
+
+@app.get("/api/tenants/{tenant_id}/profile/diagnose")
+@app.get("/api/profile/diagnose")
+async def diagnose_tenant_profile(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    """Read-only: share + apismx /Details + apismx /List for one tenant.
+
+    Registered BEFORE `/profile/{agent}` on purpose — FastAPI matches routes in
+    definition order, so the other way round `diagnose` would be read as an agent
+    name and 400.
+    """
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
+    from tenant_profile.smx_client import SmxClientError
+    try:
+        return await asyncio.to_thread(_run_smx_diagnose, tenant_id, _bearer(authorization))
+    except SmxClientError as e:
+        raise HTTPException(502, f"apismx diagnose failed: {e}") from e
+
+
 @app.get("/api/tenants/{tenant_id}/profile/{agent}")
 @app.get("/api/profile/{agent}")
 async def get_tenant_profile_agent(
@@ -838,6 +1037,8 @@ async def ui_config() -> dict:
         "smx_generate_wait_seconds": int(
             _settings.smx_generate_poll_attempts * _settings.smx_generate_poll_interval
         ),
+        # So "the trace is on" is checkable without reading the server's .env.
+        "smx_debug_wire": _settings.smx_debug_wire,
         "skip_llm": _settings.skip_llm,
     }
 

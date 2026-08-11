@@ -245,6 +245,12 @@ def resolve_tenant_profile(
     try:
         summary = client.generate([tenant_id])
     except SmxClientError as e:
+        # The route turns this into a 404, whose body the browser sees and the
+        # log does not. Say it here too, or the server-side story ends at
+        # "smx_generate_triggered" with no outcome. (The full response body is
+        # already on the ERROR line SmxClient._request emitted.)
+        logger.error("smx_generate_failed",
+                     extra={"tenant_id": tenant_id, "error": str(e)})
         return ResolveResult(
             results=[], source="unavailable", detail=f"Generate failed: {e}",
         )
@@ -286,8 +292,13 @@ def build_client(settings: Any, token: str = "") -> SmxClient:
     explicitly the request-scoped token is used — the browser puts one on every
     call, so a route that never threaded it through still forwards it.
     `settings.smx_token` is the headless fallback (CLI, scheduler).
+
+    This is also the single place the wire trace is configured from Settings, so
+    every client built for the app is traced identically and one constructed by
+    hand (tests) is not traced at all.
     """
     import request_context
+    from tenant_profile.smx_trace import SmxTrace
 
     verify: bool | str = settings.sogo_verify_ssl
     if settings.sogo_ca_bundle_path:
@@ -304,4 +315,9 @@ def build_client(settings: Any, token: str = "") -> SmxClient:
         token=resolved,
         timeout=settings.smx_request_timeout,
         verify=verify,
+        trace=SmxTrace(
+            enabled=bool(getattr(settings, "smx_debug_wire", False)),
+            log_dir=getattr(settings, "log_dir", None),
+            max_chars=int(getattr(settings, "smx_debug_max_chars", 2000) or 2000),
+        ),
     )

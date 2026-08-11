@@ -18,18 +18,31 @@ Two things about the wire format that the swagger does not tell you:
 Every route needs a Bearer JWT from the same issuer as our own `auth.py`, so a
 request-scoped caller can forward its token; `settings.smx_token` is the
 fallback for headless paths (CLI backfill, scheduler).
+
+Every step of every exchange goes through `smx_trace.SmxTrace` — see that module
+for what is recorded and why the levels are the way they are. The short version:
+failures are logged in full unconditionally, and the successful traffic is one
+env flag away.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from tenant_profile.smx_trace import DISABLED, SmxTrace, compact
+
 logger = logging.getLogger(__name__)
+
+# How much of a failing response body goes into the exception message — which
+# ends up in the HTTP error the UI shows. The full body is always in the log;
+# this is just the part a human sees without opening app.log.
+_ERROR_EXCERPT = 500
 
 # profileType -> our agent name. Confirmed against qauc corp 7594:
 #   1 "Account" -> org, 2 "CX" -> cx, 3 "EX" -> ex.
@@ -103,6 +116,24 @@ def _as_str(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def _ms_since(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
+
+
+def _row_summary(row: "ProfileRow") -> dict[str, Any]:
+    """What a `/Details` row is, without its (already-persisted) contents."""
+    return {
+        "profile_type": row.profile_type,
+        "profile_type_name": row.profile_type_name,
+        "agent": row.agent,
+        "is_success": row.is_success,
+        "api_status_message": row.api_status_message,
+        "payload_parsed": row.payload is not None,
+        "payload_keys": sorted(row.payload)[:20] if row.payload else [],
+        "created_at": row.created_at,
+    }
+
+
 def parse_profile_response(raw: Any) -> dict[str, Any] | None:
     """`profileResponse` is typed `string`; recover the object it holds.
 
@@ -139,6 +170,7 @@ class SmxClient:
         token: str,
         timeout: float = 60.0,
         verify: bool | str = True,
+        trace: SmxTrace | None = None,
     ) -> None:
         if not token:
             raise SmxClientError(
@@ -147,6 +179,7 @@ class SmxClient:
             )
         self._base = base_url.rstrip("/")
         self._pmx = pmx_base_url.rstrip("/")
+        self._trace = trace or DISABLED
         self._client = httpx.Client(
             timeout=timeout,
             verify=verify,
@@ -167,15 +200,34 @@ class SmxClient:
 
     # ---------- transport ----------
 
-    def _decrypt(self, blob: str) -> Any:
-        """Round-trip an encrypted payload through apipmx `/dcdata`."""
+    def _decrypt(self, blob: str, exchange: str = "") -> Any:
+        """Round-trip an encrypted payload through apipmx `/dcdata`.
+
+        Traced separately from the call that produced the blob: a `/Details` that
+        returns 200 and then fails to decrypt is a different problem (mismatched
+        apismx/apipmx hosts) from one that never answered, and the one-line
+        `smx_decrypted` record with the plaintext is what makes the difference
+        visible.
+        """
+        url = f"{self._pmx}/dcdata"
+        started = time.perf_counter()
+        self._trace.record("smx_decrypt_request", exchange=exchange, url=url,
+                           blob_chars=len(blob))
         try:
-            resp = self._client.post(f"{self._pmx}/dcdata", json={"decValue": blob})
+            resp = self._client.post(url, json={"decValue": blob})
         except httpx.HTTPError as e:
+            self._trace.record("smx_decrypt_transport_error", level=logging.ERROR,
+                               exchange=exchange, url=url, error=str(e),
+                               duration_ms=_ms_since(started))
             raise SmxClientError(f"/dcdata request failed: {e}") from e
+        duration_ms = _ms_since(started)
         if resp.status_code != 200:
+            self._trace.record("smx_decrypt_http_error", level=logging.ERROR,
+                               exchange=exchange, url=url,
+                               status_code=resp.status_code, duration_ms=duration_ms,
+                               response_body=resp.text)
             raise SmxClientError(
-                f"/dcdata returned HTTP {resp.status_code}: {resp.text[:200]}"
+                f"/dcdata returned HTTP {resp.status_code}: {resp.text[:_ERROR_EXCERPT]}"
             )
         try:
             inner = resp.json()
@@ -186,33 +238,78 @@ class SmxClient:
             try:
                 inner = json.loads(inner)
             except json.JSONDecodeError as e:
+                self._trace.record("smx_decrypt_non_json", level=logging.ERROR,
+                                   exchange=exchange, url=url, error=str(e),
+                                   response_body=inner)
                 raise SmxClientError(f"/dcdata returned non-JSON plaintext: {e}") from e
+        self._trace.record("smx_decrypted", exchange=exchange, duration_ms=duration_ms,
+                           plaintext=compact(inner))
         return inner
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self._base}{path}"
+        exchange = self._trace.new_exchange()
+        params = kwargs.get("params")
+        request_body = kwargs.get("json")
+        started = time.perf_counter()
+        self._trace.record("smx_request", exchange=exchange, method=method, url=url,
+                           params=params, request_body=request_body)
         try:
             resp = self._client.request(method, url, **kwargs)
         except httpx.HTTPError as e:
+            self._trace.record("smx_transport_error", level=logging.ERROR,
+                               exchange=exchange, method=method, url=url,
+                               error=str(e), duration_ms=_ms_since(started))
             raise SmxClientError(f"{method} {path} failed: {e}") from e
+        duration_ms = _ms_since(started)
 
-        if resp.status_code == 401:
-            raise SmxClientError(
-                f"{method} {path} returned 401 — the apismx token is missing, "
-                "expired, or issued for a different environment."
-            )
         if resp.status_code >= 400:
+            # ERROR, and the WHOLE body — the exception carries an excerpt to the
+            # caller, but the server's own explanation of a 500 exists nowhere
+            # else. This is the one record that must not need a flag flipped.
+            self._trace.record("smx_http_error", level=logging.ERROR,
+                               exchange=exchange, method=method, url=url,
+                               params=params, request_body=request_body,
+                               status_code=resp.status_code, duration_ms=duration_ms,
+                               response_body=resp.text)
+            if resp.status_code == 401:
+                raise SmxClientError(
+                    f"{method} {path} returned 401 — the apismx token is missing, "
+                    "expired, or issued for a different environment."
+                )
             raise SmxClientError(
-                f"{method} {path} returned HTTP {resp.status_code}: {resp.text[:200]}"
+                f"{method} {path} returned HTTP {resp.status_code}: "
+                f"{resp.text[:_ERROR_EXCERPT]}"
             )
         try:
             body = resp.json()
         except ValueError as e:
+            self._trace.record("smx_non_json_response", level=logging.ERROR,
+                               exchange=exchange, method=method, url=url,
+                               status_code=resp.status_code, duration_ms=duration_ms,
+                               response_body=resp.text)
             raise SmxClientError(f"{method} {path} returned non-JSON body: {e}") from e
 
         blob = _ci(body, "payload")
-        if isinstance(blob, str) and blob:
-            body = self._decrypt(blob)
+        encrypted = isinstance(blob, str) and bool(blob)
+        # An encrypted body is a base64 blob: recording it would be pure noise,
+        # so the size goes here and the content comes from `smx_decrypted`.
+        self._trace.record("smx_response", exchange=exchange, method=method, url=url,
+                           status_code=resp.status_code, duration_ms=duration_ms,
+                           encrypted=encrypted,
+                           payload_chars=len(blob) if encrypted else None,
+                           response_body=None if encrypted else compact(body))
+        if encrypted:
+            body = self._decrypt(blob, exchange)
+
+        message = _ci(body, "message") or {}
+        data = _ci(body, "data")
+        self._trace.record("smx_envelope", exchange=exchange, url=url,
+                           envelope_status=_ci(message, "status"),
+                           user_message=_as_str(_ci(message, "userMessage")) or None,
+                           exception_message=_as_str(_ci(message, "exceptionMessage")) or None,
+                           data_type=type(data).__name__,
+                           data_len=len(data) if isinstance(data, (list, dict, str)) else None)
         return self._unwrap(body, f"{method} {path}")
 
     @staticmethod
@@ -314,15 +411,32 @@ class SmxClient:
                 logger.warning("smx_unreadable_profile_type",
                                extra={"corp_no": corp_no, "value": repr(ptype_raw)})
                 continue
+            raw_response = _ci(item, "profileResponse")
+            payload = parse_profile_response(raw_response)
+            if payload is None:
+                # The row exists but carries nothing we can read. Keep the raw
+                # string: "generated but empty" and "generated but malformed"
+                # look identical downstream, and only this tells them apart.
+                self._trace.record("smx_unreadable_profile_response",
+                                   corp_no=corp_no, profile_type=ptype,
+                                   raw_type=type(raw_response).__name__,
+                                   raw=_as_str(raw_response))
             rows.append(ProfileRow(
                 profile_type=ptype,
                 profile_type_name=_as_str(_ci(item, "profileTypeName")),
                 agent=PROFILE_TYPE_TO_AGENT.get(ptype),
                 is_success=bool(_ci(item, "isSuccess")),
                 api_status_message=_as_str(_ci(item, "apiStatusMessage")),
-                payload=parse_profile_response(_ci(item, "profileResponse")),
+                payload=payload,
                 created_at=_as_str(_ci(item, "createdate", "createDate", "created_at")),
             ))
+
+        # The shape of what came back, not its content — the content is already
+        # written to the share as an artifact. This is the record that answers
+        # "does this tenant have a profile, and is it usable?".
+        self._trace.record("smx_details_rows", corp_no=corp_no, row_count=len(rows),
+                           rows=[_row_summary(r) for r in rows])
+
         unknown = [r.profile_type for r in rows if r.agent is None]
         if unknown:
             # Not fatal: a new profile type is additive, and the three we map
@@ -335,8 +449,13 @@ class SmxClient:
         """Trigger generation. Write operation — callers gate this on user intent."""
         if not corp_nos:
             raise SmxClientError("generate() needs at least one corp_no")
-        return self._request("POST", "/AIAccountProfile/Generate",
-                             json={"corpNos": [int(c) for c in corp_nos]}) or {}
+        body = {"corpNos": [int(c) for c in corp_nos]}
+        summary = self._request("POST", "/AIAccountProfile/Generate", json=body) or {}
+        # inserted/skipped/failed. "Accepted" and "actually queued" are not the
+        # same thing, and this is the only place the difference shows.
+        self._trace.record("smx_generate_accepted", corp_nos=body["corpNos"],
+                           summary=summary)
+        return summary
 
     def package_types(self) -> list[str]:
         data = self._request("GET", "/AIAccountProfile/PackageTypes") or []

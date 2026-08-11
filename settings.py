@@ -85,6 +85,25 @@ class Settings(BaseSettings):
     cache_dir: Path = Field(default=Path("./.cache"))
     max_concurrent_surveys: int = 5
     skip_llm: bool = False
+    # Threads used to probe survey dirs when listing a tenant. Unrelated to
+    # max_concurrent_surveys: no tagging happens here, each thread only waits on
+    # an SMB round trip, so this hides latency rather than doing work.
+    #
+    # The number is low on purpose, and raising it is not free. SMB2 grants the
+    # client a bounded number of *credits* (outstanding requests) and past that
+    # smbprotocol fails the request outright. Measured on the QA image server,
+    # 44 surveys: 20.3s at 1 worker, 5.9s at 4, 3.6s at 8 — and 12 workers fail
+    # on the spot with "Request requires 1 credits but only 0 credits are
+    # available".
+    #
+    # 4 rather than 8 because this pool does not have the share to itself: a
+    # tenant tag run holds up to `max_concurrent_surveys` workers doing their own
+    # share I/O, and that path does not retry, so a listing that eats the credit
+    # window would surface as a *tagging* failure. 4 keeps the total under the
+    # measured wall while still cutting the listing ~3.5x. The window belongs to
+    # the server, so a roomier share can take more; `service._probe` retries, so
+    # an over-tuned value degrades a row rather than the listing.
+    discovery_workers: int = 4
 
     # Auto-retag scheduler (periodic change-driven re-tagging).
     #
@@ -139,6 +158,18 @@ class Settings(BaseSettings):
     smx_generate_poll_attempts: int = 6
     smx_generate_poll_interval: float = 15.0
 
+    # Wire trace for the apismx exchange (tenant_profile/smx_trace.py). Off, the
+    # successful traffic logs at DEBUG (i.e. nowhere, at our INFO level) and
+    # nothing is written; on, every step logs at INFO and the full request and
+    # response bodies land in {log_dir}/smx-wire-YYYY-MM-DD.jsonl.
+    #
+    # Failures are logged in full either way — a 500 that needs a flag flipped
+    # and a reproduction is a 500 already lost. This flag is for seeing what the
+    # SUCCESSFUL calls returned.
+    smx_debug_wire: bool = False
+    # Body clipping for the app.log lines only; the JSONL keeps the full body.
+    smx_debug_max_chars: int = 2000
+
     # Logging
     log_level: str = "DEBUG"
     log_format: str = "console"
@@ -157,6 +188,14 @@ class Settings(BaseSettings):
     # app.log rotation. 10 MB x 10 keeps roughly a week of DEBUG at current volume.
     app_log_max_bytes: int = 10 * 1024 * 1024
     app_log_backup_count: int = 10
+    # Retention — rotation bounds one file, this bounds the pile (log_retention.py).
+    # `app_log_backup_count` already caps app.log.N by COUNT; the age cutoff is the
+    # second half of that, so a quiet month does not keep January's log forever.
+    # The ledger has no count cap at all — it is one new file per UTC day — so
+    # without this it grows unbounded. 0 disables the sweep for that sink.
+    # Keep the ledger the longer of the two: it is the billing record.
+    app_log_retention_days: int = 30
+    usage_log_retention_days: int = 90
     # Mirror app.log to stderr as well. False in a service host where stderr
     # goes nowhere; True in dev so `uvicorn --reload` still prints.
     log_to_stderr: bool = True

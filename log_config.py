@@ -7,6 +7,9 @@ Two sinks, deliberately different in kind:
   logs/usage-*.jsonl  structured ledger — see usage_log.py.
                   For summing cost and latency. Never parse app.log for those.
 
+Both are bounded twice: by rotation (size here, one-file-per-day for the ledger)
+and by age (see log_retention.py, swept at startup and on every rollover).
+
 The whole codebase logs structured events as `logger.debug("event_name",
 extra={...})`. The stdlib default formatter only renders `%(message)s`, so all
 those `extra` key/values are silently dropped — you see `stage_start` but not
@@ -20,6 +23,8 @@ import logging
 import logging.handlers
 import sys
 from pathlib import Path
+
+import log_retention
 
 # All attributes the stdlib puts on a LogRecord by default. Anything *else* on
 # the record came from a caller's `extra={...}` and should be rendered.
@@ -41,6 +46,29 @@ _UVICORN_LOGGERS = ("uvicorn.access", "uvicorn.error")
 # The single file handler, kept so late attachers (the lifespan re-attach) reuse
 # it instead of opening a second handle on the same file.
 _file_handler: logging.Handler | None = None
+
+
+class RetainingRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler that prunes aged-out logs after each rollover.
+
+    A rollover is the one moment we know the directory just gained a file, and
+    it is rare enough that an unconditional sweep costs nothing. It also means a
+    long-running service prunes without a timer or a background thread.
+
+    The sweep may log (it reports what it deleted) while this handler's own lock
+    is held; that re-entry is safe because `Handler.lock` is an RLock and the
+    stream has already been reopened by the time we get here. It must never take
+    down a log write, hence the blanket except.
+    """
+
+    def doRollover(self) -> None:  # noqa: N802 — stdlib name
+        super().doRollover()
+        try:
+            log_retention.sweep_now()
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger(__name__).debug(
+                "log_retention_sweep_failed", extra={"error": str(e)}
+            )
 
 
 class ExtraFormatter(logging.Formatter):
@@ -95,7 +123,7 @@ def configure_logging(
     log_dir = Path(settings.log_dir)
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
-        _file_handler = logging.handlers.RotatingFileHandler(
+        _file_handler = RetainingRotatingFileHandler(
             log_dir / "app.log",
             maxBytes=int(settings.app_log_max_bytes),
             backupCount=int(settings.app_log_backup_count),
@@ -118,6 +146,13 @@ def configure_logging(
     import usage_log
 
     usage_log.configure(settings)
+
+    # Retention last: it prunes both sinks, so it needs the dir to exist and the
+    # handler to hold the live app.log (which it must never delete). One sweep
+    # at startup catches whatever piled up while the process was down; after
+    # that a rollover (app.log) or a UTC day boundary (ledger) triggers it.
+    log_retention.configure(settings)
+    log_retention.sweep_now()
 
 
 def attach_uvicorn_handlers() -> None:

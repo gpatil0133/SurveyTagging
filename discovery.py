@@ -67,14 +67,57 @@ def list_survey_nos(data_dir: Path, tenant_id: int) -> list[int]:
     return sorted(out)
 
 
-def survey_exists(data_dir: Path, tenant_id: int, survey_no: int) -> bool:
-    return sharefs.exists(survey_dir(data_dir, tenant_id, survey_no) / "survey_structure.json")
-
-
 # Generated artifacts that live inside the survey dir alongside its inputs.
 # The change detector must exclude these or writing the output would perturb
 # the survey's own input hash — see pipeline/change_detector.py.
 TAGGED_OUTPUT_FILE = "tagged_output.json"
+
+
+def list_survey_dirs(data_dir: Path, tenant_id: int) -> list[Path]:
+    """Numerically-named child dirs of `{tenant}/SurveyData` — one listing, no
+    per-dir I/O.
+
+    The candidate set behind `list_survey_nos`, before the per-survey
+    `survey_structure.json` check that costs a round trip each. Split out so the
+    streaming listing can send "scanning N dirs" immediately and then emit each
+    survey as its own probe lands.
+
+    Unlike `list_survey_nos` this **raises** OSError instead of returning an
+    empty list: the caller that streams needs to tell "the share is down" from
+    "this tenant has no surveys", which is exactly the distinction the swallow
+    destroys (see `probe_root`).
+    """
+    base = Path(data_dir) / str(tenant_id) / "SurveyData"
+    dirs = [d for d in sharefs.list_dirs(base) if _as_int(d.name) is not None]
+    return sorted(dirs, key=lambda d: int(d.name))
+
+
+def probe_survey(
+    data_dir: Path, output_dir: Path, tenant_id: int, survey_no: int
+) -> dict | None:
+    """`{survey_no, tagged}` for one survey, or None when it is not a survey.
+
+    Two `exists()` calls, deliberately, even though a single `iterdir` of the
+    survey dir would answer both questions at once and the deployed layout puts
+    inputs and outputs in the same dir. Measured against the QA share, a listing
+    costs about **twice** what two stats do (~810 ms vs ~420 ms per survey dir):
+    `listdir` is create + query-directory + close, and the query-directory leg
+    is not one round trip. Survey dirs hold only a handful of entries, so there
+    is nothing for the listing to amortize.
+
+    Both stats are on the critical path of every tenant listing — one per survey
+    — so this is the operation to keep cheap; the caller is expected to run many
+    of these concurrently.
+    """
+    sdir = survey_dir(data_dir, tenant_id, survey_no)
+    if not sharefs.exists(sdir / "survey_structure.json"):
+        return None
+    tagged_at = survey_dir(output_dir, tenant_id, survey_no) / TAGGED_OUTPUT_FILE
+    return {"survey_no": survey_no, "tagged": sharefs.exists(tagged_at)}
+
+
+def survey_exists(data_dir: Path, tenant_id: int, survey_no: int) -> bool:
+    return sharefs.exists(survey_dir(data_dir, tenant_id, survey_no) / "survey_structure.json")
 
 
 def tagged_output_path(root: Path, tenant_id: int, survey_no: int) -> Path:

@@ -5,6 +5,7 @@ orchestration and file I/O so the route handlers stay thin and there is one
 code path per operation.
 
   Survey:  tag_survey / read_tagged / delete_tagged
+  Listing: list_survey_status / stream_survey_status
   Tenant:  tag_tenant_surveys (all surveys, bounded-parallel)
   Tenant:  tag_tenant_tags / read_tenant_tags / delete_tenant_tags
   Ad-hoc:  tag_uploaded (in-memory survey JSON, no persistence)
@@ -12,8 +13,13 @@ code path per operation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
+import time
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import discovery
@@ -91,6 +97,129 @@ def tag_tenant_surveys(ctx: AppContext, tenant_id: int, *, force: bool = False) 
         "failed": summary.get("total_surveys_failed", 0),
         "surveys": tenant_summary.get("surveys", []),
     }
+
+
+# ---------- survey listing (tagged status) ----------
+#
+# A tenant's listing is one directory listing plus one probe per survey, and each
+# probe is a network round trip. At a few thousand surveys the serial form takes
+# minutes and the browser (or a proxy in front of it) gives up before the first
+# byte, so both listing paths here fan the probes out across a thread pool: the
+# threads share one authenticated SMB session safely (see sharefs' module
+# docstring) and the round trips overlap, up to the server's credit window —
+# which is what `discovery_workers` is really sized against, see `_probe`.
+#
+# `stream_survey_status` additionally yields each survey the moment its probe
+# lands, which is what keeps the response alive: bytes flow continuously, so no
+# timeout is waiting on a total that only exists at the end.
+
+_PING_SECONDS = 10.0     # keepalive cadence while every probe is still in flight
+_PROBE_ATTEMPTS = 3
+
+
+def _probe(ctx: AppContext, tenant_id: int, sdir: Path) -> dict | None:
+    """One survey's status, with a retry for the failure the fan-out causes itself.
+
+    SMB2 hands the client a bounded number of *credits* — outstanding requests
+    the server will accept — and smbprotocol raises `SMBException: Request
+    requires 1 credits but only 0 credits are available` the moment the pool
+    outruns that window. Measured against the QA image server the wall is
+    somewhere between 8 and 12 concurrent probes, and it is a property of the
+    server, not of this code: a different share grants a different window, so no
+    fixed `discovery_workers` can be guaranteed safe.
+
+    It is also transient by construction — the credits come back as the in-flight
+    requests return — so a short jittered wait and a retry clears it. What must
+    not happen is the alternative: an exception here kills the whole listing, and
+    an exception swallowed here silently drops a survey the user owns. After the
+    last attempt the survey is still reported, with `tagged: None` for "could not
+    tell", which the UI already renders as an unknown-state row.
+    """
+    sno = int(sdir.name)
+    data_dir, output_dir = Path(ctx.settings.data_dir), Path(ctx.settings.output_dir)
+    for attempt in range(_PROBE_ATTEMPTS):
+        try:
+            return discovery.probe_survey(data_dir, output_dir, tenant_id, sno)
+        except Exception as e:  # noqa: BLE001 — smbprotocol raises SMBException, not OSError
+            if attempt < _PROBE_ATTEMPTS - 1:
+                time.sleep(random.uniform(0.1, 0.4) * (attempt + 1))
+                continue
+            logger.warning("survey_probe_failed", extra={
+                "tenant_id": tenant_id, "survey_no": sno,
+                "error": f"{type(e).__name__}: {e}"})
+            return {"survey_no": sno, "tagged": None, "probe_error": str(e)}
+    return None
+
+
+def _workers(ctx: AppContext, n: int) -> int:
+    return max(1, min(getattr(ctx.settings, "discovery_workers", 4), n))
+
+
+def list_survey_status(ctx: AppContext, tenant_id: int) -> list[dict]:
+    """`[{survey_no, tagged}]` for every survey under a tenant, sorted.
+
+    Raises OSError when the tenant's SurveyData dir cannot be listed.
+    """
+    dirs = discovery.list_survey_dirs(Path(ctx.settings.data_dir), tenant_id)
+    if not dirs:
+        return []
+    with ThreadPoolExecutor(max_workers=_workers(ctx, len(dirs))) as pool:
+        rows = pool.map(lambda d: _probe(ctx, tenant_id, d), dirs)
+    return sorted((r for r in rows if r), key=lambda r: r["survey_no"])
+
+
+async def stream_survey_status(
+    ctx: AppContext, tenant_id: int, dirs: list[Path]
+) -> AsyncIterator[dict]:
+    """Yield listing events for a tenant, one per survey as its probe lands.
+
+    Events: `{kind: "start", tenant_id, scanning}`, then a `{kind: "survey",
+    survey_no, tagged}` per survey **in completion order, not sorted** (the
+    consumer orders them — waiting for order would reintroduce the stall this
+    exists to remove), a `{kind: "ping"}` whenever a whole cadence passes with
+    nothing finished, and finally `{kind: "done", count}`.
+
+    `dirs` is passed in rather than listed here so the route can still answer a
+    dead share with an HTTP error: once the first byte is out the status code is
+    already spent.
+    """
+    yield {"kind": "start", "tenant_id": tenant_id, "scanning": len(dirs)}
+    if not dirs:
+        yield {"kind": "done", "count": 0}
+        return
+
+    loop = asyncio.get_running_loop()
+    pool = ThreadPoolExecutor(max_workers=_workers(ctx, len(dirs)),
+                              thread_name_prefix="survey-probe")
+    count = 0
+    try:
+        pending = {loop.run_in_executor(pool, _probe, ctx, tenant_id, d) for d in dirs}
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, timeout=_PING_SECONDS, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                # Nothing landed this cadence. Say so rather than going quiet:
+                # silence on the wire is indistinguishable from a hung server
+                # and is what the client's idle timer would shoot.
+                yield {"kind": "ping"}
+                continue
+            for fut in done:
+                try:
+                    row = fut.result()
+                except Exception as e:    # noqa: BLE001 — _probe already retries; a
+                    # survivor here must still not take the rest of the listing down.
+                    logger.warning("survey_probe_failed", extra={"tenant_id": tenant_id,
+                                                                 "error": str(e)})
+                    continue
+                if row:
+                    count += 1
+                    yield {"kind": "survey", **row}
+        yield {"kind": "done", "count": count}
+    finally:
+        # The client can disconnect mid-listing (closed tab, switched corp).
+        # Don't wait for the queued probes — drop what has not started.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------- tenant-level tags (tenant_tags.json) ----------

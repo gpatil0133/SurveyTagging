@@ -35,6 +35,15 @@ window.ST = window.ST || {};
   var GET_TIMEOUT_MS = 30000;
   var TOAST_MS = 6000;
 
+  /* The survey listing streams (NDJSON, one line per survey), so it gets no
+   * overall deadline — a corp with thousands of surveys legitimately takes
+   * minutes to enumerate over the share, and GET_TIMEOUT_MS would abort exactly
+   * the listings this exists for. What is bounded instead is *silence*: the
+   * server pings every 10s while probes are in flight, so nothing arriving for
+   * this long means the connection is dead rather than slow. */
+  var STREAM_IDLE_MS = 45000;
+  var STREAM_RENDER_MS = 150;    // sidebar repaint throttle while rows arrive
+
   var LS = { corp: "st.corp", topView: "st.topview", profileJob: "st.profilejob",
              tab: "st.tab", theme: "st.theme", density: "st.density" };
   /* Bump the version suffix whenever /api/taxonomy's response shape grows a
@@ -58,6 +67,7 @@ window.ST = window.ST || {};
     me:              function ()      { return "/api/me"; },
     shareHealth:     function ()      { return "/api/health/share"; },
     surveyList:      function (t)     { return "/api/tenants/" + t + "/tag-surveys"; },
+    surveyListStream:function (t)     { return "/api/tenants/" + t + "/tag-surveys/stream"; },
     batchTag:        function (t)     { return "/api/tenants/" + t + "/tag-surveys"; },
     tenantTags:      function (t)     { return "/api/tenants/" + t + "/tags"; },
     tenantTagsBuild: function (t)     { return "/api/tenants/" + t + "/tag"; },   // NOTE: singular
@@ -141,6 +151,8 @@ window.ST = window.ST || {};
     surveyNames: {},                 // {survey_no: title} — backfilled lazily
     surveysLoaded: false,
     surveysError: null,
+    surveysLoading: false,           // a listing stream is open
+    surveysProgress: null,           // {seen, total} while it is
     navSearch: "",
     navFilter: "all",                // all | tagged | untagged
 
@@ -425,6 +437,21 @@ window.ST = window.ST || {};
     return job.id;
   }
 
+  /* Retitle a ribbon in place. A job whose text carries a running count (the
+   * survey listing) would otherwise have to stop and restart its ribbon on
+   * every update, which flickers and loses its place in the stack. */
+  function ribbonUpdate(id, text) {
+    if (id == null) return;
+    for (var i = 0; i < state.ribbons.length; i++) {
+      if (state.ribbons[i].id === id) {
+        if (state.ribbons[i].text === text) return;
+        state.ribbons[i].text = text;
+        renderRibbon();
+        return;
+      }
+    }
+  }
+
   function ribbonStop(id) {
     if (id == null) return;
     var before = state.ribbons.length;
@@ -522,7 +549,12 @@ window.ST = window.ST || {};
     if (state.slowWarn) bits.push("Still waiting on the network share…");
     else if (state.corpNo) {
       bits.push("Corp <strong>" + U.escapeHtml(String(state.corpNo)) + "</strong>");
-      if (state.surveysLoaded) {
+      var p = state.surveysProgress;
+      if (state.surveysLoading && p) {
+        // The listing streams in, so this is a real count, not a spinner.
+        bits.push("Listing surveys — <strong>" + p.seen + "</strong>" +
+                  (p.total ? " of " + p.total : "") + "…");
+      } else if (state.surveysLoaded) {
         var tagged = state.surveys.filter(function (s) { return s.tagged; }).length;
         bits.push("<strong>" + tagged + "</strong>/" + state.surveys.length + " tagged");
       }
@@ -607,7 +639,8 @@ window.ST = window.ST || {};
     if (!rows.length) {
       el.nav.innerHTML = '<li class="survey-item" style="cursor:default"><span class="stitle">' +
         (state.surveys.length ? "No surveys match this filter."
-                              : "No surveys on disk for this corp.") +
+          : state.surveysLoading ? "Listing surveys…"
+          : "No surveys on disk for this corp.") +
         "</span></li>";
       return;
     }
@@ -1084,6 +1117,9 @@ window.ST = window.ST || {};
   }
 
   function loadTenant(corpNo) {
+    // A listing for the previous corp is still streaming rows in; its events
+    // would land in this corp's sidebar.
+    abortSurveyStream();
     state.corpNo = corpNo;
     state.surveys = [];
     state.surveysLoaded = false;
@@ -1100,20 +1136,271 @@ window.ST = window.ST || {};
     return loadSurveyList();
   }
 
+  /* ---- survey listing ----
+   *
+   * The listing is the one call whose cost scales with the corp: the server
+   * pays a share round trip per survey, and the corps that matter have
+   * thousands. Waiting for the complete list means waiting minutes for the
+   * first pixel and, past 30s, not getting one at all — the request is aborted
+   * before the server has anything to say.
+   *
+   * So the default path streams NDJSON (GET .../tag-surveys/stream) and rows
+   * land in the sidebar as they are probed. loadSurveyList() keeps its old
+   * contract — same callers, same resolved shape — and falls back to the
+   * one-shot endpoint when the browser cannot read a stream or the server does
+   * not know the route (404 there means "no such route"; an empty corp is a
+   * normal 200 whose stream ends at zero).
+   */
+
+  var streamGen = 0;               // bumps per stream; late events from an
+  var surveyStream = null;         // aborted one are dropped by generation
+
+  function abortSurveyStream() {
+    streamGen++;
+    if (surveyStream) { try { surveyStream.abort(); } catch (e) {} surveyStream = null; }
+    state.surveysLoading = false;
+    state.surveysProgress = null;
+  }
+
+  function canStream() {
+    return typeof window.ReadableStream === "function" &&
+           typeof window.TextDecoder === "function";
+  }
+
+  function bySurveyNo(a, b) { return a.survey_no - b.survey_no; }
+
   function loadSurveyList(opts) {
     opts = opts || {};
-    if (!state.corpNo) return Promise.resolve();
+    if (!state.corpNo) return Promise.resolve({ ok: false, status: 0 });
+    // A background poll (batch progress) must not preempt a listing that is
+    // still streaming: on a big corp it would restart it every 6s and it would
+    // never finish. A user-initiated Refresh still wins.
+    if (opts.quiet && state.surveysLoading) return Promise.resolve({ ok: false, status: 0, busy: true });
+    if (!canStream()) return loadSurveyListOnce(opts);
+    return streamSurveyList(opts).then(function (r) {
+      // Server predates the stream route, or the browser refused it before a
+      // single line arrived — the blocking listing still works, it is only slow.
+      if (r && r.fallback) return loadSurveyListOnce(opts);
+      return r;
+    });
+  }
+
+  function streamSurveyList(opts) {
+    abortSurveyStream();
+    var corpNo = state.corpNo;
+    var gen = streamGen;
+    var ctrl = new AbortController();
+    surveyStream = ctrl;
+
+    // Rows are updated in place, keyed by survey number: a refresh (and the
+    // 6s poll during a batch run) must not blank the sidebar and rebuild it.
+    // Anything not re-seen by the time the stream ends is gone from disk and
+    // is dropped then — see finish().
+    var index = {}, seen = {}, count = 0, total = null, needSort = false;
+    state.surveys.forEach(function (s) { index[s.survey_no] = s; });
+
+    var rib = opts.quiet ? null : ribbonStart("Listing surveys for corp " + corpNo + "…");
+    if (!opts.quiet) setBusy(1);
+    state.surveysLoading = true;
+    state.surveysProgress = { seen: 0, total: null };
+    // A stale error from the last attempt would otherwise take the sidebar over
+    // and hide the rows this stream is about to deliver.
+    state.surveysError = null;
+
+    var idleTimer = null, renderTimer = null, closed = false;
+    function armIdle() {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, STREAM_IDLE_MS);
+    }
+    function stale() { return gen !== streamGen; }
+
+    function paint() {
+      renderTimer = null;
+      if (stale()) return;
+      if (needSort) { state.surveys.sort(bySurveyNo); needSort = false; }
+      state.surveysProgress = { seen: count, total: total };
+      renderNav(); renderTopStatus();
+      if (rib) {
+        ribbonUpdate(rib, "Listing surveys for corp " + corpNo + " — " + count +
+                          (total ? " of " + total : "") + "…");
+      }
+    }
+    function schedulePaint() {
+      if (renderTimer == null) renderTimer = setTimeout(paint, STREAM_RENDER_MS);
+    }
+
+    function onEvent(ev) {
+      if (!ev || stale()) return;
+      armIdle();
+      if (ev.kind === "start") { total = ev.scanning; schedulePaint(); return; }
+      if (ev.kind === "ping") return;
+      if (ev.kind === "error") { throw new Error(ev.detail || "Listing failed."); }
+      if (ev.kind !== "survey") return;
+
+      var row = index[ev.survey_no];
+      if (row) {
+        row.tagged = ev.tagged;
+        delete row.provisional;      // it is on disk after all
+      } else {
+        row = { survey_no: ev.survey_no, tagged: ev.tagged };
+        index[ev.survey_no] = row;
+        state.surveys.push(row);
+        needSort = true;             // completion order, not survey order
+      }
+      seen[ev.survey_no] = true;
+      count++;
+      schedulePaint();
+    }
+
+    function cleanup() {
+      if (closed) return;          // idempotent: every exit routes through here
+      closed = true;
+      clearTimeout(idleTimer);
+      if (renderTimer != null) { clearTimeout(renderTimer); renderTimer = null; }
+      if (surveyStream === ctrl) surveyStream = null;
+      if (!opts.quiet) { setBusy(-1); ribbonStop(rib); }
+      // Cleared here rather than only in finish()/fail(): the fallback exit
+      // (no such route) takes neither, and a stuck "Listing surveys — 0…" would
+      // then sit in the top bar for the rest of the session. Not if a newer
+      // stream has already claimed these — they describe that one now.
+      if (!stale()) { state.surveysLoading = false; state.surveysProgress = null; }
+    }
+
+    function finish() {
+      // Drop rows the listing no longer reports, except the provisional ones
+      // the user typed in by hand — those are deliberately not on disk.
+      state.surveys = state.surveys.filter(function (s) {
+        return seen[s.survey_no] || s.provisional;
+      });
+      state.surveys.sort(bySurveyNo);
+      state.surveysLoading = false;
+      state.surveysProgress = null;
+      state.surveysLoaded = true;
+      state.surveysError = count ? null
+        : "No surveys on disk for corp " + corpNo + ".";
+      redrawSurveys();
+      return { ok: true, status: 200, data: { tenant_id: corpNo, surveys: state.surveys } };
+    }
+
+    function fail(detail, res) {
+      state.surveysLoading = false;
+      state.surveysProgress = null;
+      if (count) {
+        // Partial listing beats no listing: keep what arrived, say it is short.
+        state.surveysLoaded = true;
+        state.surveys.sort(bySurveyNo);
+        toast("warn", "Survey list is incomplete (" + count + " loaded): " + detail, true);
+      } else {
+        state.surveysLoaded = false;
+        state.surveysError = detail;
+      }
+      redrawSurveys();
+      return res || { ok: false, status: 0, detail: detail, netError: true };
+    }
+
+    var headers = { Accept: "application/x-ndjson" };
+    var token = readToken();
+    if (token) headers.Authorization = "Bearer " + token;
+
+    armIdle();
+    return fetch(ROUTES.surveyListStream(corpNo), { headers: headers, signal: ctrl.signal })
+      .then(function (res) {
+        if (stale()) { cleanup(); return { ok: false, status: 0, stale: true }; }
+        if (res.status === 404) { cleanup(); return { fallback: true }; }
+        if (!res.ok || !res.body) {
+          return res.text().then(function (text) {
+            var data = null;
+            if (text) { try { data = JSON.parse(text); } catch (e) { data = text; } }
+            var r = { ok: false, status: res.status, data: data,
+                      detail: detailOf(data, res.statusText) };
+            guarded(r);
+            cleanup();
+            // No body to read from (or an old browser): the one-shot route can
+            // still answer, and it reports its own errors.
+            if (!res.body) return { fallback: true };
+            return fail(r.detail || "Could not list surveys.", r);
+          });
+        }
+        clearShareDown();
+        return readNdjson(res.body, onEvent).then(function () {
+          cleanup();
+          if (stale()) return { ok: false, status: 0, stale: true };
+          return finish();
+        });
+      })
+      .catch(function (e) {
+        cleanup();
+        if (stale()) return { ok: false, status: 0, stale: true };
+        var aborted = e && e.name === "AbortError";
+        var detail = aborted
+          ? "The survey listing stalled for " + Math.round(STREAM_IDLE_MS / 1000) +
+            "s with no data — the share may be unreachable."
+          : (e && e.message) || "Network error";
+        var r = { ok: false, status: 0, detail: detail, netError: true };
+        guarded(r);
+        return fail(detail, r);
+      });
+  }
+
+  /* NDJSON reader: hand each complete line to onEvent as it arrives. Lines can
+   * be split across chunks, so the tail is carried over. */
+  function readNdjson(body, onEvent) {
+    var reader = body.getReader();
+    var decoder = new TextDecoder();
+    var buf = "";
+
+    function drain(final) {
+      var parts = buf.split("\n");
+      buf = final ? "" : parts.pop();
+      for (var i = 0; i < parts.length; i++) {
+        var line = parts[i].trim();
+        if (!line) continue;
+        var ev = null;
+        try { ev = JSON.parse(line); } catch (e) { continue; }   // torn line: skip
+        onEvent(ev);
+      }
+    }
+
+    function pump() {
+      return reader.read().then(function (chunk) {
+        if (chunk.done) {
+          buf += decoder.decode();
+          drain(true);
+          return;
+        }
+        buf += decoder.decode(chunk.value, { stream: true });
+        drain(false);
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  function redrawSurveys() {
+    renderNav(); renderTopStatus();
+    if (state.topView === "surveys") renderWorkspace();
+  }
+
+  /* The pre-streaming listing: one request, everything at once. Kept as the
+   * fallback path and for browsers without ReadableStream. */
+  function loadSurveyListOnce(opts) {
+    opts = opts || {};
+    if (!state.corpNo) return Promise.resolve({ ok: false, status: 0 });
+    var corpNo = state.corpNo;
     var rib = null;
     if (!opts.quiet) {
       setBusy(1);
-      rib = ribbonStart("Fetching surveys for corp " + state.corpNo + "…");
+      rib = ribbonStart("Fetching surveys for corp " + corpNo + "…");
     }
-    return api(ROUTES.surveyList(state.corpNo)).then(guarded).then(function (r) {
+    // No client deadline: on a big corp the server legitimately needs minutes,
+    // and aborting at 30s guarantees the listing can never load.
+    return api(ROUTES.surveyList(corpNo), { timeoutMs: null })
+      .then(guarded).then(function (r) {
       if (!opts.quiet) { setBusy(-1); ribbonStop(rib); }
       if (r.status === 404) {
         // Empty state, not an error — the corp may simply have no surveys.
         state.surveys = []; state.surveysLoaded = true;
-        state.surveysError = "No surveys on disk for corp " + state.corpNo + ".";
+        state.surveysError = "No surveys on disk for corp " + corpNo + ".";
       } else if (!r.ok) {
         state.surveysError = r.detail || "Could not list surveys.";
         state.surveysLoaded = false;
@@ -1127,8 +1414,7 @@ window.ST = window.ST || {};
         state.surveysLoaded = true;
         state.surveysError = null;
       }
-      renderNav(); renderTopStatus();
-      if (state.topView === "surveys") renderWorkspace();
+      redrawSurveys();
       return r;
     });
   }
@@ -1180,9 +1466,14 @@ window.ST = window.ST || {};
       });
   }
 
+  /* Mutates the row rather than replacing it: while a listing is streaming, its
+   * index holds references to these objects, and swapping one out would orphan
+   * the reference so later lines for that survey would update nothing. */
   function markTagged(no, tagged) {
-    state.surveys = state.surveys.map(function (s) {
-      return s.survey_no === no ? { survey_no: no, tagged: tagged } : s;
+    state.surveys.forEach(function (s) {
+      if (s.survey_no !== no) return;
+      s.tagged = tagged;
+      delete s.provisional;      // it has been seen for real now
     });
   }
 
