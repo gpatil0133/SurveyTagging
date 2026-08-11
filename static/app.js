@@ -1669,7 +1669,11 @@ window.ST = window.ST || {};
       var msg = lookupOnly
         ? "Looking up the profile — share, then GET /AIAccountProfile/Details…"
         : isSmx
-          ? "Resolving profile — share, then apismx, then generate…"
+          // The banner names the legs this run will actually attempt — with
+          // generation off (checkbox unchecked or absent) it stops at apismx.
+          ? (f.allowGenerate
+              ? "Resolving profile — share, then apismx, then generate…"
+              : "Resolving profile — share, then apismx…")
           : "Profile fetch running synchronously — this can take 30 minutes…";
       var rib = ribbonStart(msg);
       return api(ROUTES.profileFetch(state.corpNo, false),
