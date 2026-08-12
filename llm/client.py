@@ -20,12 +20,51 @@ import json
 import logging
 import re
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import usage_log
 from llm.cache import LLMCache
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=32)
+def _accepts_temperature(model: str, temperature: float) -> bool:
+    """Will this model accept this temperature, or must the param be dropped?
+
+    OpenAI's reasoning families (gpt-5*, o-series) accept `temperature=1` only,
+    and litellm raises `UnsupportedParamsError` for anything else rather than
+    silently correcting it — so a default of 0.1 that is fine on Anthropic kills
+    every call on `openai/gpt-5-mini`.
+
+    Asking litellm's own param mapper is local (no network, no key) and keeps
+    the rule where it belongs: with the provider matrix, not in a model-name
+    prefix list here that would need editing on every new family. A probe that
+    fails for any other reason answers True — the real call then reports the
+    real error instead of us quietly changing the request.
+    """
+    try:
+        from litellm.utils import get_llm_provider, get_optional_params
+
+        model_name, provider, _, _ = get_llm_provider(model=model)
+        get_optional_params(
+            model=model_name,
+            custom_llm_provider=provider,
+            temperature=temperature,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ == "UnsupportedParamsError":
+            logger.info(
+                "llm_temperature_dropped",
+                extra={"model": model, "temperature": temperature,
+                       "reason": str(e)[:200]},
+            )
+            return False
+        logger.debug("llm_temperature_probe_failed",
+                     extra={"model": model, "error": str(e)})
+        return True
 
 
 class LLMClient:
@@ -194,7 +233,6 @@ class LLMClient:
                     "model": self.model,
                     "messages": messages,
                     "system": system_blocks,
-                    "temperature": self.temperature,
                     "max_tokens": self.max_tokens,
                 }
             else:
@@ -212,16 +250,22 @@ class LLMClient:
                 kwargs = {
                     "model": self.model,
                     "messages": messages,
-                    "temperature": self.temperature,
                     "max_tokens": self.max_tokens,
                 }
+
+            # Sent only when the provider will take it — see _accepts_temperature.
+            # litellm maps max_tokens → max_completion_tokens itself where needed.
+            send_temperature = _accepts_temperature(self.model, self.temperature)
+            if send_temperature:
+                kwargs["temperature"] = self.temperature
 
             logger.debug(
                 "litellm_request",
                 extra={"model": self.model, "is_anthropic": is_anthropic,
                        "prompt_caching": is_anthropic and self.use_prompt_caching
                        and bool(cached_system_preamble),
-                       "max_tokens": self.max_tokens, "temperature": self.temperature},
+                       "max_tokens": self.max_tokens,
+                       "temperature": self.temperature if send_temperature else None},
             )
             started = time.perf_counter()
             try:

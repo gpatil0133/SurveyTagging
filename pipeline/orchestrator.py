@@ -277,9 +277,21 @@ class PipelineOrchestrator:
                 tenant_id, survey_no, survey_dir,
                 tenant_dir=tenant_dir, output_dir=output_dir,
             ):
-                logger.info("survey_unchanged", extra={"tenant": tenant_id, "survey": survey_no})
-                usage_log.set_status("skipped")
-                return {"survey_no": survey_no, "status": "skipped"}
+                # "Inputs unchanged" only justifies a skip while the *output* of
+                # the last run still exists. It can vanish independently of the
+                # hash — DELETE /tags, a hand-cleaned share, a restored cache —
+                # and then the survey would skip forever while every read 404s.
+                # One stat per skipped survey, against a check that already read
+                # survey_structure.json and walked the survey dir.
+                if sharefs.exists(
+                    discovery.tagged_output_path(output_dir, tenant_id, survey_no)
+                ):
+                    logger.info("survey_unchanged",
+                                extra={"tenant": tenant_id, "survey": survey_no})
+                    usage_log.set_status("skipped")
+                    return {"survey_no": survey_no, "status": "skipped"}
+                logger.info("survey_unchanged_but_output_missing_retagging",
+                            extra={"tenant": tenant_id, "survey": survey_no})
 
             try:
                 result = self._process_survey(

@@ -4,35 +4,41 @@ The single entry point. All wiring comes from `bootstrap.build_context()`; all
 tagging work goes through `service.py` (which drives the per-survey engine for a
 single survey and the orchestrator for tenant-level work).
 
-Surface (all under /api):
-  Survey
+Surface (all under /api). The sections below are the order the routes appear in
+this file; see "Route layout" further down for why that order is what it is.
+
+  §1  Survey  — one survey, addressed by tenant + survey number
     POST   /tenants/{t}/surveys/{s}/tag        tag one survey (incremental)
     POST   /tenants/{t}/surveys/{s}/retag      force re-tag one survey
     GET    /tenants/{t}/surveys/{s}/tags       unified survey view (ETag/304)
     DELETE /tenants/{t}/surveys/{s}/tags       delete one survey's tags
     POST   /tag                                ad-hoc: tag uploaded survey JSON
-  Per-tenant survey tagging
+  §2  Tenant surveys  — the same work fanned out over every survey
     POST   /tenants/{t}/tag-surveys            tag all surveys (bounded-parallel)
     POST   /tenants/{t}/retag-surveys          force re-tag all surveys
     GET    /tenants/{t}/tag-surveys            tagged-status for the tenant
     GET    /tenants/{t}/tag-surveys/stream     same, NDJSON, one line per survey
-  Tenant tags
-    POST   /tenants/{t}/tag                     build tenant_tags.json
-    GET    /tenants/{t}/tags                     read tenant_tags.json
-    DELETE /tenants/{t}/tags                     delete tenant_tags.json
-  Parallel.ai tenant profile
-    POST   /tenants/{t}/profile/fetch
-    GET    /tenants/{t}/profile
-    GET    /tenants/{t}/profile/diagnose   read-only: why is there no profile?
-    GET    /tenants/{t}/profile/{agent}
+  §3  Tenant tags  — tenant_tags.json
+    POST   /tenants/{t}/tag                    build tenant_tags.json
+    GET    /tenants/{t}/tags                   read tenant_tags.json
+    DELETE /tenants/{t}/tags                   delete tenant_tags.json
+  §4  Tenant profile  — org/cx/ex artifacts (producer set by `profile_source`)
+    POST   /tenants/{t}/profile/fetch          resolve: share -> producer -> generate
+    GET    /tenants/{t}/profile                summary of what is on disk
+    GET    /tenants/{t}/profile/diagnose       read-only: why is there no profile?
+    GET    /tenants/{t}/profile/{agent}        raw envelope for org | cx | ex
     DELETE /tenants/{t}/profile
-  Catalog / admin
-    GET    /taxonomy
-    GET    /surveys
+  §5  Catalog  — process-wide, read-only, no tenant
+    GET    /taxonomy               all 41 dimensions + the explanation layer
+    GET    /config                 server config the UI shapes itself from
     GET    /me                     caller identity from the Bearer token
+    GET    /health/share           is the data root reachable?
+    GET    /surveys                whole-root catalog (expensive; legacy callers)
+  §6  Admin
     GET    /admin/autoretag        (see scheduler.py)
     POST   /admin/autoretag/run-now
-    GET    /                       static UI
+  §7  Static UI
+    GET    /                       index.html; /static/* is a mount
 
 Every `/tenants/{t}/…` route above is also registered without the `/tenants/{t}`
 prefix (`POST /api/surveys/{s}/tag`, `GET /api/tags`, `GET /api/profile`, …).
@@ -203,6 +209,54 @@ async def capture_bearer_token(request: Request, call_next):
         request_context.reset_token(handle)
 
 
+# ====================================================================
+# Route layout
+# ====================================================================
+#
+# Four rules decide where a route goes. The first is a correctness constraint;
+# the rest are conventions that keep the file readable — but only the first one
+# will break the API if you get it wrong.
+#
+# 1. LITERAL BEFORE PARAMETER — the one rule with teeth.
+#    FastAPI matches routes in *definition order* and takes the first path that
+#    fits, with no notion of one pattern being more specific than another. So a
+#    literal segment must be registered before any `{param}` at the same
+#    position that could swallow it:
+#
+#        GET /profile/diagnose      <- must come first
+#        GET /profile/{agent}          otherwise "diagnose" arrives as an agent
+#                                      name and the route 400s
+#
+#    Only same-method pairs collide. `POST /profile/fetch` sits happily above
+#    `GET /profile/{agent}` because the methods differ — though note the
+#    consequence: `GET /api/profile/fetch` does match `{agent}` and answers
+#    "Unknown agent: 'fetch'" rather than 405.
+#
+# 2. GROUPED BY RESOURCE, NARROWEST FIRST.
+#    One survey (§1) -> every survey under a tenant (§2) -> the tenant's own
+#    tags (§3) -> the tenant's profile (§4) -> process-wide reads (§5) ->
+#    admin (§6) -> the UI (§7). Reading top to bottom widens the blast radius of
+#    what a call touches, which is also roughly the order a new tenant is
+#    onboarded in: fetch a profile, build tenant tags, tag the surveys.
+#
+# 3. LIFECYCLE ORDER WITHIN A GROUP: build -> read -> delete
+#    (POST, then GET, then DELETE). Where a group has both an incremental and a
+#    forced writer the incremental one leads, since it is the common call.
+#    §1 breaks the pattern once, deliberately: `POST /tag` is last because it is
+#    the only route in the group that has no tenant and touches no disk.
+#
+# 4. HELPERS ABOVE THE ROUTES THEY SERVE, never interleaved between two
+#    handlers. Each section opens with its module-level constants, request
+#    models and private `_helpers`, then runs its routes contiguously — so the
+#    surface of a section can be read without stepping over implementation.
+#
+# Decorator stacking is a separate axis: the long `/tenants/{t}/…` form is
+# always written on top and the short form beneath it, purely so the canonical
+# path is the one you read first. Python applies decorators bottom-up, so the
+# short form is in fact registered first — harmless here, because the two never
+# overlap. If you ever stack two forms that *can* match the same URL, rule 1
+# applies to the effective (bottom-up) order, not the written one.
+#
 # `tenant_id` is optional on every tenant route below. Each is registered twice:
 #
 #     /api/tenants/{tenant_id}/surveys/{s}/tags     tenant in the path
@@ -215,8 +269,17 @@ async def capture_bearer_token(request: Request, call_next):
 
 
 # ====================================================================
-# Survey tagging
+# §1  Survey — one survey (tenant + survey number)
+#     POST tag -> POST retag -> GET tags -> DELETE tags, then the tenant-less
+#     ad-hoc upload route.
 # ====================================================================
+
+def _survey_view_etag(path: Path, include_journey_candidates: bool) -> str:
+    """Strong ETag from file identity (mtime_ns + size); cheap, no body hash."""
+    st = sharefs.stat(path)
+    base = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+    return base if not include_journey_candidates else base[:-1] + '+jc"'
+
 
 @app.post("/api/tenants/{tenant_id}/surveys/{survey_no}/tag")
 @app.post("/api/surveys/{survey_no}/tag")
@@ -252,13 +315,6 @@ async def retag_survey(
     except Exception as e:  # noqa: BLE001
         logger.exception("retag_survey_failed")
         raise HTTPException(500, f"Retag failed: {e}")
-
-
-def _survey_view_etag(path: Path, include_journey_candidates: bool) -> str:
-    """Strong ETag from file identity (mtime_ns + size); cheap, no body hash."""
-    st = sharefs.stat(path)
-    base = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
-    return base if not include_journey_candidates else base[:-1] + '+jc"'
 
 
 @app.get("/api/tenants/{tenant_id}/surveys/{survey_no}/tags")
@@ -354,7 +410,10 @@ async def tag_uploaded(
 
 
 # ====================================================================
-# Per-tenant survey tagging (all surveys)
+# §2  Tenant surveys — §1's work fanned out over every survey
+#     The two writers first (incremental, then forced), then the two readers.
+#     `/tag-surveys/stream` trails `/tag-surveys` because it is the same
+#     listing in a second representation, not a second listing.
 # ====================================================================
 
 @app.post("/api/tenants/{tenant_id}/tag-surveys")
@@ -468,7 +527,10 @@ async def tenant_tag_status_stream(
 
 
 # ====================================================================
-# Tenant tags (tenant_tags.json)
+# §3  Tenant tags — tenant_tags.json
+#     Plain build -> read -> delete. These read the §4 profile, so they sit
+#     above it in dependency order but below the survey routes, which are what
+#     callers reach for first.
 # ====================================================================
 
 @app.post("/api/tenants/{tenant_id}/tag")
@@ -526,7 +588,14 @@ async def delete_tenant_tags(
 
 
 # ====================================================================
-# Parallel.ai tenant profile
+# §4  Tenant profile — org/cx/ex artifacts under {output_dir}/{t}/tenant_profile/
+#     The producer is chosen by `profile_source` (Parallel.ai research vs
+#     apismx), but the routes, paths and envelope shape are identical either
+#     way, so there is one section rather than two.
+#
+#     Order: fetch (write) -> profile (read summary) -> diagnose -> {agent}
+#     -> delete. `diagnose` MUST precede `{agent}` (rule 1); everything else
+#     is lifecycle order.
 # ====================================================================
 
 _PARALLEL_AGENTS = ("org", "cx", "ex")
@@ -689,100 +758,6 @@ def _agent_artifact_path(tenant_id: int, agent: str) -> Path:
     return artifact_path(tenant_id, agent, Path(_settings.output_dir))
 
 
-@app.post("/api/tenants/{tenant_id}/profile/fetch")
-@app.post("/api/profile/fetch")
-async def tenant_profile_fetch(
-    req: TenantProfileFetchRequest,
-    tenant_id: int | None = None, background: bool = False,
-    authorization: str | None = Header(default=None),
-) -> JSONResponse:
-    """Fetch the tenant profile (org/cx/ex) from whichever producer
-    `profile_source` selects. Sync by default; `?background=true` returns 202
-    and runs fire-and-forget.
-
-    Under profile_source='smx' the caller's Bearer token is forwarded to apismx
-    (shared issuer), falling back to SURVEY_TAGGER_SMX_TOKEN.
-    """
-    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
-    agents = _normalize_agents(req.agents)
-    token = _bearer(authorization)
-
-    if background:
-        async def _run():
-            try:
-                await asyncio.to_thread(_run_profile_fetch, tenant_id, req.website,
-                                        agents, req.force, token, req.allow_generate)
-                logger.info("tenant_profile_background_fetch_done", extra={"tenant_id_": tenant_id})
-            except Exception as e:  # noqa: BLE001
-                logger.exception("tenant_profile_background_fetch_failed",
-                                 extra={"tenant_id_": tenant_id, "error": str(e)})
-        asyncio.create_task(_run())
-        return JSONResponse(status_code=202, content={
-            "status": "accepted", "tenant_id": tenant_id, "agents": list(agents),
-            "source": _settings.profile_source,
-            "force": req.force, "poll_url": f"/api/tenants/{tenant_id}/profile",
-            "note": "Fetch running in background. Server restart will lose the job.",
-        })
-
-    try:
-        summary = await asyncio.to_thread(_run_profile_fetch, tenant_id, req.website,
-                                          agents, req.force, token, req.allow_generate)
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        logger.exception("tenant_profile_fetch_failed")
-        raise HTTPException(500, f"Tenant profile fetch failed: {e}") from e
-    return JSONResponse(content={"status": "ok", "tenant_id": tenant_id, **summary})
-
-
-@app.get("/api/tenants/{tenant_id}/profile")
-@app.get("/api/profile")
-async def get_tenant_profile(
-    tenant_id: int | None = None,
-    authorization: str | None = Header(default=None),
-) -> dict:
-    """Summary of on-disk Parallel.ai artifacts for a tenant."""
-    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
-    from models.tenant_profile import TenantProfile
-    profile = TenantProfile.load(tenant_id, Path(_settings.output_dir))
-    if profile is None or profile.is_empty:
-        raise HTTPException(
-            404,
-            f"No tenant profile for tenant_id={tenant_id}. "
-            f"POST /api/tenants/{tenant_id}/profile/fetch to build it.",
-        )
-
-    summary = {}
-    for attr in (
-        "industry_vertical", "industry_sub_vertical", "regulatory_intensity",
-        "data_sensitivity", "primary_customer_segment", "relationship_type",
-        "cx_confidence", "workforce_composition", "work_arrangement",
-        "frontline_ratio", "ex_confidence", "corporate_purpose",
-    ):
-        val = getattr(profile, attr, None)
-        if val:
-            summary[attr] = val
-    if profile.regulatory_frameworks:
-        summary["regulatory_frameworks"] = profile.regulatory_frameworks[:10]
-    if profile.secondary_customer_segments:
-        summary["secondary_customer_segments"] = profile.secondary_customer_segments[:5]
-    if profile.customer_types:
-        summary["customer_types"] = [
-            {"type_name": str(t.get("type_name") or "?")} for t in profile.customer_types[:8]
-        ]
-    if profile.employee_types:
-        summary["employee_types"] = [
-            {"type_name": str(t.get("type_name") or "?")} for t in profile.employee_types[:8]
-        ]
-
-    return {
-        "tenant_id": tenant_id,
-        "has_org": profile.has_org, "has_cx": profile.has_cx, "has_ex": profile.has_ex,
-        "artifact_paths": profile.artifact_paths,
-        "summary": summary,
-    }
-
-
 def _run_smx_diagnose(tenant_id: int, token: str) -> dict:
     """Everything we can learn about one tenant's profile WITHOUT writing anything.
 
@@ -888,6 +863,100 @@ def _diagnose_next_step(tenant_id: int, out: dict, rows: list, account) -> str:
             "the smx_http_error line from app.log to that team.")
 
 
+@app.post("/api/tenants/{tenant_id}/profile/fetch")
+@app.post("/api/profile/fetch")
+async def tenant_profile_fetch(
+    req: TenantProfileFetchRequest,
+    tenant_id: int | None = None, background: bool = False,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Fetch the tenant profile (org/cx/ex) from whichever producer
+    `profile_source` selects. Sync by default; `?background=true` returns 202
+    and runs fire-and-forget.
+
+    Under profile_source='smx' the caller's Bearer token is forwarded to apismx
+    (shared issuer), falling back to SURVEY_TAGGER_SMX_TOKEN.
+    """
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
+    agents = _normalize_agents(req.agents)
+    token = _bearer(authorization)
+
+    if background:
+        async def _run():
+            try:
+                await asyncio.to_thread(_run_profile_fetch, tenant_id, req.website,
+                                        agents, req.force, token, req.allow_generate)
+                logger.info("tenant_profile_background_fetch_done", extra={"tenant_id_": tenant_id})
+            except Exception as e:  # noqa: BLE001
+                logger.exception("tenant_profile_background_fetch_failed",
+                                 extra={"tenant_id_": tenant_id, "error": str(e)})
+        asyncio.create_task(_run())
+        return JSONResponse(status_code=202, content={
+            "status": "accepted", "tenant_id": tenant_id, "agents": list(agents),
+            "source": _settings.profile_source,
+            "force": req.force, "poll_url": f"/api/tenants/{tenant_id}/profile",
+            "note": "Fetch running in background. Server restart will lose the job.",
+        })
+
+    try:
+        summary = await asyncio.to_thread(_run_profile_fetch, tenant_id, req.website,
+                                          agents, req.force, token, req.allow_generate)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.exception("tenant_profile_fetch_failed")
+        raise HTTPException(500, f"Tenant profile fetch failed: {e}") from e
+    return JSONResponse(content={"status": "ok", "tenant_id": tenant_id, **summary})
+
+
+@app.get("/api/tenants/{tenant_id}/profile")
+@app.get("/api/profile")
+async def get_tenant_profile(
+    tenant_id: int | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    """Summary of on-disk Parallel.ai artifacts for a tenant."""
+    tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
+    from models.tenant_profile import TenantProfile
+    profile = TenantProfile.load(tenant_id, Path(_settings.output_dir))
+    if profile is None or profile.is_empty:
+        raise HTTPException(
+            404,
+            f"No tenant profile for tenant_id={tenant_id}. "
+            f"POST /api/tenants/{tenant_id}/profile/fetch to build it.",
+        )
+
+    summary = {}
+    for attr in (
+        "industry_vertical", "industry_sub_vertical", "regulatory_intensity",
+        "data_sensitivity", "primary_customer_segment", "relationship_type",
+        "cx_confidence", "workforce_composition", "work_arrangement",
+        "frontline_ratio", "ex_confidence", "corporate_purpose",
+    ):
+        val = getattr(profile, attr, None)
+        if val:
+            summary[attr] = val
+    if profile.regulatory_frameworks:
+        summary["regulatory_frameworks"] = profile.regulatory_frameworks[:10]
+    if profile.secondary_customer_segments:
+        summary["secondary_customer_segments"] = profile.secondary_customer_segments[:5]
+    if profile.customer_types:
+        summary["customer_types"] = [
+            {"type_name": str(t.get("type_name") or "?")} for t in profile.customer_types[:8]
+        ]
+    if profile.employee_types:
+        summary["employee_types"] = [
+            {"type_name": str(t.get("type_name") or "?")} for t in profile.employee_types[:8]
+        ]
+
+    return {
+        "tenant_id": tenant_id,
+        "has_org": profile.has_org, "has_cx": profile.has_cx, "has_ex": profile.has_ex,
+        "artifact_paths": profile.artifact_paths,
+        "summary": summary,
+    }
+
+
 @app.get("/api/tenants/{tenant_id}/profile/diagnose")
 @app.get("/api/profile/diagnose")
 async def diagnose_tenant_profile(
@@ -954,7 +1023,10 @@ async def delete_tenant_profile(
 
 
 # ====================================================================
-# Catalog / admin
+# §5  Catalog — process-wide, read-only, no tenant in the path
+#     Ordered by cost, cheapest first: three in-memory reads (taxonomy,
+#     config, me), then one that touches the share (health), then the one
+#     that walks the entire share (surveys) and is kept for legacy callers.
 # ====================================================================
 
 @app.get("/api/taxonomy")
@@ -981,47 +1053,6 @@ async def get_taxonomy() -> dict:
     return dims
 
 
-@app.get("/api/surveys")
-async def list_surveys() -> list[dict]:
-    """List all tenants and their surveys discovered under the local data dir.
-
-    Walks the whole data root — expensive over a network share (minutes, not
-    seconds). The current UI does not call it; prefer
-    GET /api/tenants/{t}/tag-surveys, which is one directory listing.
-
-    Offloaded to a thread even though it is the only caller's own problem how
-    long it takes: run inline in the event loop, one request to this route
-    freezes the entire server for everyone — no other route answers, not even
-    /api/health/share, and the process looks hung rather than busy. A stale
-    browser tab still holding the pre-v7 UI calls this on load, which is exactly
-    how that happens in practice.
-    """
-    return await asyncio.to_thread(discovery.discover_catalog, _settings.data_dir)
-
-
-@app.get("/api/health/share")
-async def share_health() -> dict:
-    """Is the data root reachable? Lets the UI distinguish a downed share from
-    a tenant that simply has no surveys (both otherwise look like an empty list)."""
-    return await asyncio.to_thread(discovery.probe_root, _settings.data_dir)
-
-
-@app.get("/api/me")
-async def whoami(authorization: str | None = Header(default=None)) -> dict:
-    """What the caller's Bearer token says about them.
-
-    `{corp_no, subject, has_token, verified, auth_enabled}`. The UI calls this
-    once at boot: when it is embedded in the platform shell there is a token in
-    localStorage but no corp number typed into the box, and this is how it
-    learns which tenant to open. A typed corp number always overrides it.
-
-    `verified` is False when the signature could not be checked (no/again wrong
-    public key) but the claims were read anyway — see auth._decode_verified. It
-    is advisory while `auth_enabled` is False.
-    """
-    return {**auth.principal(authorization), "auth_enabled": _settings.auth_enabled}
-
-
 @app.get("/api/config")
 async def ui_config() -> dict:
     """Server config the UI needs to shape itself.
@@ -1043,6 +1074,53 @@ async def ui_config() -> dict:
     }
 
 
+@app.get("/api/me")
+async def whoami(authorization: str | None = Header(default=None)) -> dict:
+    """What the caller's Bearer token says about them.
+
+    `{corp_no, subject, has_token, verified, auth_enabled}`. The UI calls this
+    once at boot: when it is embedded in the platform shell there is a token in
+    localStorage but no corp number typed into the box, and this is how it
+    learns which tenant to open. A typed corp number always overrides it.
+
+    `verified` is False when the signature could not be checked (no/again wrong
+    public key) but the claims were read anyway — see auth._decode_verified. It
+    is advisory while `auth_enabled` is False.
+    """
+    return {**auth.principal(authorization), "auth_enabled": _settings.auth_enabled}
+
+
+@app.get("/api/health/share")
+async def share_health() -> dict:
+    """Is the data root reachable? Lets the UI distinguish a downed share from
+    a tenant that simply has no surveys (both otherwise look like an empty list)."""
+    return await asyncio.to_thread(discovery.probe_root, _settings.data_dir)
+
+
+@app.get("/api/surveys")
+async def list_surveys() -> list[dict]:
+    """List all tenants and their surveys discovered under the local data dir.
+
+    Walks the whole data root — expensive over a network share (minutes, not
+    seconds). The current UI does not call it; prefer
+    GET /api/tenants/{t}/tag-surveys, which is one directory listing.
+
+    Offloaded to a thread even though it is the only caller's own problem how
+    long it takes: run inline in the event loop, one request to this route
+    freezes the entire server for everyone — no other route answers, not even
+    /api/health/share, and the process looks hung rather than busy. A stale
+    browser tab still holding the pre-v7 UI calls this on load, which is exactly
+    how that happens in practice.
+    """
+    return await asyncio.to_thread(discovery.discover_catalog, _settings.data_dir)
+
+
+# ====================================================================
+# §6  Admin — the auto-retag scheduler (scheduler.py)
+#     Separate from §5 because these are the only non-tenant routes that
+#     *do* something: run-now kicks off a full change-scan.
+# ====================================================================
+
 @app.get("/api/admin/autoretag")
 async def autoretag_status() -> dict:
     """Auto-retag scheduler status (enabled?, interval, last scan)."""
@@ -1061,7 +1139,10 @@ async def autoretag_run_now() -> dict:
     return await sched.run_once()
 
 
-# ---------- Static UI ----------
+# ====================================================================
+# §7  Static UI — last, because the SPA shell is the broadest match here
+#     and `GET /` must not shadow anything above it.
+# ====================================================================
 
 static_dir = Path(__file__).parent / "static"
 

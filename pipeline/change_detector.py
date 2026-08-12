@@ -174,6 +174,20 @@ class ChangeDetector:
             self._hashes[key] = current
             self._save()
 
+    def forget(self, tenant_id: int, survey_no: int) -> bool:
+        """Drop a survey's stored hash so the next run re-tags it.
+
+        Deleting `tagged_output.json` without this leaves the survey looking
+        processed: the inputs still hash the same, so the run skips and the read
+        route keeps 404ing. Returns whether an entry was actually removed.
+        """
+        key = self._survey_key(tenant_id, survey_no)
+        with self._lock:
+            existed = self._hashes.pop(key, None) is not None
+            if existed:
+                self._save()
+        return existed
+
     # ---------- tenant-level change API (tenant_tags.json) ----------
 
     def tenant_is_unchanged(self, tenant_id: int, tenant_dir: Path, output_dir: Path) -> bool:
@@ -182,6 +196,16 @@ class ChangeDetector:
         with self._lock:
             stored = self._hashes.get(key)
         return stored is not None and current == stored
+
+    def tenant_forget(self, tenant_id: int) -> bool:
+        """Drop the tenant-level hash — same reason as `forget`, for
+        `tenant_tags.json`."""
+        key = self._tenant_key(tenant_id)
+        with self._lock:
+            existed = self._hashes.pop(key, None) is not None
+            if existed:
+                self._save()
+        return existed
 
     def tenant_mark_processed(self, tenant_id: int, tenant_dir: Path, output_dir: Path) -> None:
         key = self._tenant_key(tenant_id)

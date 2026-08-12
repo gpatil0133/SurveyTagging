@@ -45,22 +45,42 @@ def read_tagged(ctx: AppContext, tenant_id: int, survey_no: int) -> dict | None:
 
 
 def delete_tagged(ctx: AppContext, tenant_id: int, survey_no: int | None = None) -> dict:
-    """Delete tagged_output.json for one survey or every survey in a tenant."""
+    """Delete tagged_output.json for one survey or every survey in a tenant.
+
+    Deleting the artifact also drops the survey's change-detector hash. The two
+    record one fact — "this survey has been tagged" — in two places, and leaving
+    the hash behind makes the next tag call skip a survey whose output no longer
+    exists (200 "skipped", then 404 on the read).
+    """
+    from pipeline.change_detector import ChangeDetector
+
     root = Path(ctx.settings.output_dir) / str(tenant_id)
     removed: list[str] = []
     if not sharefs.exists(root):
         return {"tenant_id": tenant_id, "survey_no": survey_no, "tagged_removed": []}
 
+    detector = ChangeDetector(Path(ctx.settings.cache_dir))
     if survey_no is None:
         for path in sharefs.glob(root, f"SurveyData/*/{discovery.TAGGED_OUTPUT_FILE}"):
             sharefs.unlink(path, missing_ok=True)
             removed.append(str(path.relative_to(root)))
+            _forget_survey_hash(detector, tenant_id, path.parent.name)
     else:
         path = tagged_output_path(ctx, tenant_id, survey_no)
         if sharefs.exists(path):
             sharefs.unlink(path)
             removed.append(str(path.relative_to(root)))
+        detector.forget(tenant_id, survey_no)
     return {"tenant_id": tenant_id, "survey_no": survey_no, "tagged_removed": removed}
+
+
+def _forget_survey_hash(detector, tenant_id: int, survey_dir_name: str) -> None:
+    """Drop one survey's hash, given the directory name its output sat in."""
+    try:
+        detector.forget(tenant_id, int(survey_dir_name))
+    except ValueError:  # non-numeric survey dir — nothing was ever hashed under it
+        logger.debug("skip_forget_non_numeric_survey_dir | tenant=%s dir=%s",
+                     tenant_id, survey_dir_name)
 
 
 # ---------- survey tagging ----------
@@ -238,11 +258,14 @@ def read_tenant_tags(ctx: AppContext, tenant_id: int) -> dict | None:
 
 
 def delete_tenant_tags(ctx: AppContext, tenant_id: int) -> dict:
+    from pipeline.change_detector import ChangeDetector
     from projections.tenant_tags_io import tenant_tags_path
     path = tenant_tags_path(tenant_id, Path(ctx.settings.output_dir))
     existed = sharefs.exists(path)
     if existed:
         sharefs.unlink(path)
+    # Same pairing as delete_tagged: the artifact and its hash go together.
+    ChangeDetector(Path(ctx.settings.cache_dir)).tenant_forget(tenant_id)
     return {"tenant_id": tenant_id, "removed": existed}
 
 
