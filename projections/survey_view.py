@@ -135,14 +135,24 @@ def _shape_question_tags(
             out[dim] = entry
             continue
 
+        # Prefer the leaf id: with a two-level journey several candidates can
+        # share a stage name, and on the `sub_stage_name` dimension the tag
+        # value is the sub-stage, so a name comparison marks the wrong row (or
+        # none at all). Fall back to the name for artifacts written before
+        # leaf ids existed.
         picked = entry.get("value")
+        picked_leaf = cov.get("leaf_id")
         decorated = []
         for c in candidates:
             if not isinstance(c, dict):
                 decorated.append(c)
                 continue
-            cand_name = c.get("stage_name") or c.get("name")
-            decorated.append({**c, "selected": cand_name == picked})
+            if picked_leaf and c.get("leaf_id"):
+                selected = c.get("leaf_id") == picked_leaf
+            else:
+                cand_name = c.get("stage_name") or c.get("name")
+                selected = cand_name == picked
+            decorated.append({**c, "selected": selected})
 
         shaped_cov = {**cov, "candidates": decorated}
         out[dim] = {**entry, "coverage_metadata": shaped_cov}

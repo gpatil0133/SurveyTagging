@@ -101,10 +101,14 @@ def assemble_context(
     directory_signals: DirectorySignals | None = None,
     config_dir: Path | None = None,
     tenant_profile: TenantProfile | None = None,
-    tenant_canon=None,             # V5: TenantCanon | None  (CX)
-    canon_embeddings=None,         # V5: CanonEmbeddingIndex | None  (CX)
-    tenant_canon_ex=None,          # V5: TenantCanon | None  (EX)
-    canon_embeddings_ex=None,      # V5: CanonEmbeddingIndex | None  (EX)
+    profile_journey=None,          # V8: ProfileJourney | None  (CX)
+    journey_index=None,            # V8: JourneyIndex | None    (CX)
+    profile_journey_ex=None,       # V8: ProfileJourney | None  (EX)
+    journey_index_ex=None,         # V8: JourneyIndex | None    (EX)
+    tenant_canon=None,             # PARKED (V5): TenantCanon | None  (CX)
+    canon_embeddings=None,         # PARKED (V5): CanonEmbeddingIndex | None  (CX)
+    tenant_canon_ex=None,          # PARKED (V5): TenantCanon | None  (EX)
+    canon_embeddings_ex=None,      # PARKED (V5): CanonEmbeddingIndex | None  (EX)
 ) -> UnifiedContext:
     """Build the complete UnifiedContext for a single survey.
 
@@ -116,10 +120,13 @@ def assemble_context(
         config_dir: Path to config/ for domain keyword definitions.
         tenant_profile: Pre-loaded TenantProfile (cached per tenant).
             Optional — None means no Parallel.ai artifacts are available.
-        tenant_canon: Pre-loaded CX TenantCanon (V5; cached per tenant).
-        canon_embeddings: Pre-loaded CX CanonEmbeddingIndex (V5; cached per tenant).
-        tenant_canon_ex: Pre-loaded EX TenantCanon (V5; cached per tenant).
-        canon_embeddings_ex: Pre-loaded EX CanonEmbeddingIndex (V5; cached per tenant).
+        profile_journey: Pre-built CX ProfileJourney (V8; cached per tenant).
+        journey_index: Pre-built CX JourneyIndex (V8; cached per tenant).
+        profile_journey_ex: Pre-built EX ProfileJourney (V8; cached per tenant).
+        journey_index_ex: Pre-built EX JourneyIndex (V8; cached per tenant).
+        tenant_canon / canon_embeddings / tenant_canon_ex / canon_embeddings_ex:
+            PARKED. The canon layer no longer feeds the pipeline; accepted so
+            existing callers still construct.
 
     Returns:
         Fully assembled UnifiedContext ready for tagging.
@@ -176,6 +183,10 @@ def assemble_context(
     return UnifiedContext(
         tenant_id=tenant_id,
         tenant_profile=tenant_profile,
+        profile_journey=profile_journey,
+        journey_index=journey_index,
+        profile_journey_ex=profile_journey_ex,
+        journey_index_ex=journey_index_ex,
         tenant_canon=tenant_canon,
         canon_embeddings=canon_embeddings,
         tenant_canon_ex=tenant_canon_ex,

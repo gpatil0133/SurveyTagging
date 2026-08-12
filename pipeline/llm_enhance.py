@@ -14,6 +14,7 @@ import logging
 
 from llm.cache import LLMCache
 from llm.prompt_builder import build_project_prompt, build_question_prompt
+from models import evidence as ev
 from models.tags import TagResult
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,31 @@ def _rationale(why: dict, field: str, summary: str | None) -> str | None:
     if isinstance(line, str) and line.strip():
         return line.strip()
     return summary or None
+
+
+def _journey_fingerprint(journey) -> dict:
+    """Identity of the journey a question prompt was grounded in.
+
+    Two journeys with the same leaves in the same order produce the same
+    candidates and may safely share a cache entry; anything else must not — a
+    refreshed tenant profile has to invalidate the response.
+    """
+    if journey is None:
+        return {"journey": None}
+    return {
+        "journey": journey.journey_name,
+        "journey_hash": journey.source_hash,
+        "journey_leaves": [leaf.leaf_id for leaf in journey.leaves],
+    }
+
+
+def _cache_key(parts: dict) -> str:
+    """Hash the full set of inputs a cached response actually depends on.
+
+    `sort_keys` matters: dict ordering must not decide whether two identical
+    surveys share an entry.
+    """
+    return LLMCache.compute_hash(json.dumps(parts, sort_keys=True, default=str))
 
 
 def _superseded(existing) -> dict | None:
@@ -68,17 +94,24 @@ def run_llm_enhancement(
     """Run LLM calls for semantic tagging. Returns number of calls made."""
     calls_made = 0
 
-    survey_hash = LLMCache.compute_hash(
-        json.dumps({"title": context.survey_meta.title,
-                    "questions": [q.title for q in context.questions]})
-    )
-    logger.debug("llm_cache_key_computed", extra={"survey_hash": survey_hash})
+    # The survey's own identity. `tenant_id` is part of it because the response
+    # is tenant-shaped — the prompts carry the tenant profile, and the question
+    # prompt carries that tenant's canon. Without it two tenants running the
+    # same survey template (the common case for a standard engagement survey)
+    # share one flat cache entry and inherit each other's journey stages.
+    survey_identity = {
+        "tenant": context.tenant_id,
+        "title": context.survey_meta.title,
+        "questions": [q.title for q in context.questions],
+    }
+    project_key = _cache_key(survey_identity)
+    logger.debug("llm_cache_key_computed", extra={"project_key": project_key})
 
     try:
         loop = asyncio.new_event_loop()
 
         # LLM Call 1: Project-level
-        logger.debug("llm_project_call_start", extra={"survey_hash": survey_hash})
+        logger.debug("llm_project_call_start", extra={"cache_key": project_key})
         rp = build_project_prompt(context, accumulator, taxonomy)
         logger.debug("project_prompt_built",
                      extra={"prompt_version": rp.version,
@@ -87,7 +120,7 @@ def run_llm_enhancement(
         result = loop.run_until_complete(
             llm_client.complete(
                 rp.user_prompt, "",
-                cache_key=survey_hash, call_type="project",
+                cache_key=project_key, call_type="project",
                 cached_system_preamble=rp.cached_preamble,
                 prompt_version=rp.version,
             )
@@ -96,44 +129,72 @@ def run_llm_enhancement(
             parsed = response_parser.parse_project_response(result)
             _apply_project_llm_results(parsed, accumulator)
             calls_made += 1
-            logger.debug("llm_project_call_applied", extra={"survey_hash": survey_hash})
+            logger.debug("llm_project_call_applied", extra={"cache_key": project_key})
         else:
             logger.debug("llm_project_call_no_result",
-                         extra={"survey_hash": survey_hash,
+                         extra={"cache_key": project_key,
                                 "has_result": result is not None})
 
-        # LLM Call 2: Question-level
-        if context.non_cm_questions and industry_stages:
+        # LLM Call 2: Question-level.
+        # No longer gated on `industry_stages`: that registry only ever fed the
+        # journey fallback, which is gone, and the call assigns seven other
+        # dimensions that have nothing to do with journeys. Gating on it meant a
+        # deployment without journey_stages.yaml silently lost topic_theme,
+        # visualization_type and the rest.
+        if context.non_cm_questions:
+            industry = accumulator.get_project_tag_value("industry_vertical")
+            project_type = accumulator.get_project_tag_value("project_type")
+            # Select CX vs EX journey by project_type (EX surveys ground against
+            # the employee lifecycle). Resolved before the call because the
+            # journey is a cache-key input, not just a prompt input.
+            journey, _journey_index = context.journey_for(project_type)
+            top_k = settings.embedding_top_k
+            min_score = float(getattr(settings, "embedding_min_score", 0.0) or 0.0)
+
+            # The question response is only valid for the journey that produced
+            # its candidate lists and the knobs that shaped them — a refreshed
+            # tenant profile must invalidate it.
+            question_key = _cache_key(
+                {**survey_identity, **_journey_fingerprint(journey),
+                 "top_k": top_k, "min_score": min_score}
+            )
             logger.debug("llm_question_call_start",
-                         extra={"survey_hash": survey_hash,
+                         extra={"cache_key": question_key,
                                 "non_cm_questions": len(context.non_cm_questions)})
-            rp = build_question_prompt(context, accumulator, taxonomy, industry_stages)
+
+            # Candidates are computed once here (inside the prompt build) and
+            # handed to the parser, which needs the identical ranking for its
+            # out-of-canon top-1 fallback.
+            rp, candidates_by_qid = build_question_prompt(
+                context, accumulator, taxonomy, industry_stages,
+                top_k=top_k, embedding_model=settings.embedding_model,
+                min_score=min_score,
+            )
             result = loop.run_until_complete(
                 llm_client.complete(
                     rp.user_prompt, "",
-                    cache_key=survey_hash, call_type="question",
+                    cache_key=question_key, call_type="question",
                     cached_system_preamble=rp.cached_preamble,
                     prompt_version=rp.version,
                 )
             )
             if result and response_parser:
-                industry = accumulator.get_project_tag_value("industry_vertical")
-                project_type = accumulator.get_project_tag_value("project_type")
-                # Select CX vs EX canon by project_type (EX surveys ground
-                # against the employee-lifecycle canon).
-                canon, canon_embeddings = context.canon_for(project_type)
-                # Capture per-question candidates so the parser can downgrade
-                # out-of-canon stage names to top-1 instead of dropping them.
-                candidates_by_qid = _gather_question_candidates(context, settings, canon_embeddings)
                 parsed_questions = response_parser.parse_question_response(
                     result, industry=industry, project_type=project_type,
-                    canon=canon,
                     candidates_by_qid=candidates_by_qid,
                 )
                 _apply_question_llm_results(parsed_questions, accumulator, context)
+                # Every eligible question the call did not place is still sitting
+                # at pending_llm. Resolve it here, where we know WHY it was not
+                # placed, rather than leaving a status that reads as "the call
+                # never landed" when in fact it landed and declined.
+                _close_unplaced_journeys(
+                    context, accumulator, journey, _journey_index,
+                    candidates_by_qid, min_score,
+                )
                 calls_made += 1
                 logger.debug("llm_question_call_applied",
-                             extra={"survey_hash": survey_hash,
+                             extra={"cache_key": question_key,
                                     "parsed_questions": len(parsed_questions),
                                     "candidates_qids": len(candidates_by_qid)})
 
@@ -196,6 +257,84 @@ def _apply_project_llm_results(parsed: dict, accumulator) -> None:
             reasoning=_rationale(why, "dashboard_names", summary),
             superseded=_superseded(existing),
         ))
+
+
+def _close_unplaced_journeys(
+    context, accumulator, journey, journey_index, candidates_by_qid: dict,
+    min_score: float,
+) -> None:
+    """Turn leftover `pending_llm` journey tags into skips that say why.
+
+    `journey_stage` is a pending_llm-only tagger: the deterministic pass
+    reserves the dimension and the LLM call fills it. Anything the call did not
+    fill would otherwise keep a status whose documented meaning is "that call
+    never landed" — which, once the call has landed and declined, is a lie the
+    output tells about itself.
+
+    Four distinct reasons, each written to the tag so a reader does not have to
+    guess which one applies — and, more to the point, so they are sent to the
+    right system to fix it:
+      * no journey source for the tenant at all -> fetch the profile;
+      * a source exists but could not be scored -> the embedding model;
+      * scored, but nothing cleared the similarity floor -> the journey or the floor;
+      * candidates were offered and the model declined -> nothing to fix.
+    """
+    from taggers._metric_utils import is_journey_eligible_metric
+
+    for q in context.questions:
+        if q.is_content_message:
+            continue
+        eligible, _ev = is_journey_eligible_metric(q)
+        if not eligible:
+            continue
+
+        for dimension in ("journey_stage", "sub_stage_name"):
+            existing = accumulator.get_question_tag(q.question_id, dimension)
+            if existing is None or existing.status != "pending_llm":
+                continue
+
+            if journey is None:
+                detail = ev.fallback(
+                    f"question.{dimension}.no_journey_source",
+                    "No journey is available for this tenant: `tenant_profile/` carries "
+                    "no CX journeys or EX lifecycle stages to place this metric against. "
+                    "Fetch the tenant profile and re-tag to populate this dimension.",
+                    stage=5,
+                    inputs={"tenant_id": context.tenant_id},
+                )
+            elif journey_index is None:
+                detail = ev.fallback(
+                    f"question.{dimension}.scoring_unavailable",
+                    f"'{journey.journey_name}' was read from the tenant profile, but its "
+                    "moments could not be embedded, so no candidates could be ranked for "
+                    "this question. The journey source is fine — check the embedding "
+                    "model.",
+                    stage=5,
+                    inputs={"leaves": len(journey.leaves)},
+                )
+            elif q.question_id not in candidates_by_qid:
+                detail = ev.statistic(
+                    f"question.{dimension}.below_similarity_floor",
+                    f"Scored against all {len(journey.leaves)} moments in "
+                    f"'{journey.journey_name}' and none reached the floor, so the metric "
+                    "was left unplaced rather than filed under its nearest miss.",
+                    measure="max_cosine_similarity",
+                    observed="below_floor",
+                    threshold=min_score,
+                    stage=5,
+                )
+            else:
+                detail = ev.rule(
+                    f"question.{dimension}.llm_declined",
+                    "Candidate moments were offered and the model judged that none of "
+                    "them is what this question measures.",
+                    stage=5,
+                    inputs={"candidates": len(candidates_by_qid[q.question_id])},
+                )
+
+            accumulator.set_question_tag(q.question_id, dimension, TagResult(
+                value=None, source="deterministic", status="skipped", evidence=detail,
+            ))
 
 
 def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=None) -> None:
@@ -267,6 +406,7 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
             coverage = {
                 "confidence": j_confidence,
                 "evidence": j_evidence,
+                "leaf_id": q_data.get("journey_leaf_id"),
                 "candidates": j_candidates or [],
             }
 
@@ -284,14 +424,29 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                         evidence=j_evidence, reasoning=j_reasoning,
                         coverage_metadata=coverage,
                     ))
-            if sub_value:
-                existing_sub = accumulator.get_question_tag(q_id, "sub_stage_name")
-                if not (existing_sub and existing_sub.status == "skipped"):
+            existing_sub = accumulator.get_question_tag(q_id, "sub_stage_name")
+            if not (existing_sub and existing_sub.status == "skipped"):
+                if sub_value:
                     accumulator.set_question_tag(q_id, "sub_stage_name", TagResult(
                         value=sub_value, source="llm",
                         confidence=conf_numeric, status=tag_status,
                         evidence=j_evidence, reasoning=j_reasoning,
                         coverage_metadata=coverage,
+                    ))
+                elif stage_value:
+                    # A one-level journey (the EX lifecycle) has no sub-stage to
+                    # assign. Record that as a skip against the source, not as a
+                    # question we failed to reach — and never synthesize a label,
+                    # which is how metric names ended up in this column.
+                    accumulator.set_question_tag(q_id, "sub_stage_name", TagResult(
+                        value=None, source="deterministic", status="skipped",
+                        evidence=ev.rule(
+                            "question.sub_stage_name.source_has_one_level",
+                            f"Placed at '{stage_value}', but the tenant's journey for this "
+                            "survey type is a flat stage list with no sub-stage level, so "
+                            "there is nothing to assign.",
+                            stage=5,
+                        ),
                     ))
 
         # Multi-label: dashboard_names → dashboard_placement
@@ -326,38 +481,3 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                 ))
 
 
-def _gather_question_candidates(context, settings, canon_embeddings=None) -> dict[int, list[dict]]:
-    """Re-run per-question canon scoring to produce candidates_by_qid for the
-    response parser's out-of-canon top-1 fallback. Returns {} when embeddings
-    are unavailable.
-
-    `canon_embeddings` is the journey-type-selected index (CX or EX) for this
-    survey, resolved by the caller via `context.canon_for(project_type)`.
-    """
-    if canon_embeddings is None:
-        return {}
-    try:
-        from llm.embeddings import EmbeddingModel, score_signature
-        from llm.prompt_builder import build_question_signature
-        from taggers._metric_utils import is_journey_eligible_metric
-
-        embedder = EmbeddingModel.get(settings.embedding_model)
-        top_k = settings.embedding_top_k
-
-        out: dict[int, list[dict]] = {}
-        for q in context.questions:
-            if q.is_content_message:
-                continue
-            eligible, _ev = is_journey_eligible_metric(q)
-            if not eligible:
-                continue
-            sig = build_question_signature(context, q)
-            ranked = score_signature(sig, canon_embeddings, embedder, top_k=top_k)
-            out[q.question_id] = [
-                {"stage_name": s.name, "score": round(score, 3)}
-                for (s, score) in ranked
-            ]
-        return out
-    except Exception as e:  # noqa: BLE001
-        logger.warning("question_candidate_gather_failed", extra={"error": str(e)})
-        return {}

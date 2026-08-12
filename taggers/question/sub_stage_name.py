@@ -1,14 +1,16 @@
-"""sub_stage_name tagger — per-question semantic label under a journey stage.
+"""sub_stage_name tagger — the moment under a journey stage.
 
-Stage 5, LLM. Free-text, user_defined (2-5 word Title Case).
+Stage 5, LLM-resolved. user_defined, but no longer free text: the value is the
+`stages[]` entry of the tenant's own profile journey, selected atomically with
+`journey_stage` when the LLM picks a candidate leaf. A tenant whose journey
+source has only one level (the EX lifecycle) gets no sub-stage at all rather
+than an invented one — under the previous canon path this column defaulted to
+"Other <stage>" and filled up with metric names, which is what motivated
+sourcing both levels from the profile.
 
-Assigned ONLY to journey-eligible metric questions (NPS/CSAT/CES/custom
-metric). The LLM produces a concise label describing what the metric
-measures (e.g., "Overall Satisfaction", "Checkout Ease"). These per-question
-labels are then clustered into canonical sub-stages at the tenant level.
-
-Non-eligible questions get status="skipped". The LLM call fills eligible
-questions in via the pending_llm status.
+Assigned ONLY to journey-eligible metric questions (NPS/CSAT/CES/custom metric).
+Non-eligible questions get status="skipped". Eligible ones are reserved as
+pending_llm here and resolved at merge time.
 """
 
 from __future__ import annotations
@@ -59,10 +61,12 @@ class SubStageNameTagger(QuestionTagger):
             evidence=ev.rule(
                 "question.sub_stage_name.awaiting_llm",
                 "Journey-eligible, so this tagger reserves the dimension and stops. "
-                "The value comes from LLM Call 2, which picks from the tenant's own "
-                "canon ranked by embedding similarity — a status of pending_llm in "
-                "the final output means that call never landed. The eligibility "
-                "reason is recorded on the assigned tag once it does.",
+                "The value comes from LLM Call 2, which selects a moment from the "
+                "tenant's own profile journey ranked by embedding similarity — a "
+                "status of pending_llm in the final output means that call never "
+                "landed, since a call that lands and declines is recorded as a skip "
+                "with its reason. The eligibility reason is recorded on the assigned "
+                "tag once it does.",
                 stage=5,
             ),
         )

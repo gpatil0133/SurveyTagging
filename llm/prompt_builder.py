@@ -11,7 +11,7 @@ V6 changes:
 
 Public API:
 - build_project_prompt(...)  -> RenderedPrompt
-- build_question_prompt(...) -> RenderedPrompt
+- build_question_prompt(...) -> (RenderedPrompt, candidates_by_qid)
 
 `RenderedPrompt.cached_preamble` is marked with cache_control=ephemeral by the
 LLMClient for Anthropic prompt caching (90%+ input cost reduction on hits).
@@ -235,40 +235,98 @@ def build_question_signature(context: UnifiedContext, q) -> str:
     return " | ".join(parts)
 
 
-def _question_candidates(
+def build_question_candidates(
     context: UnifiedContext,
-    q,
+    journey_index,
+    *,
     top_k: int,
-    canon_embeddings=None,
-) -> list[tuple]:
-    """Return [(CanonStage, score)] for one question, or [] if no embeddings.
+    embedding_model: str,
+    min_score: float = 0.0,
+) -> dict[int, list[dict]]:
+    """Score every journey-eligible question against the journey in ONE encode pass.
 
-    `canon_embeddings` is the journey-type-selected index (CX or EX) for this
-    survey; the caller resolves it via `context.canon_for(project_type)`.
+    Returns `{question_id: [candidate, ...]}` where each candidate carries the
+    fields the LLM prompt shows *and* the `leaf_id` the response parser resolves
+    the model's pick through — one shape, one computation, two consumers.
+
+    This is deliberately survey-wide rather than per-question: `score_questions`
+    batches the transformer forward pass, and the previous per-question call ran
+    it once per question, twice per survey (prompt build + parser gather).
+
+    `journey_index` is the journey-type-selected index (CX or EX) for this
+    survey; the caller resolves it via `context.journey_for(project_type)`.
+
+    A question whose best leaf scores below `min_score` is **omitted entirely**.
+    That is the honest outcome for a metric the tenant's journey has no home for
+    — the alternative is forcing it into the nearest stage and reporting a match
+    that isn't one. The caller distinguishes "below floor" from "no journey at
+    all" and records the difference in the tag's evidence.
     """
-    if canon_embeddings is None:
-        return []
-    from llm.embeddings import EmbeddingModel, score_signature
-    from settings import Settings
+    if journey_index is None:
+        return {}
+    try:
+        from llm.profile_journey import score_questions
+        from llm.embeddings import EmbeddingModel
+        from taggers._metric_utils import is_journey_eligible_metric
 
-    embedder = EmbeddingModel.get(Settings().embedding_model)
-    sig = build_question_signature(context, q)
-    return score_signature(sig, canon_embeddings, embedder, top_k=top_k)
+        eligible = [
+            q for q in context.questions
+            if not q.is_content_message and is_journey_eligible_metric(q)[0]
+        ]
+        if not eligible:
+            return {}
+
+        embedder = EmbeddingModel.get(embedding_model)
+        signatures = [build_question_signature(context, q) for q in eligible]
+        ranked = score_questions(signatures, journey_index, embedder, top_k=top_k)
+
+        out: dict[int, list[dict]] = {}
+        for q, r in zip(eligible, ranked):
+            if not r or r[0][1] < min_score:
+                continue
+            out[q.question_id] = [
+                {
+                    "leaf_id": leaf.leaf_id,
+                    "stage_name": leaf.stage_value,
+                    "sub_stage_name": leaf.sub_stage_value,
+                    "description": leaf.description,
+                    "goal": leaf.goal,
+                    "score": round(score, 3),
+                }
+                for (leaf, score) in r
+            ]
+        return out
+    except Exception as e:  # noqa: BLE001 — scoring is an enhancement, never fatal
+        logger.warning("question_candidate_scoring_failed", extra={"error": str(e)})
+        return {}
 
 
 def build_question_prompt(
     context: UnifiedContext,
     accumulator: TagAccumulator,
     taxonomy: TaxonomyRegistry,
-    industry_stages: IndustryStagesRegistry,
+    industry_stages: IndustryStagesRegistry = None,
     top_k: int = 4,
-) -> RenderedPrompt:
+    embedding_model: str = "BAAI/bge-small-en-v1.5",
+    min_score: float = 0.0,
+) -> tuple[RenderedPrompt, dict[int, list[dict]]]:
     """Build question-level prompt for LLM Call 2.
 
-    V5+: per-question candidates from canon embeddings replace the survey-wide
-    industry stage list. When `context.tenant_canon` is None (legacy tenants),
-    we fall back to the industry-stage-list path so the system stays runnable
-    end-to-end during the transition.
+    Returns `(rendered_prompt, candidates_by_qid)`. The candidate map is
+    returned rather than recomputed downstream because the response parser
+    resolves the model's pick through the identical ranking — deriving it twice
+    cost a second full embedding pass and let the two copies disagree whenever
+    `top_k` differed between the call sites.
+
+    `top_k`, `embedding_model` and `min_score` are passed in (rather than read
+    from a freshly-constructed `Settings()`) so a single survey does not
+    re-parse `.env` from disk once per question.
+
+    V8: journey candidates come from the tenant profile (`context.journey_for`).
+    There is no industry-template fallback — a tenant with no profile gets no
+    journey candidates, and the questions are marked skipped with evidence
+    rather than assigned a generic stage. `industry_stages` is retained in the
+    signature for callers built against the parked canon path; it is unused.
     """
     industry = accumulator.get_project_tag_value("industry_vertical")
     project_type = accumulator.get_project_tag_value("project_type")
@@ -276,13 +334,9 @@ def build_question_prompt(
     if not isinstance(project_dashboards, list):
         project_dashboards = [project_dashboards]
 
-    # Select CX vs EX canon by project_type (EX surveys ground against the
-    # employee-lifecycle canon).
-    canon, canon_embeddings = context.canon_for(project_type)
-    legacy_stage_list = (
-        industry_stages.get_stages(industry, project_type=project_type)
-        if canon is None else []
-    )
+    # Select CX vs EX journey by project_type (EX surveys ground against the
+    # employee lifecycle).
+    journey, journey_index = context.journey_for(project_type)
 
     project_context = {
         "industry":     industry,
@@ -292,6 +346,13 @@ def build_question_prompt(
         "sub_type":     accumulator.get_project_tag_value("survey_sub_type"),
         "project_type": project_type,
     }
+
+    # One embedding pass for the whole survey; reused by the prompt below and
+    # returned to the caller for the parser.
+    candidates_by_qid = build_question_candidates(
+        context, journey_index, top_k=top_k, embedding_model=embedding_model,
+        min_score=min_score,
+    )
 
     questions_data = []
     for q in context.questions:
@@ -316,44 +377,47 @@ def build_question_prompt(
             "metric_title": metric_title,
         }
 
-        if is_journey_metric and canon is not None and canon_embeddings is not None:
-            ranked = _question_candidates(context, q, top_k=top_k, canon_embeddings=canon_embeddings)
-            q_entry["signature"] = build_question_signature(context, q)
-            q_entry["candidates"] = [
-                {
-                    "stage_name": stage.name,
-                    "description": stage.description,
-                    "customer_goal": stage.customer_goal,
-                    "synonyms": stage.synonyms[:5],
-                    "score": round(score, 3),
-                }
-                for (stage, score) in ranked
-            ]
+        if is_journey_metric and journey is not None:
+            ranked = candidates_by_qid.get(q.question_id)
+            if ranked:
+                q_entry["signature"] = build_question_signature(context, q)
+                q_entry["candidates"] = ranked
 
         questions_data.append(q_entry)
 
-    canon_note = ""
-    if canon is not None:
-        canon_note = (
-            f'Tenant canon: "{canon.journey_name}" '
-            f'({len(canon.stages)} stages, source={canon.source}). '
-            f'Each journey-eligible question has its own ranked `candidates` list — '
-            f'pick `journey.stage_name` EXACTLY from that list.'
+    journey_note = ""
+    if journey is not None:
+        sub_stage_rule = (
+            "Each candidate carries both levels: `stage_name` is the journey the "
+            "moment belongs to and `sub_stage_name` is the specific moment within "
+            "it. Return the candidate's `leaf_id` — both tag values are resolved "
+            "from it, so you never type a stage name."
+            if journey.has_sub_stages else
+            "This journey has one level only: candidates carry `stage_name` with a "
+            "null `sub_stage_name`, and no sub-stage will be recorded. Return the "
+            "candidate's `leaf_id`."
+        )
+        journey_note = (
+            f'Tenant journey: "{journey.journey_name}" '
+            f'({len(journey.leaves)} moments across {len(journey.stage_values)} '
+            f'stages, read from the tenant profile). {sub_stage_rule} '
+            f'A question with no `candidates` list has no home in this journey — '
+            f'set its `journey` to null rather than guessing.'
         )
 
     user_context = {
         "survey_title":         context.survey_meta.title,
         "project_context_json": json.dumps(project_context),
         "tenant_profile_block": _build_tenant_profile_block(context.tenant_profile),
-        "canon_note":           canon_note,
-        "legacy_stage_list":    legacy_stage_list,
+        "journey_note":         journey_note,
         "project_dashboards":   project_dashboards,
         "questions_count":      len(questions_data),
         "questions_json":       json.dumps(questions_data, indent=2),
     }
 
-    return get_registry().render(
+    rendered = get_registry().render(
         "question_tagging",
         cached_context=_question_cached_context(taxonomy),
         user_context=user_context,
     )
+    return rendered, candidates_by_qid

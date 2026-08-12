@@ -1,10 +1,11 @@
-"""journey_stage tagger — V5: pending_llm-only.
+"""journey_stage tagger — pending_llm-only.
 
 Stage 5 LLM tagger. Eligibility (NPS/CSAT/CES/custom metric) is enforced
-locally; the actual stage assignment comes from the canon-aware LLM call
-at orchestrator merge time. Keyword priors and the NPS->advocacy heuristic
-are gone because they (a) operate in the YAML namespace which now diverges
-from the tenant canon and (b) misfired badly on generic words like
+locally; the actual stage assignment comes from the journey-aware LLM call at
+orchestrator merge time, where the value is read off a moment in the tenant's
+own profile journey. Keyword priors and the NPS->advocacy heuristic are gone
+because they (a) operate in the YAML namespace, which diverges from the
+tenant's own stage names, and (b) misfired badly on generic words like
 "experience" and "help" (see TENANT_PROFILE_PLAN forensic).
 
 Non-eligible questions get status="skipped". Eligible questions get
@@ -68,10 +69,12 @@ class JourneyStageTagger(QuestionTagger):
             evidence=ev.rule(
                 "question.journey_stage.awaiting_llm",
                 "Journey-eligible, so this tagger reserves the dimension and stops. "
-                "The value comes from LLM Call 2, which picks from the tenant's own "
-                "canon ranked by embedding similarity — a status of pending_llm in "
-                "the final output means that call never landed. The eligibility "
-                "reason is recorded on the assigned tag once it does.",
+                "The value comes from LLM Call 2, which selects a moment from the "
+                "tenant's own profile journey ranked by embedding similarity — a "
+                "status of pending_llm in the final output means that call never "
+                "landed, since a call that lands and declines is recorded as a skip "
+                "with its reason. The eligibility reason is recorded on the assigned "
+                "tag once it does.",
                 stage=5,
             ),
         )

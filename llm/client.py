@@ -67,6 +67,30 @@ def _accepts_temperature(model: str, temperature: float) -> bool:
         return True
 
 
+def _cache_tokens(usage) -> tuple[int, int]:
+    """Pull (cache_read, cache_write) out of a litellm usage block.
+
+    litellm's `Usage` model declares neither `cache_read_input_tokens` nor
+    `cache_creation_input_tokens`; the canonical home is
+    `usage.prompt_tokens_details.{cached_tokens, cache_creation_tokens}`, which
+    **every** provider populates. The Anthropic-style attributes exist only
+    because `Usage` sets `extra="allow"` and the Anthropic handler happens to
+    pass those kwargs — the OpenAI handler does not.
+
+    So reading the flat attributes alone silently reports zero on OpenAI, which
+    makes prompt caching unmeasurable exactly when it is being tuned. Read the
+    details block first, fall back to the Anthropic extras.
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    read = getattr(details, "cached_tokens", None) if details is not None else None
+    write = getattr(details, "cache_creation_tokens", None) if details is not None else None
+    if read is None:
+        read = getattr(usage, "cache_read_input_tokens", 0)
+    if write is None:
+        write = getattr(usage, "cache_creation_input_tokens", 0)
+    return int(read or 0), int(write or 0)
+
+
 class LLMClient:
     """Wraps litellm for LLM calls with retry, caching, and structured output parsing."""
 
@@ -287,8 +311,7 @@ class LLMClient:
                 usage = response.usage
                 in_tok = getattr(usage, "prompt_tokens", 0) or 0
                 out_tok = getattr(usage, "completion_tokens", 0) or 0
-                cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-                cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                cache_read, cache_write = _cache_tokens(usage)
                 if cache_read or cache_write:
                     logger.info("llm_prompt_cache_stats",
                                 extra={"cache_read_tokens": cache_read,

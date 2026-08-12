@@ -56,12 +56,9 @@ class ResponseParser:
         industry_stages: IndustryStagesRegistry | None = None,
     ) -> None:
         self.taxonomy = taxonomy
+        # PARKED: only the removed journey fallback ever read this. Kept on the
+        # constructor so existing call sites (orchestrator, tests) still build.
         self.industry_stages = industry_stages
-
-    @staticmethod
-    def _is_word_count_ok(label: str, *, min_w: int = 2, max_w: int = 6) -> bool:
-        n = len(label.split())
-        return min_w <= n <= max_w
 
     @staticmethod
     def _note_normalization(
@@ -134,38 +131,23 @@ class ResponseParser:
     def parse_question_response(
         self, data: dict, industry: str | None = None,
         project_type: str | None = None,
-        canon=None,                # V5: TenantCanon | None
-        candidates_by_qid: dict[int, list[dict]] | None = None,  # V5: per-question candidate lists
+        candidates_by_qid: dict[int, list[dict]] | None = None,  # per-question candidate lists
     ) -> list[dict]:
         """Parse and validate question-level LLM response.
 
-        V5: when `canon` is provided, the LLM's atomic `journey` block is
-        parsed and validated against the canon namespace; out-of-canon stage
-        names are downgraded to `low_confidence_assigned` keyed to the top-1
-        candidate so no question is silently dropped.
-
-        When `canon` is None (legacy tenants), falls back to the v4.x
-        `journey_stage` + `sub_stage_name` parsing path.
+        V8: the `journey` block is resolved through `candidates_by_qid` — the
+        same ranking the prompt showed the model — so both journey tag values
+        come from the tenant's profile rather than from model text. A question
+        with no candidates has no journey namespace and gets no journey tags.
         """
         questions = data.get("questions", [])
         logger.debug("parse_question_response_start",
                      extra={"question_count": len(questions) if isinstance(questions, list) else 0,
-                            "has_canon": canon is not None,
+                            "candidate_qids": len(candidates_by_qid or {}),
                             "industry": industry, "project_type": project_type})
         if not isinstance(questions, list):
             logger.warning("llm_questions_not_list")
             return []
-
-        canon_names: set[str] = set()
-        canon_lower: dict[str, str] = {}
-        if canon is not None:
-            canon_names = {s.name for s in canon.stages}
-            canon_lower = {s.name.lower(): s.name for s in canon.stages}
-
-        # Legacy industry-stage list (only used when canon is None)
-        industry_stages_list: list[str] = []
-        if canon is None and self.industry_stages is not None:
-            industry_stages_list = self.industry_stages.get_stages(industry, project_type=project_type)
 
         candidates_by_qid = candidates_by_qid or {}
 
@@ -194,15 +176,12 @@ class ResponseParser:
                 else:
                     why.pop(field, None)  # explained a dimension it never set
 
-            # ---------- Journey block (V5 atomic OR v4 legacy) ----------
+            # ---------- Journey block (leaf selected from this question's candidates) ----------
             qid = q_data.get("id")
             qid_int = int(qid) if isinstance(qid, int) or (isinstance(qid, str) and qid.isdigit()) else None
             self._parse_journey_for_question(
                 q_data=q_data, parsed=parsed,
-                canon_names=canon_names, canon_lower=canon_lower,
                 candidates=candidates_by_qid.get(qid_int) if qid_int is not None else None,
-                legacy_stage_list=industry_stages_list,
-                use_v5=canon is not None,
             )
 
             # dashboard_names multi-label
@@ -244,103 +223,116 @@ class ResponseParser:
         *,
         q_data: dict,
         parsed: dict,
-        canon_names: set[str],
-        canon_lower: dict[str, str],
         candidates: list[dict] | None,
-        legacy_stage_list: list[str],
-        use_v5: bool,
     ) -> None:
-        """Parse the LLM's `journey` block (V5) or legacy fields (v4) and write
-        into `parsed`. Always emits non-null `sub_stage_name` whenever the
-        stage was assigned. Surfaces `journey_status` ∈
-        {"assigned", "low_confidence_assigned"} so the orchestrator can map it
-        onto TagResult.status.
+        """Resolve the LLM's `journey` block into stage + sub-stage tag values.
+
+        V8: the model returns a `leaf_id` selected from this question's own
+        candidate list, and both values are read off that candidate. Nothing the
+        model types becomes a tag value, so a stage can no longer be invented,
+        misspelled, or fuzzy-matched into the wrong place — the failure mode the
+        canon path spent a validation ladder defending against.
+
+        An unresolvable pick falls back to the top-ranked candidate as
+        `low_confidence_assigned` rather than being dropped, since the embedding
+        ranking is independent evidence that the question belongs somewhere.
+        A model that declined to place the question (`journey: null`) is left
+        alone — the caller marks it skipped with the reason.
+
+        Writes nothing when there is no assignment to make.
         """
         journey = q_data.get("journey")
-        # Legacy v4 fallback path: pick up old fields if the new block is absent.
-        legacy_stage = q_data.get("journey_stage")
-        legacy_sub = q_data.get("sub_stage_name")
-
-        stage_value: str | None = None
-        sub_value: str | None = None
-        confidence: str = "high"
-        evidence: str | None = None
-
-        if isinstance(journey, dict) and journey:
-            stage_raw = journey.get("stage_name")
-            sub_raw = journey.get("sub_stage_name")
-            confidence = str(journey.get("confidence") or "medium").lower().strip()
-            evidence = journey.get("evidence")
-            if isinstance(stage_raw, str) and stage_raw and stage_raw.lower() != "null":
-                stage_value = stage_raw.strip()
-            if isinstance(sub_raw, str) and sub_raw and sub_raw.lower() != "null":
-                sub_value = sub_raw.strip()
-        elif legacy_stage and legacy_stage != "null":
-            # v4 fallback (used during transition before all surveys re-tagged)
-            stage_value = str(legacy_stage).strip()
-            if isinstance(legacy_sub, str) and legacy_sub.strip() and legacy_sub.strip().lower() != "null":
-                sub_value = legacy_sub.strip()
-
-        if not stage_value:
-            # Nothing to assign. journey is null; downstream tagger will still
-            # emit pending_llm → skipped via metric eligibility check.
+        if not isinstance(journey, dict) or not journey:
+            return
+        if not candidates:
+            # The model placed a question we gave it no candidates for. There is
+            # no namespace to resolve against, so there is no safe value.
+            logger.warning("journey_assigned_without_candidates",
+                           extra={"qid": q_data.get("id")})
             return
 
-        # ---------- Validate stage_name against canon (V5) or legacy list ----------
+        by_leaf = {c.get("leaf_id"): c for c in candidates if c.get("leaf_id")}
+        leaf_id = journey.get("leaf_id")
+        leaf_id = leaf_id.strip() if isinstance(leaf_id, str) else None
+
         status = "assigned"
-        if use_v5 and canon_names:
-            if stage_value in canon_names:
-                pass  # exact match
-            elif stage_value.lower() in canon_lower:
-                stage_value = canon_lower[stage_value.lower()]  # case fix
-            else:
-                # Out-of-canon: downgrade to top-1 candidate, low confidence
-                fallback = (candidates or [{}])[0].get("stage_name") if candidates else None
-                if fallback:
-                    logger.warning(
-                        "journey_stage_out_of_canon",
-                        extra={"qid": q_data.get("id"),
-                               "llm_value": stage_value, "fallback": fallback},
-                    )
-                    stage_value = fallback
-                    status = "low_confidence_assigned"
-                    confidence = "low"
-                    evidence = (evidence + " | " if evidence else "") + \
-                        f"LLM emitted out-of-canon stage; defaulted to top-1 candidate"
-                else:
-                    # No candidates and out-of-canon — drop the assignment.
-                    logger.warning(
-                        "journey_stage_no_canon_match_no_candidates",
-                        extra={"qid": q_data.get("id"), "llm_value": stage_value},
-                    )
-                    return
-        elif not use_v5 and legacy_stage_list:
-            # Legacy v4 fuzzy match against industry list
-            stage_value = self._find_closest_in_list(stage_value, legacy_stage_list) or stage_value
+        confidence = str(journey.get("confidence") or "medium").lower().strip()
+        evidence = journey.get("evidence")
 
-        # ---------- Validate sub_stage_name; deterministic fallback when missing ----------
-        if not sub_value or not self._is_word_count_ok(sub_value, max_w=6):
-            sub_value = f"Other {stage_value}"
-            if status == "assigned":
-                status = "low_confidence_assigned"
-                if not evidence:
-                    evidence = "LLM omitted sub_stage_name; defaulted from stage."
+        chosen = by_leaf.get(leaf_id) if leaf_id else None
+        if chosen is None:
+            # Tolerate a model that named the moment instead of copying the id,
+            # then fall back to the ranking.
+            chosen = self._match_candidate_by_name(journey, candidates)
+            if chosen is None:
+                chosen = candidates[0]
+                logger.warning(
+                    "journey_leaf_unresolved",
+                    extra={"qid": q_data.get("id"), "llm_leaf_id": leaf_id,
+                           "fallback": chosen.get("leaf_id")},
+                )
+                evidence = (evidence + " | " if evidence else "") + (
+                    "LLM returned an unknown leaf_id; defaulted to the top-ranked "
+                    "candidate."
+                )
+            status = "low_confidence_assigned"
 
-        # ---------- Confidence → status escalation ----------
+        stage_value = chosen.get("stage_name")
+        if not stage_value:
+            return
+        sub_value = chosen.get("sub_stage_name") or None
+
+        # ---------- Confidence -> status escalation ----------
         if confidence in ("low", "none") and status == "assigned":
             status = "low_confidence_assigned"
 
         parsed["journey_stage"] = stage_value
+        parsed["journey_leaf_id"] = chosen.get("leaf_id")
+        # None is a real answer here: a one-level journey (EX lifecycle) has no
+        # sub-stage, and inventing one is what produced metric names in the
+        # sub_stage_name column under the canon path.
         parsed["sub_stage_name"] = sub_value
         parsed["journey_status"] = status
-        parsed["journey_confidence"] = confidence if confidence in ("high", "medium", "low", "none") else "medium"
+        parsed["journey_confidence"] = (
+            confidence if confidence in ("high", "medium", "low", "none") else "medium"
+        )
         if evidence:
             parsed["journey_evidence"] = evidence
-        if candidates:
-            parsed["journey_candidates"] = [
-                {"name": c.get("stage_name"), "score": c.get("score")}
-                for c in candidates
-            ]
+        # `leaf_id` rides along so a reader can tell WHICH candidate was picked.
+        # Name alone no longer identifies one: a two-level journey legitimately
+        # has several moments under the same stage.
+        parsed["journey_candidates"] = [
+            {"leaf_id": c.get("leaf_id"), "name": c.get("stage_name"),
+             "sub_stage": c.get("sub_stage_name"), "score": c.get("score")}
+            for c in candidates
+        ]
+
+    @staticmethod
+    def _match_candidate_by_name(journey: dict, candidates: list[dict]) -> dict | None:
+        """Second chance for a model that wrote names instead of the leaf_id.
+
+        Matches on the (stage, sub_stage) pair when both were given, else on
+        whichever single name was. Case-insensitive; no fuzzy matching — a near
+        miss goes to the ranking fallback, which is honest about being one.
+        """
+        stage = journey.get("stage_name")
+        sub = journey.get("sub_stage_name")
+        stage = stage.strip().lower() if isinstance(stage, str) else ""
+        sub = sub.strip().lower() if isinstance(sub, str) else ""
+        if not stage and not sub:
+            return None
+
+        for c in candidates:
+            c_stage = str(c.get("stage_name") or "").strip().lower()
+            c_sub = str(c.get("sub_stage_name") or "").strip().lower()
+            if stage and sub:
+                if c_stage == stage and c_sub == sub:
+                    return c
+            elif stage and c_stage == stage:
+                return c
+            elif sub and c_sub == sub:
+                return c
+        return None
 
     # ---------- Validation helpers ----------
 
@@ -393,17 +385,3 @@ class ResponseParser:
         logger.warning("no_close_match", extra={"value": value, "dimension": dimension})
         return None
 
-    def _find_closest_in_list(self, value: str, allowed: list[str]) -> str | None:
-        """Fuzzy match against an explicit list (used for industry-specific stages)."""
-        if not allowed:
-            return value
-        value_lower = value.lower().strip()
-        for av in allowed:
-            if av.lower() == value_lower:
-                return av
-        for av in allowed:
-            if value_lower in av.lower() or av.lower() in value_lower:
-                return av
-        logger.warning("journey_stage_no_match",
-                       extra={"value": value, "allowed": allowed})
-        return None

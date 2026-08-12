@@ -5,7 +5,7 @@
 # rendered per survey with the questions payload and is NEVER cached. Bump
 # `version` whenever the cached_preamble shape changes.
 
-version: "7.1"
+version: "8.0"
 description: "Question-level classification — topic_theme, sensitivity, flow, journey {stage,sub_stage}, visualization, dashboard, display_role."
 
 cached_preamble: |
@@ -16,21 +16,23 @@ cached_preamble: |
   - Impact on respondent experience (effort, sensitivity)
   - Role in the survey flow (reengagement, progress anchor, etc.)
   - Whether the question is a template/benchmark or a custom one-off
-  - For metric questions only: which canon stage and sub-stage describe the moment being measured
+  - For metric questions only: which journey moment (stage and sub-stage) is being measured
   - The best visualization type for displaying responses
   - Which dashboards the question belongs on
   - The display role (Primary KPI vs Supporting vs Detail)
 
   Rules for the `journey` block (metric questions ONLY — `is_journey_metric=true`):
-  - The question's input includes a ranked list of `candidates` — these are tenant-specific canonical stages with name, description, and customer_goal. Pick `stage_name` EXACTLY from this candidate list.
+  - The question's input includes a ranked list of `candidates`. These are the tenant's OWN journey moments, read from their profile — each has a `leaf_id`, a `stage_name`, a `sub_stage_name` (may be null), a description and a goal.
+  - You SELECT a candidate; you do not write stage text. Return its `leaf_id` verbatim. Both `journey_stage` and `sub_stage_name` are resolved from that id, so a moment can never be recorded under a name the tenant does not use.
   - Use the SURVEY title and SECTION header to disambiguate when the question text is generic (e.g. "Please rate your level of agreement..."). Survey-level context wins over individual question wording when they conflict.
-  - `sub_stage_name` is a 2-5 word Title Case label describing what the metric specifically measures (e.g. "Appointment Booking", "Reception Helpfulness", "Discharge Coordination"). It is a BUSINESS CONCEPT/TOUCHPOINT — never a topic theme, never the raw question title.
+  - The candidates are ranked by embedding similarity, NOT by correctness. The top-ranked candidate is a suggestion — read all of them and pick the moment the question actually measures.
   - `confidence` is your assessment of the assignment quality:
-      "high"   — survey title + question text + candidates align unambiguously
+      "high"   — survey title + question text + candidate align unambiguously
       "medium" — multiple candidates plausible; you picked the strongest
       "low"    — uncertain; question text is generic or candidate scores were close
-      "none"   — none of the candidates fits; pick the closest with low and a clear evidence sentence
-  - ALWAYS emit a non-null `sub_stage_name` whenever you set `stage_name`. Never null both — if you set stage, you must label the moment.
+      "none"   — none of the candidates fits the moment being measured
+  - If `confidence` would be "none", set the entire `journey` to null instead of forcing a pick. An unplaced metric is a correct answer; a metric filed under the wrong moment corrupts the tenant's journey rollup.
+  - If a journey-eligible question has NO `candidates` list, set its `journey` to null. It means nothing in this tenant's journey scored close enough to that question.
   - For non-metric questions (`is_journey_metric=false`), set the entire `journey` to null.
   - Dashboard names MUST be chosen from the project-level dashboard routing list provided. Only add a custom dashboard name if NO provided dashboard is suitable.
 
@@ -57,10 +59,9 @@ cached_preamble: |
     "flow_respondent_experience": "{{ flow_exp | join(' | ') }}",
     "flow_reusability": "{{ flow_reuse | join(' | ') }}",
     "journey": null OR {
-      "stage_name":     "<EXACT name from this question's `candidates` list>",
-      "sub_stage_name": "<2-5 word Title Case business concept (e.g. 'Appointment Booking')>",
-      "confidence":     "high|medium|low|none",
-      "evidence":       "<one short sentence justifying the choice>"
+      "leaf_id":    "<EXACT leaf_id copied from this question's `candidates` list>",
+      "confidence": "high|medium|low",
+      "evidence":   "<one short sentence justifying the choice>"
     },
     "visualization_type": "{{ viz | join(' | ') }}",
     "dashboard_names": ["pick from project-level dashboards; do not invent"],
@@ -79,15 +80,12 @@ user_prompt: |
 
   {{ tenant_profile_block }}
   {%- endif %}
-  {%- if canon_note %}
+  {%- if journey_note %}
 
-  {{ canon_note }}
-  {%- elif legacy_stage_list %}
+  {{ journey_note }}
+  {%- else %}
 
-  Industry-specific journey stages (pick journey.stage_name from THIS list for journey-eligible metric questions):
-  {% for s in legacy_stage_list -%}
-    - {{ s }}
-  {% endfor %}
+  No journey source is available for this tenant — set `journey` to null on EVERY question.
   {%- endif %}
 
   Project-level dashboard routing (pick dashboard_names from THIS list):

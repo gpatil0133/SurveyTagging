@@ -11,6 +11,7 @@ from models.survey import QuestionContext, SurveyMeta
 from models.signals import DirectorySignals, InvitationSignals, ResponseStats
 from models.tenant_profile import TenantProfile
 from models.tenant_canon import TenantCanon
+from models.journey import ProfileJourney
 
 if TYPE_CHECKING:
     from llm.embeddings import CanonEmbeddingIndex
@@ -53,13 +54,20 @@ class UnifiedContext(BaseModel):
     # these; the disk pipeline leaves them empty and uses `tenant_profile`.
     overrides: ManualOverrides = Field(default_factory=ManualOverrides)
     tenant_profile: TenantProfile | None = None
-    # V5: tenant canon + embeddings, loaded once per tenant in the
-    # orchestrator and attached here for every survey of that tenant.
-    # Both are optional: tenants without a canon fall back to the
-    # legacy industry-template path inside the prompt builder.
-    # `tenant_canon` / `canon_embeddings` hold the CX canon; the `_ex` pair
-    # holds the EX (employee-lifecycle) canon. Use `canon_for(project_type)`
-    # to pick the right one for a survey.
+    # Journey source (v8): read straight off `tenant_profile/` once per tenant
+    # in the orchestrator and attached here for every survey of that tenant.
+    # `profile_journey` / `journey_index` hold CX; the `_ex` pair holds the
+    # employee lifecycle. Use `journey_for(project_type)` to pick per survey.
+    # Both are optional — a tenant with no profile gets no journey tags rather
+    # than generic ones.
+    profile_journey: ProfileJourney | None = None
+    journey_index: Any | None = None  # llm.profile_journey.JourneyIndex
+    profile_journey_ex: ProfileJourney | None = None
+    journey_index_ex: Any | None = None  # llm.profile_journey.JourneyIndex
+    # PARKED (v5-v7): the tenant-canon layer. Left on the model so previously
+    # persisted artifacts and existing callers still construct, but nothing in
+    # the pipeline populates or reads these now — the journey dimensions are
+    # sourced from the profile above. See `llm/tenant_canon.py`.
     tenant_canon: TenantCanon | None = None
     canon_embeddings: Any | None = None  # llm.embeddings.CanonEmbeddingIndex
     tenant_canon_ex: TenantCanon | None = None
@@ -112,12 +120,22 @@ class UnifiedContext(BaseModel):
         """Nearest section header (CM question title) preceding `q`. "" if none."""
         return self.section_for_qid.get(q.question_id, "")
 
-    def canon_for(self, project_type: str | None) -> tuple[TenantCanon | None, Any | None]:
-        """Return (canon, embeddings) for a survey given its project_type.
+    def journey_for(self, project_type: str | None) -> tuple[ProfileJourney | None, Any | None]:
+        """Return (journey, index) for a survey given its project_type.
 
-        EX surveys ground journey stages against the employee-lifecycle canon;
-        every other project type uses the CX canon. Falls back to the CX canon
-        when the EX canon is missing so EX surveys stay runnable.
+        EX surveys ground against the employee lifecycle; every other project
+        type uses the CX journey. Falls back to CX when the EX side of the
+        profile is missing, so an EX survey under a CX-only profile still gets
+        placed rather than dropped.
+        """
+        if (project_type or "").strip().upper() == "EX" and self.profile_journey_ex is not None:
+            return self.profile_journey_ex, self.journey_index_ex
+        return self.profile_journey, self.journey_index
+
+    def canon_for(self, project_type: str | None) -> tuple[TenantCanon | None, Any | None]:
+        """PARKED — the canon layer is no longer populated. Kept so existing
+        callers and tests resolve; returns whatever was passed in, which in the
+        live pipeline is always (None, None). Use `journey_for` instead.
         """
         if (project_type or "").strip().upper() == "EX" and self.tenant_canon_ex is not None:
             return self.tenant_canon_ex, self.canon_embeddings_ex

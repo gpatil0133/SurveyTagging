@@ -152,14 +152,17 @@ class PipelineOrchestrator:
         # survey loop opens its own scopes, so the two never nest and each
         # survey's cost stays its own.
         with usage_log.scope("tenant", tenant_id=tenant_id, unit="tenant_tags"):
-            # V5: load tenant canon + embeddings for BOTH journey types. The right
-            # one is selected per survey by project_type (EX surveys use the EX
-            # canon, everything else uses CX) inside the LLM enhancement step.
-            tenant_canon, canon_embeddings = self._load_tenant_canon(tenant_id, tenant_profile, "CX")
-            tenant_canon_ex, canon_embeddings_ex = self._load_tenant_canon(tenant_id, tenant_profile, "EX")
+            # V8: build the journey source for BOTH types straight from the
+            # tenant profile. No LLM call and no artifact — the right one is
+            # selected per survey by project_type (EX surveys use the employee
+            # lifecycle, everything else CX) inside the LLM enhancement step.
+            profile_journey, journey_index = self._load_profile_journey(
+                tenant_id, tenant_profile, "CX")
+            profile_journey_ex, journey_index_ex = self._load_profile_journey(
+                tenant_id, tenant_profile, "EX")
             usage_log.annotate(
-                has_canon_cx=tenant_canon is not None,
-                has_canon_ex=tenant_canon_ex is not None,
+                has_journey_cx=profile_journey is not None,
+                has_journey_ex=profile_journey_ex is not None,
                 has_profile=tenant_profile is not None,
             )
 
@@ -194,8 +197,8 @@ class PipelineOrchestrator:
         records = self._tag_surveys(
             surveys, survey_dir_base, tenant_dir, tenant_id,
             dir_signals, config_dir,
-            tenant_profile, tenant_canon, canon_embeddings, force,
-            tenant_canon_ex, canon_embeddings_ex,
+            tenant_profile, profile_journey, journey_index, force,
+            profile_journey_ex, journey_index_ex,
         )
 
         stats = {"processed": 0, "skipped": 0, "failed": 0, "surveys": []}
@@ -213,8 +216,8 @@ class PipelineOrchestrator:
     def _tag_surveys(
         self, surveys, survey_dir_base, tenant_dir, tenant_id,
         dir_signals, config_dir,
-        tenant_profile, tenant_canon, canon_embeddings, force,
-        tenant_canon_ex=None, canon_embeddings_ex=None,
+        tenant_profile, profile_journey, journey_index, force,
+        profile_journey_ex=None, journey_index_ex=None,
     ) -> list[dict]:
         """Dispatch survey tagging sequentially or in a bounded thread pool."""
         # Captured on THIS thread, which is still inside the request's context.
@@ -229,8 +232,8 @@ class PipelineOrchestrator:
             return self._tag_one_survey(
                 survey_no, survey_dir_base, tenant_dir, tenant_id,
                 dir_signals, config_dir,
-                tenant_profile, tenant_canon, canon_embeddings, force,
-                tenant_canon_ex, canon_embeddings_ex,
+                tenant_profile, profile_journey, journey_index, force,
+                profile_journey_ex, journey_index_ex,
             )
 
         max_workers = max(1, int(self.settings.max_concurrent_surveys))
@@ -241,7 +244,7 @@ class PipelineOrchestrator:
         # out. The lazy load is now lock-guarded, but loading it once up front
         # keeps the torch meta-tensor materialization off the worker threads
         # entirely and avoids N-1 workers blocking on the first load.
-        if canon_embeddings is not None and not self.settings.skip_llm:
+        if journey_index is not None and not self.settings.skip_llm:
             try:
                 from llm.embeddings import EmbeddingModel
                 EmbeddingModel.get(self.settings.embedding_model).encode(["warmup"])
@@ -258,8 +261,8 @@ class PipelineOrchestrator:
     def _tag_one_survey(
         self, survey_no, survey_dir_base, tenant_dir, tenant_id,
         dir_signals, config_dir,
-        tenant_profile, tenant_canon, canon_embeddings, force,
-        tenant_canon_ex=None, canon_embeddings_ex=None,
+        tenant_profile, profile_journey, journey_index, force,
+        profile_journey_ex=None, journey_index_ex=None,
     ) -> dict:
         """Tag one survey: change-check, process, write, mark. Returns a record.
 
@@ -296,10 +299,10 @@ class PipelineOrchestrator:
             try:
                 result = self._process_survey(
                     tenant_dir, tenant_id, survey_no, dir_signals, config_dir,
-                    tenant_profile, tenant_canon=tenant_canon,
-                    canon_embeddings=canon_embeddings,
-                    tenant_canon_ex=tenant_canon_ex,
-                    canon_embeddings_ex=canon_embeddings_ex,
+                    tenant_profile, profile_journey=profile_journey,
+                    journey_index=journey_index,
+                    profile_journey_ex=profile_journey_ex,
+                    journey_index_ex=journey_index_ex,
                     llm_client=self._worker_llm_client(),
                 )
                 output_path = self._write_output(tenant_id, survey_no, result)
@@ -396,88 +399,60 @@ class PipelineOrchestrator:
             artifact = load_tenant_tags(tenant_id, Path(self.settings.output_dir))
             return artifact.model_dump() if artifact else None
 
-    def _load_tenant_canon(
+    def _load_profile_journey(
         self,
         tenant_id: int,
         tenant_profile: TenantProfile | None,
         journey_type: str,
     ):
-        """Load (and lazily build) a tenant canon + embeddings for one journey type.
+        """Build the journey source + embedding index for one journey type.
 
         `journey_type` is "CX" or "EX". Returns
-        (TenantCanon | None, CanonEmbeddingIndex | None). Best-effort — any
-        failure logs and returns (None, None) so tagging falls back to the
-        legacy industry-stage list path.
+        (ProfileJourney | None, JourneyIndex | None).
+
+        Reads `tenant_profile/` directly — no LLM call, no canon artifact, no
+        share write. Both are None when the tenant has no profile for this
+        journey type, which leaves `journey_stage` / `sub_stage_name`
+        unassigned for the tenant's surveys. That is the intended behaviour:
+        the previous industry-template fallback produced generic stage names
+        that read as tenant-grounded and were not.
+
+        Best-effort — any failure logs and returns (None, None) rather than
+        failing the tenant run, since every other dimension is unaffected.
         """
-        if self.settings.skip_llm:
-            # No LLM available → can still load a previously-persisted canon,
-            # but skip the LLM-driven build path.
-            try:
-                from projections.tenant_canon_io import load_tenant_canon, tenant_canon_embeddings_path
-                from llm.embeddings import EmbeddingModel, build_index, load_embeddings
-                canon = load_tenant_canon(tenant_id, journey_type, Path(self.settings.output_dir))
-                if canon is None:
-                    return None, None
-                npz = tenant_canon_embeddings_path(tenant_id, journey_type, Path(self.settings.output_dir))
-                idx = load_embeddings(npz, canon)
-                if idx is None:
-                    embedder = EmbeddingModel.get(self.settings.embedding_model)
-                    idx = build_index(canon, embedder)
-                return canon, idx
-            except Exception as e:  # noqa: BLE001
-                logger.warning("tenant_canon_load_failed_skip_llm",
-                               extra={"tenant_id": tenant_id, "journey_type": journey_type,
-                                      "error": str(e)})
+        try:
+            from llm.profile_journey import build_journey_index, build_profile_journey
+
+            journey = build_profile_journey(tenant_id, tenant_profile, journey_type)
+            if journey is None:
+                logger.info(
+                    "profile_journey_unavailable",
+                    extra={"tenant_id": tenant_id, "journey_type": journey_type,
+                           "has_profile": tenant_profile is not None},
+                )
                 return None, None
 
-        try:
-            import asyncio
-            from llm.embeddings import EmbeddingModel, build_index, load_embeddings
-            from projections.tenant_canon_io import (
-                get_or_build_tenant_canon_async,
-                tenant_canon_embeddings_path,
-            )
+            if self.settings.skip_llm:
+                # The index only exists to rank candidates for the question LLM
+                # call. Without that call, embedding the leaves is pure cost.
+                return journey, None
 
-            industry = ""
-            corporate_purpose = ""
-            if tenant_profile is not None:
-                industry = (tenant_profile.industry_taxonomy_vertical
-                            or tenant_profile.industry_vertical or "")
-                corporate_purpose = tenant_profile.corporate_purpose or ""
-
-            embedder = None
+            # Embedding failure is scoped separately on purpose: the journey is
+            # still real, and reporting "this tenant has no journey" when the
+            # truth is "the embedding model would not load" sends whoever reads
+            # the evidence to the wrong system.
             try:
+                from llm.embeddings import EmbeddingModel
+
                 embedder = EmbeddingModel.get(self.settings.embedding_model)
+                return journey, build_journey_index(journey, embedder)
             except Exception as e:  # noqa: BLE001
-                logger.warning("embedder_init_failed",
-                               extra={"tenant_id": tenant_id, "error": str(e)})
-
-            loop = asyncio.new_event_loop()
-            try:
-                canon = loop.run_until_complete(get_or_build_tenant_canon_async(
-                    tenant_id=tenant_id,
-                    journey_type=journey_type,
-                    output_dir=Path(self.settings.output_dir),
-                    llm=self.llm_client,
-                    tenant_profile=tenant_profile,
-                    industry=industry,
-                    corporate_purpose=corporate_purpose,
-                    industry_stages_registry=self.industry_stages,
-                    embedder=embedder,
-                    embedding_model_name=self.settings.embedding_model,
-                    force=False,
-                ))
-            finally:
-                loop.close()
-
-            if embedder is None or canon is None:
-                return canon, None
-
-            npz = tenant_canon_embeddings_path(tenant_id, journey_type, Path(self.settings.output_dir))
-            idx = load_embeddings(npz, canon) or build_index(canon, embedder)
-            return canon, idx
+                logger.warning("journey_index_build_failed",
+                               extra={"tenant_id": tenant_id, "journey_type": journey_type,
+                                      "leaves": len(journey.leaves), "error": str(e)})
+                return journey, None
         except Exception as e:  # noqa: BLE001
-            logger.warning("tenant_canon_build_failed",
+            logger.warning("profile_journey_build_failed",
                            extra={"tenant_id": tenant_id, "journey_type": journey_type,
                                   "error": str(e)})
             return None, None
@@ -504,10 +479,10 @@ class PipelineOrchestrator:
         dir_signals,
         config_dir: Path,
         tenant_profile: TenantProfile | None = None,
-        tenant_canon=None,
-        canon_embeddings=None,
-        tenant_canon_ex=None,
-        canon_embeddings_ex=None,
+        profile_journey=None,
+        journey_index=None,
+        profile_journey_ex=None,
+        journey_index_ex=None,
         llm_client=None,
     ) -> TaggedSurvey:
         """Process a single survey through all pipeline stages.
@@ -523,10 +498,10 @@ class PipelineOrchestrator:
         context = assemble_context(
             tenant_dir, survey_no, tenant_id, dir_signals, config_dir,
             tenant_profile=tenant_profile,
-            tenant_canon=tenant_canon,
-            canon_embeddings=canon_embeddings,
-            tenant_canon_ex=tenant_canon_ex,
-            canon_embeddings_ex=canon_embeddings_ex,
+            profile_journey=profile_journey,
+            journey_index=journey_index,
+            profile_journey_ex=profile_journey_ex,
+            journey_index_ex=journey_index_ex,
         )
         logger.debug(
             "context_assembled",
@@ -536,7 +511,7 @@ class PipelineOrchestrator:
                 "questions": len(context.questions),
                 "non_cm_questions": len(context.non_cm_questions),
                 "has_responses": context.has_responses,
-                "has_tenant_canon": context.tenant_canon is not None,
+                "has_profile_journey": context.profile_journey is not None,
             },
         )
         # Enough shape on the ledger record to explain an outlier cost without

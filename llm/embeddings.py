@@ -196,6 +196,45 @@ def load_embeddings(path: Path, canon: TenantCanon) -> CanonEmbeddingIndex | Non
 # ---------- Scoring ----------
 
 
+def score_signatures(
+    signatures: Sequence[str],
+    index: CanonEmbeddingIndex,
+    embedder: EmbeddingModel,
+    top_k: int = 4,
+) -> list[list[tuple[CanonStage, float]]]:
+    """Batch form of `score_signature` — ONE `encode()` call for every signature.
+
+    Returns one ranked list per input, positionally aligned with `signatures`,
+    so the caller can zip results back onto its own inputs without filtering
+    first. Blank signatures yield an empty list rather than being dropped.
+
+    The transformer forward pass inside `encode()` dominates the cost here and
+    batches almost for free, so scoring a survey's questions one call at a time
+    is close to N times slower than scoring them together.
+    """
+    n = len(signatures)
+    if n == 0 or len(index.canon.stages) == 0 or index.vectors.size == 0:
+        return [[] for _ in range(n)]
+
+    out: list[list[tuple[CanonStage, float]]] = [[] for _ in range(n)]
+    scorable = [i for i, s in enumerate(signatures) if s and s.strip()]
+    if not scorable:
+        return out
+
+    matrix = embedder.encode([signatures[i] for i in scorable])  # (M, dim), L2-normalized
+    if matrix.size == 0:
+        return out
+
+    # Cosine = dot for L2-normalized vectors → (n_stages, M), one column per signature.
+    scores = (index.vectors @ matrix.T).astype(float)
+    k = min(top_k, len(index.canon.stages))
+    for col, i in enumerate(scorable):
+        col_scores = scores[:, col]
+        top_idx = np.argsort(col_scores)[::-1][:k]
+        out[i] = [(index.canon.stages[j], float(col_scores[j])) for j in top_idx]
+    return out
+
+
 def score_signature(
     signature: str,
     index: CanonEmbeddingIndex,
@@ -206,14 +245,8 @@ def score_signature(
 
     Returns a list of (stage, score) sorted descending by score. Scores are
     in [-1, 1] but typically [0.0, 0.8] for sensible inputs.
+
+    Single-signature convenience wrapper over `score_signatures`; kept as one
+    implementation so the batch and scalar paths cannot rank differently.
     """
-    if not signature.strip() or len(index.canon.stages) == 0 or index.vectors.size == 0:
-        return []
-    sig_vec = embedder.encode([signature])  # shape (1, dim), already L2-normalized
-    if sig_vec.size == 0:
-        return []
-    # Cosine = dot for L2-normalized vectors
-    scores = (index.vectors @ sig_vec[0]).astype(float)
-    k = min(top_k, len(index.canon.stages))
-    top_idx = np.argsort(scores)[::-1][:k]
-    return [(index.canon.stages[i], float(scores[i])) for i in top_idx]
+    return score_signatures([signature], index, embedder, top_k=top_k)[0]
