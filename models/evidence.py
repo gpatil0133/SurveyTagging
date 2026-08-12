@@ -94,10 +94,17 @@ def hybrid(
     components: list[dict[str, Any]],
     stage: int | None = None,
     inputs: dict[str, Any] | None = None,
+    quote: str | None = None,
 ) -> dict[str, Any]:
     """Several signals combined. Each component is `{source, detail?}` — the
-    UI chips them so a reader can see which inputs voted."""
-    ev = _base("hybrid", rule_id, detail, stage=stage, inputs=inputs, quote=None)
+    UI chips them so a reader can see which inputs voted.
+
+    `quote` is the span of source text the match was made against, same as the
+    other builders. It was missing here while `segment_dimensions` already
+    passed it, so every call raised TypeError and that tagger failed on every
+    question — the dimension was absent from all output rather than empty.
+    """
+    ev = _base("hybrid", rule_id, detail, stage=stage, inputs=inputs, quote=quote)
     ev["components"] = components
     return ev
 

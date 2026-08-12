@@ -588,7 +588,8 @@ async def delete_tenant_tags(
 
 
 # ====================================================================
-# §4  Tenant profile — org/cx/ex artifacts under {output_dir}/{t}/tenant_profile/
+# §4  Tenant profile — org/cx/ex artifacts under {data_dir}/{t}/tenant_profile/
+#     (an INPUT to tagging; `settings.profile_root`, not output_dir)
 #     The producer is chosen by `profile_source` (Parallel.ai research vs
 #     apismx), but the routes, paths and envelope shape are identical either
 #     way, so there is one section rather than two.
@@ -668,7 +669,7 @@ def _run_parallel_fetch(tenant_id: int, website: str, agents: tuple[str, ...], f
     client = _build_parallel_client()
     spec = TenantSpec(tenant_id=tenant_id, website_url=website, agents=DEFAULT_AGENTS)
     result = run_batch(
-        specs=[spec], output_dir=Path(_settings.output_dir), client=client, force=force,
+        specs=[spec], output_dir=_settings.profile_root, client=client, force=force,
         only=agents if set(agents) != set(_PARALLEL_AGENTS) else None, skip=(),
     )
     return _summarize_batch(result)
@@ -691,7 +692,7 @@ def _run_smx_fetch(tenant_id: int, website: str, agents: tuple[str, ...],
     try:
         with client:
             outcome = resolve_tenant_profile(
-                tenant_id, Path(_settings.output_dir), client,
+                tenant_id, _settings.profile_root, client,
                 website_url=website, agents=agents, force=force,
                 allow_generate=allow_generate and _settings.smx_allow_generate,
                 poll_attempts=_settings.smx_generate_poll_attempts,
@@ -755,7 +756,7 @@ def _bearer(authorization: str | None) -> str:
 
 def _agent_artifact_path(tenant_id: int, agent: str) -> Path:
     from tenant_profile.runner import artifact_path
-    return artifact_path(tenant_id, agent, Path(_settings.output_dir))
+    return artifact_path(tenant_id, agent, _settings.profile_root)
 
 
 def _run_smx_diagnose(tenant_id: int, token: str) -> dict:
@@ -918,7 +919,7 @@ async def get_tenant_profile(
     """Summary of on-disk Parallel.ai artifacts for a tenant."""
     tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     from models.tenant_profile import TenantProfile
-    profile = TenantProfile.load(tenant_id, Path(_settings.output_dir))
+    profile = TenantProfile.load(tenant_id, _settings.profile_root)
     if profile is None or profile.is_empty:
         raise HTTPException(
             404,
@@ -1010,7 +1011,7 @@ async def delete_tenant_profile(
 ) -> dict:
     """Delete all Parallel.ai artifacts for a tenant."""
     tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
-    profile_dir = Path(_settings.output_dir) / str(tenant_id) / "tenant_profile"
+    profile_dir = _settings.profile_root / str(tenant_id) / "tenant_profile"
     removed: list[str] = []
     if not sharefs.exists(profile_dir):
         return {"tenant_id": tenant_id, "removed": []}
@@ -1018,7 +1019,7 @@ async def delete_tenant_profile(
         path = _agent_artifact_path(tenant_id, agent)
         if sharefs.exists(path):
             sharefs.unlink(path)
-            removed.append(str(path.relative_to(Path(_settings.output_dir))))
+            removed.append(str(path.relative_to(_settings.profile_root)))
     return {"tenant_id": tenant_id, "removed": removed}
 
 

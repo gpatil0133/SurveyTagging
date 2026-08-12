@@ -134,7 +134,7 @@ class PipelineOrchestrator:
         # Parallel.ai-derived profile (org/cx/ex artifacts). May be None when the
         # fetcher hasn't been run for this tenant — downstream code falls back
         # to directory / survey signals in that case.
-        tenant_profile = TenantProfile.load(tenant_id, Path(self.settings.output_dir))
+        tenant_profile = TenantProfile.load(tenant_id, self.settings.profile_root)
         if tenant_profile is not None:
             logger.info(
                 "tenant_profile_loaded",
@@ -387,7 +387,7 @@ class PipelineOrchestrator:
 
         with usage_log.scope("tenant", tenant_id=tenant_id, unit="tenant_tags_only"):
             tenant_dir = Path(self.settings.data_dir) / str(tenant_id)
-            tenant_profile = TenantProfile.load(tenant_id, Path(self.settings.output_dir))
+            tenant_profile = TenantProfile.load(tenant_id, self.settings.profile_root)
             usage_log.annotate(has_profile=tenant_profile is not None)
             self._tag_tenant(tenant_id, tenant_profile)
             self.change_detector.tenant_mark_processed(

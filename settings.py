@@ -369,6 +369,22 @@ class Settings(BaseSettings):
         self.output_dir = self.share_root
         return self
 
+    @property
+    def profile_root(self) -> Path:
+        """Root holding `{tenant}/tenant_profile/{org,cx,ex}.json`.
+
+        The Parallel.ai artifacts are an **input** to tagging — the share layout
+        lists them next to CorporateData and Directory/, not beside the files
+        the pipeline generates — so they hang off `data_dir`, not `output_dir`.
+
+        On the share the distinction is invisible (`share_root` sets both to the
+        same path), which is why the two were interchangeable for so long. They
+        diverge locally, and reading profiles from `output_dir` there made
+        `TenantProfile.load` return None: every tenant tag fell to its no-profile
+        branch and canon derivation silently dropped to `industry_template`.
+        """
+        return Path(self.data_dir)
+
     @model_validator(mode="after")
     def _derive_sogo_urls_from_host(self) -> "Settings":
         """When `sogo_host` is set, rewrite any apicx/apipmx URL still on its

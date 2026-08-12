@@ -134,12 +134,22 @@ class ChangeDetector:
         output_dir: Path | None,
         tenant_id: int,
     ) -> str:
-        """Hash over tenant-level inputs (directory + profile)."""
+        """Hash over tenant-level inputs (directory + profile).
+
+        The profile is read from `tenant_dir`, not `output_dir`: it is an input
+        living beside CorporateData and Directory/ (see `settings.profile_root`).
+        The two are the same path under SHARE_ROOT, which is why the old
+        output_dir spelling worked in deployment — but locally it pointed at a
+        directory that no longer holds profiles, so a profile change stopped
+        invalidating the surveys that depend on it.
+
+        `output_dir` is kept in the signature because callers pass it
+        positionally; it is deliberately not consulted here.
+        """
         parts = [
             _dir_token(tenant_dir / "Directory"),
+            _dir_token(tenant_dir / "tenant_profile"),
         ]
-        if output_dir is not None:
-            parts.append(_dir_token(Path(output_dir) / str(tenant_id) / "tenant_profile"))
         return _short("|".join(parts))
 
     # ---------- survey-level change API ----------

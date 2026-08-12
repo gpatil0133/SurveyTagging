@@ -172,7 +172,7 @@ def profile_show(tenant: int, agent_type: str, raw: bool) -> None:
     """Print a tenant profile artifact to stdout."""
     settings = Settings()
     from tenant_profile.runner import artifact_path, load_artifact
-    path = artifact_path(tenant, agent_type.lower(), Path(settings.output_dir))  # type: ignore[arg-type]
+    path = artifact_path(tenant, agent_type.lower(), settings.profile_root)  # type: ignore[arg-type]
     envelope = load_artifact(path)
     if envelope is None:
         click.echo(f"No artifact at {path}", err=True)
