@@ -67,6 +67,21 @@ def _accepts_temperature(model: str, temperature: float) -> bool:
         return True
 
 
+# How many times to re-ask when the model returns a 200 whose body will not
+# parse as JSON. Two, not three: at temperature 0.1 a third identical attempt
+# almost never differs, and this is the one failure litellm cannot see (to it,
+# an unparseable response is a success).
+_PARSE_ATTEMPTS = 2
+
+
+class TruncatedResponseError(RuntimeError):
+    """The model stopped at `max_tokens`, so the JSON is cut mid-object.
+
+    Distinct from a transient failure because retrying the identical request
+    reproduces it exactly — the caller must shrink the request instead.
+    """
+
+
 def _cache_tokens(usage) -> tuple[int, int]:
     """Pull (cache_read, cache_write) out of a litellm usage block.
 
@@ -102,6 +117,7 @@ class LLMClient:
         rate_limit_rpm: int = 50,
         cache_dir: Path | None = None,
         use_prompt_caching: bool = True,
+        num_retries: int = 2,
     ) -> None:
         self.model = model
         self.temperature = temperature
@@ -110,6 +126,7 @@ class LLMClient:
         self._semaphore = asyncio.Semaphore(max(1, rate_limit_rpm // 10))
         self.cache = LLMCache(cache_dir) if cache_dir else None
         self.use_prompt_caching = use_prompt_caching
+        self.num_retries = max(0, int(num_retries))
 
     async def complete(
         self,
@@ -166,51 +183,60 @@ class LLMClient:
                          extra={"cache_key": cache_key, "call_type": call_type,
                                 "prompt_version": prompt_version})
 
-        last_error = None
-        for attempt in range(3):
+        # Only unparseable JSON is retried here. Transport failures (429, 5xx,
+        # timeouts, connection errors) are litellm's job via `num_retries`: it
+        # can read the provider's `retry-after` header and this loop cannot, and
+        # retrying in both places would multiply attempts (outer x inner).
+        for attempt in range(1, _PARSE_ATTEMPTS + 1):
             try:
                 async with self._semaphore:
                     response = await self._call_llm(
                         prompt, system_prompt, cached_system_preamble,
-                        call_type=call_type, attempt=attempt + 1,
+                        call_type=call_type, attempt=attempt,
                     )
-
-                if response is None:
-                    logger.debug("llm_empty_response",
-                                 extra={"attempt": attempt + 1, "call_type": call_type})
-                    continue
-
-                logger.debug("llm_response_received",
-                             extra={"attempt": attempt + 1, "call_type": call_type,
-                                    "response_chars": len(response)})
-
-                parsed = self._extract_json(response)
-                if parsed is not None:
-                    if self.cache and cache_key:
-                        self.cache.put(cache_key, call_type, parsed, prompt_version=prompt_version)
-                    logger.debug("llm_response_parsed",
-                                 extra={"call_type": call_type,
-                                        "top_level_keys": list(parsed.keys())[:20]})
-                    return parsed
-
-                logger.warning("llm_json_parse_failed",
-                               extra={"attempt": attempt + 1,
-                                      "response_preview": response[:200]})
-
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    "llm_call_failed attempt=%d error=%s: %s",
-                    attempt + 1, type(e).__name__, e,
-                    extra={"attempt": attempt + 1, "error": str(e)},
+            except TruncatedResponseError as e:
+                # The same request truncates at the same place every time.
+                logger.error(
+                    "llm_response_truncated call_type=%s: %s",
+                    call_type, e,
+                    extra={"call_type": call_type, "max_tokens": self.max_tokens},
                 )
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
+                return None
+            except Exception as e:  # noqa: BLE001
+                # Already retried `num_retries` times inside litellm, honouring
+                # retry-after. Anything still failing here is terminal — a 400 or
+                # a 401 would fail identically however often we repeated it.
+                logger.error(
+                    "llm_call_failed call_type=%s error=%s: %s",
+                    call_type, type(e).__name__, e,
+                    extra={"call_type": call_type, "error": str(e),
+                           "num_retries": self.num_retries},
+                )
+                return None
+
+            if response is None:
+                # `_call_llm` only returns None when litellm is missing.
+                logger.error("llm_no_response", extra={"call_type": call_type})
+                return None
+
+            parsed = self._extract_json(response)
+            if parsed is not None:
+                if self.cache and cache_key:
+                    self.cache.put(cache_key, call_type, parsed, prompt_version=prompt_version)
+                logger.debug("llm_response_parsed",
+                             extra={"call_type": call_type, "attempt": attempt,
+                                    "top_level_keys": list(parsed.keys())[:20]})
+                return parsed
+
+            logger.warning("llm_json_parse_failed",
+                           extra={"attempt": attempt, "of": _PARSE_ATTEMPTS,
+                                  "call_type": call_type,
+                                  "response_preview": response[:200]})
 
         logger.error(
-            "llm_all_retries_failed call_type=%s last_error=%s: %s",
-            call_type, type(last_error).__name__ if last_error else "None", last_error,
-            extra={"error": str(last_error), "call_type": call_type},
+            "llm_unparseable_after_retries call_type=%s attempts=%d",
+            call_type, _PARSE_ATTEMPTS,
+            extra={"call_type": call_type, "attempts": _PARSE_ATTEMPTS},
         )
         return None
 
@@ -283,6 +309,11 @@ class LLMClient:
             if send_temperature:
                 kwargs["temperature"] = self.temperature
 
+            # litellm owns transport retries: it sees the status code and the
+            # provider's retry-after header, neither of which reaches our loop.
+            if self.num_retries:
+                kwargs["num_retries"] = self.num_retries
+
             logger.debug(
                 "litellm_request",
                 extra={"model": self.model, "is_anthropic": is_anthropic,
@@ -328,6 +359,16 @@ class LLMClient:
                 cache_read_tokens=cache_read, cache_write_tokens=cache_write,
                 cost_usd=usage_log.estimate_cost(response, in_tok, out_tok),
             )
+
+            # A truncated response is not a transient failure: the same request
+            # truncates at the same place every time, so retrying spends three
+            # full-price calls to fail identically. Raise a distinct error the
+            # retry loop refuses to retry.
+            if getattr(response.choices[0], "finish_reason", None) == "length":
+                raise TruncatedResponseError(
+                    f"{call_type} response hit max_tokens ({self.max_tokens}); "
+                    f"lower question_batch_size or raise llm_max_tokens"
+                )
 
             return response.choices[0].message.content
 

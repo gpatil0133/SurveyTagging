@@ -66,6 +66,7 @@ def build_llm_client(settings: Settings, *, skip_llm: bool | None = None):
             rate_limit_rpm=settings.llm_rate_limit_rpm,
             cache_dir=settings.cache_dir,
             use_prompt_caching=settings.llm_use_prompt_caching,
+            num_retries=settings.llm_num_retries,
         )
         logger.info("llm_client_configured",
                     extra={"model": settings.llm_model,

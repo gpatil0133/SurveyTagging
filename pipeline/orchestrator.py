@@ -189,6 +189,18 @@ class PipelineOrchestrator:
 
         surveys = self._discover_surveys(survey_dir_base, survey_nos)
 
+        # The tenant half of every survey's composite hash, computed ONCE for
+        # the whole run. It recursively walks Directory/ and content-reads each
+        # tenant_profile/*.json, so leaving it to the per-survey path cost 2N
+        # walks of files that cannot change while the run is in flight (N for
+        # the is_unchanged probes, N more for the mark_processed writes).
+        # Threading one value in also guarantees the two agree: computing it
+        # twice around a profile write would store a hash the next run cannot
+        # reproduce, and the survey would re-tag forever.
+        tenant_hash = self.change_detector.compute_tenant_hash(
+            tenant_dir, Path(self.settings.output_dir), tenant_id
+        )
+
         # Tag each survey. Bounded parallelism when max_concurrent_surveys > 1
         # AND there's more than one survey; otherwise sequential. The change
         # detector is thread-safe and per-survey output files are independent,
@@ -199,6 +211,7 @@ class PipelineOrchestrator:
             dir_signals, config_dir,
             tenant_profile, profile_journey, journey_index, force,
             profile_journey_ex, journey_index_ex,
+            tenant_hash=tenant_hash,
         )
 
         stats = {"processed": 0, "skipped": 0, "failed": 0, "surveys": []}
@@ -218,6 +231,7 @@ class PipelineOrchestrator:
         dir_signals, config_dir,
         tenant_profile, profile_journey, journey_index, force,
         profile_journey_ex=None, journey_index_ex=None,
+        tenant_hash=None,
     ) -> list[dict]:
         """Dispatch survey tagging sequentially or in a bounded thread pool."""
         # Captured on THIS thread, which is still inside the request's context.
@@ -234,6 +248,7 @@ class PipelineOrchestrator:
                 dir_signals, config_dir,
                 tenant_profile, profile_journey, journey_index, force,
                 profile_journey_ex, journey_index_ex,
+                tenant_hash=tenant_hash,
             )
 
         max_workers = max(1, int(self.settings.max_concurrent_surveys))
@@ -244,12 +259,14 @@ class PipelineOrchestrator:
         # out. The lazy load is now lock-guarded, but loading it once up front
         # keeps the torch meta-tensor materialization off the worker threads
         # entirely and avoids N-1 workers blocking on the first load.
+        #
+        # Under the API the lifespan already warmed it on a background thread,
+        # so this is a no-op returning immediately. It still matters for the
+        # headless paths (scheduler, tests, any direct orchestrator use) that
+        # never run a lifespan.
         if journey_index is not None and not self.settings.skip_llm:
-            try:
-                from llm.embeddings import EmbeddingModel
-                EmbeddingModel.get(self.settings.embedding_model).encode(["warmup"])
-            except Exception as e:  # noqa: BLE001 — best-effort; load is also lazy
-                logger.warning("embedding_prewarm_failed", extra={"error": str(e)})
+            from llm.embeddings import EmbeddingModel
+            EmbeddingModel.warm(self.settings.embedding_model)
 
         from concurrent.futures import ThreadPoolExecutor
         logger.info("tenant_parallel_tagging",
@@ -263,6 +280,7 @@ class PipelineOrchestrator:
         dir_signals, config_dir,
         tenant_profile, profile_journey, journey_index, force,
         profile_journey_ex=None, journey_index_ex=None,
+        tenant_hash=None,
     ) -> dict:
         """Tag one survey: change-check, process, write, mark. Returns a record.
 
@@ -279,6 +297,7 @@ class PipelineOrchestrator:
             if not force and self.change_detector.is_unchanged(
                 tenant_id, survey_no, survey_dir,
                 tenant_dir=tenant_dir, output_dir=output_dir,
+                tenant_hash=tenant_hash,
             ):
                 # "Inputs unchanged" only justifies a skip while the *output* of
                 # the last run still exists. It can vanish independently of the
@@ -312,6 +331,7 @@ class PipelineOrchestrator:
                     self.change_detector.mark_processed(
                         tenant_id, survey_no, survey_dir,
                         tenant_dir=tenant_dir, output_dir=output_dir,
+                        tenant_hash=tenant_hash,
                     )
                 else:
                     logger.warning(

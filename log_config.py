@@ -47,6 +47,17 @@ _UVICORN_LOGGERS = ("uvicorn.access", "uvicorn.error")
 # it instead of opening a second handle on the same file.
 _file_handler: logging.Handler | None = None
 
+# Third-party loggers that are INFO-chatty enough to drown the log. smbprotocol
+# narrates every SMB2 Create/Read/Close at INFO — one survey's tagging produced
+# 49 of them, and they were 22% of all lines in app.log. The share round trips
+# they describe are already summarized by our own events, and DEBUG still gets
+# them back when a share problem actually needs tracing.
+_NOISY_LOGGERS = {
+    "smbprotocol": logging.WARNING,
+    "smbclient": logging.WARNING,
+    "spnego": logging.WARNING,
+}
+
 
 class RetainingRotatingFileHandler(logging.handlers.RotatingFileHandler):
     """RotatingFileHandler that prunes aged-out logs after each rollover.
@@ -98,7 +109,13 @@ def configure_logging(
     it to get `logs/app.log` and the JSONL ledger; without it this behaves
     exactly as before — stderr only.
 
-    Safe to call once at process start; re-attaching is idempotent.
+    Safe to call more than once: the file handler is created at most once per
+    process and re-attaching is a no-op. That is not a theoretical nicety —
+    `python api.py` imports this module twice (once as `__main__`, then again as
+    `api` when `uvicorn.run("api:app")` resolves the import string), so this
+    function genuinely runs twice in one process. Without the guard the second
+    call added a SECOND handler on the same file and every line from then on was
+    written to app.log twice: 73.7% of the log was duplicate lines.
     """
     global _file_handler
 
@@ -117,7 +134,24 @@ def configure_logging(
         handler.setLevel(log_level)
         root.addHandler(handler)
 
+    # Chatty third-party loggers are capped regardless of our own level, and
+    # only when our level is above DEBUG — asking for DEBUG means you want the
+    # SMB frames back.
+    if log_level > logging.DEBUG:
+        for name, noisy_level in _NOISY_LOGGERS.items():
+            logging.getLogger(name).setLevel(noisy_level)
+
     if settings is None:
+        return
+
+    # Second call in the same process (see the docstring): the handler already
+    # exists and is already on root. Re-point its level/formatter and stop.
+    if _file_handler is not None:
+        _file_handler.setFormatter(formatter)
+        _file_handler.setLevel(log_level)
+        if _file_handler not in root.handlers:
+            root.addHandler(_file_handler)
+        attach_uvicorn_handlers()
         return
 
     log_dir = Path(settings.log_dir)

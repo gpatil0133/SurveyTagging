@@ -109,12 +109,17 @@ class AutoRetagScheduler:
                     logger.warning("autoretag_tenant_tags_failed",
                                    extra={"tenant_id": tenant_id, "error": str(e)})
 
-            # Surveys: re-tag those whose composite inputs changed.
+            # Surveys: re-tag those whose composite inputs changed. The tenant
+            # half of the hash is computed once for the whole tenant — the scan
+            # walks every survey of every tenant, so recomputing it per survey
+            # made the periodic scan the heaviest reader on the share.
+            tenant_hash = cd.compute_tenant_hash(tdir, output_dir, tenant_id)
             changed = []
             for sno in discovery.list_survey_nos(data_dir, tenant_id):
                 sdir = discovery.survey_dir(data_dir, tenant_id, sno)
                 if force or not cd.is_unchanged(tenant_id, sno, sdir,
-                                                tenant_dir=tdir, output_dir=output_dir):
+                                                tenant_dir=tdir, output_dir=output_dir,
+                                                tenant_hash=tenant_hash):
                     changed.append(sno)
             if changed:
                 # One orchestrator run covers the changed surveys (bounded-parallel).

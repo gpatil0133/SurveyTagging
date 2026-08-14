@@ -87,11 +87,41 @@ def _build_tenant_profile_block(profile: TenantProfile | None) -> str:
     return "\n".join(lines)
 
 
+# Project dimensions the LLM assigns, in the order the guide renders them.
+_PROJECT_GUIDE_DIMS = (
+    "relationship_type", "project_purpose", "industry_vertical",
+    "audience_type", "survey_sub_type", "dashboard_routing",
+)
+
+
+def _dimension_guide(taxonomy: TaxonomyRegistry, dimensions) -> list[dict]:
+    """Plain-language meaning of each dimension, sourced from the taxonomy.
+
+    The schema block lists bare enum names; this says what the dimension *is*,
+    so the model is choosing between described concepts rather than guessing
+    from labels. Sourced from `taxonomy.yaml` rather than restated here so the
+    prompt and the docs cannot drift apart.
+
+    Stable per taxonomy, so it belongs in the cached preamble — where it also
+    lifts that preamble over the providers' 1024-token minimum cacheable
+    prefix. Below that, `cache_control` is silently ignored.
+    """
+    guide = []
+    for name in dimensions:
+        dim = taxonomy.get_dimension(name)
+        if dim is None:
+            continue
+        text = (dim.explanation or dim.description or "").strip()
+        if text:
+            guide.append({"name": name, "text": text})
+    return guide
+
+
 def _project_cached_context(taxonomy: TaxonomyRegistry) -> dict:
     """Stable context for the project_tagging cached_preamble.
 
     Inputs here MUST be deterministic per-process — same taxonomy → same
-    rendered string → Anthropic ephemeral cache hits.
+    rendered string → prompt-cache hits.
     """
     canonical_dashboards = taxonomy.get_dimension("dashboard_routing")
     dashboard_list = canonical_dashboards.canonical_values if canonical_dashboards else []
@@ -102,6 +132,7 @@ def _project_cached_context(taxonomy: TaxonomyRegistry) -> dict:
         "audiences":          taxonomy.get_allowed_values("audience_type"),
         "sub_types":          taxonomy.get_allowed_values("survey_sub_type"),
         "canonical_dashboards": dashboard_list,
+        "dimension_guide":    _dimension_guide(taxonomy, _PROJECT_GUIDE_DIMS),
     }
 
 
@@ -200,6 +231,61 @@ def build_project_prompt(
         cached_context=_project_cached_context(taxonomy),
         user_context=user_context,
     )
+
+
+# Output field -> (accumulator dimension, confidence at or above which
+# `_apply_question_llm_results` discards the model's answer).
+#
+# These mirror the merge rules exactly. `dashboard_placement` and the journey
+# block are deliberately absent: both are written regardless of the prior tag's
+# confidence, so their answers are never wasted and must always be requested.
+_MASKABLE_FIELDS: dict[str, tuple[str, float]] = {
+    "topic_theme":                ("topic_theme", 0.80),
+    "respondent_sensitivity":     ("respondent_sensitivity", 0.80),
+    "flow_respondent_experience": ("flow_respondent_experience", 0.80),
+    "flow_reusability":           ("flow_reusability", 0.80),
+    "visualization_type":         ("visualization_type", 0.80),
+    "display_role":               ("display_role", 0.80),
+    "role_intent_refined":        ("role_intent", 0.70),
+}
+
+
+def _needed_fields(accumulator: TagAccumulator, q_id: int, *, has_candidates: bool) -> list[str]:
+    """The output fields still worth asking the model for on this question.
+
+    A deterministic tagger that already answered with enough confidence wins the
+    merge, so requesting that field again buys nothing and costs both the value
+    and its `why` line on every question. Measured across the sample corpus,
+    `role_intent` is already settled 95% of the time and `display_role` 79%.
+
+    This is purely an economy: omitting a field makes the parser take the same
+    `if not value: continue` branch it already takes when the merge rules drop
+    the answer, so the resulting tags are identical either way.
+
+    Order is fixed (dict insertion order) so the rendered prompt stays stable
+    for identical input — a shuffled list would be a silent cache invalidator.
+    """
+    needed = [
+        field
+        for field, (dimension, threshold) in _MASKABLE_FIELDS.items()
+        if not _is_settled(accumulator.get_question_tag(q_id, dimension), threshold)
+    ]
+    # Always requested: the merge rules apply these no matter what ran first.
+    needed.append("dashboard_names")
+    if has_candidates:
+        needed.append("journey")
+    return needed
+
+
+def _is_settled(existing, threshold: float) -> bool:
+    """True when the prior tag will beat anything the LLM returns.
+
+    Mirrors the merge rules' own test — `TagResult.confidence` is a required
+    float there too, so a bare comparison is the honest shape.
+    """
+    if existing is None:
+        return False
+    return existing.status == "skipped" or existing.confidence >= threshold
 
 
 def build_question_signature(context: UnifiedContext, q) -> str:
@@ -309,6 +395,8 @@ def build_question_prompt(
     top_k: int = 4,
     embedding_model: str = "BAAI/bge-small-en-v1.5",
     min_score: float = 0.0,
+    questions: list | None = None,
+    candidates_by_qid: dict[int, list[dict]] | None = None,
 ) -> tuple[RenderedPrompt, dict[int, list[dict]]]:
     """Build question-level prompt for LLM Call 2.
 
@@ -317,6 +405,11 @@ def build_question_prompt(
     resolves the model's pick through the identical ranking — deriving it twice
     cost a second full embedding pass and let the two copies disagree whenever
     `top_k` differed between the call sites.
+
+    `questions` renders a subset (one batch) instead of the whole survey, and
+    `candidates_by_qid` supplies a ranking already computed for the full survey.
+    Batched callers must pass both: scoring is survey-wide and batching it would
+    reinstate the per-call embedding pass this signature exists to avoid.
 
     `top_k`, `embedding_model` and `min_score` are passed in (rather than read
     from a freshly-constructed `Settings()`) so a single survey does not
@@ -348,14 +441,16 @@ def build_question_prompt(
     }
 
     # One embedding pass for the whole survey; reused by the prompt below and
-    # returned to the caller for the parser.
-    candidates_by_qid = build_question_candidates(
-        context, journey_index, top_k=top_k, embedding_model=embedding_model,
-        min_score=min_score,
-    )
+    # returned to the caller for the parser. A batched caller scores once and
+    # passes the map back in, so this runs a single time per survey.
+    if candidates_by_qid is None:
+        candidates_by_qid = build_question_candidates(
+            context, journey_index, top_k=top_k, embedding_model=embedding_model,
+            min_score=min_score,
+        )
 
     questions_data = []
-    for q in context.questions:
+    for q in (questions if questions is not None else context.questions):
         if q.is_content_message:
             continue
 
@@ -377,11 +472,17 @@ def build_question_prompt(
             "metric_title": metric_title,
         }
 
-        if is_journey_metric and journey is not None:
-            ranked = candidates_by_qid.get(q.question_id)
-            if ranked:
-                q_entry["signature"] = build_question_signature(context, q)
-                q_entry["candidates"] = ranked
+        ranked = candidates_by_qid.get(q.question_id) if (
+            is_journey_metric and journey is not None
+        ) else None
+        if ranked:
+            q_entry["signature"] = build_question_signature(context, q)
+            q_entry["candidates"] = ranked
+
+        # Ask only for what the merge rules will actually keep.
+        q_entry["needed"] = _needed_fields(
+            accumulator, q.question_id, has_candidates=bool(ranked),
+        )
 
         questions_data.append(q_entry)
 

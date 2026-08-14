@@ -118,13 +118,26 @@ class ChangeDetector:
         tenant_dir: Path | None = None,
         output_dir: Path | None = None,
         tenant_id: int | None = None,
+        tenant_hash: str | None = None,
     ) -> str:
-        """Composite hash over all inputs that affect this survey's tags."""
+        """Composite hash over all inputs that affect this survey's tags.
+
+        `tenant_hash` short-circuits the tenant half. Pass it whenever you are
+        walking more than one survey of the same tenant: the tenant hash is
+        identical for every one of them, but computing it recursively walks
+        `Directory/` and content-reads every `tenant_profile/*.json` — the
+        largest files on the share. Recomputed per survey (twice per processed
+        survey, via `is_unchanged` then `mark_processed`) that is 2N redundant
+        walks for an N-survey tenant, each one a batch of SMB round trips at
+        ~230ms apiece on the production image server.
+        """
         parts = [
             _file_token(survey_dir / "survey_structure.json"),
             _dir_token(survey_dir, exclude=_GENERATED_SURVEY_FILES),
         ]
-        if tenant_dir is not None and tenant_id is not None:
+        if tenant_hash is not None:
+            parts.append(tenant_hash)
+        elif tenant_dir is not None and tenant_id is not None:
             parts.append(self.compute_tenant_hash(tenant_dir, output_dir, tenant_id))
         return _short("|".join(parts))
 
@@ -161,10 +174,17 @@ class ChangeDetector:
         survey_dir: Path,
         tenant_dir: Path | None = None,
         output_dir: Path | None = None,
+        tenant_hash: str | None = None,
     ) -> bool:
-        """True when the survey's composite input hash matches the last run."""
+        """True when the survey's composite input hash matches the last run.
+
+        `tenant_hash` — see `compute_survey_hash`. Pass the tenant's hash once
+        per run rather than letting every survey recompute it.
+        """
         key = self._survey_key(tenant_id, survey_no)
-        current = self.compute_survey_hash(survey_dir, tenant_dir, output_dir, tenant_id)
+        current = self.compute_survey_hash(
+            survey_dir, tenant_dir, output_dir, tenant_id, tenant_hash
+        )
         with self._lock:
             stored = self._hashes.get(key)
         return stored is not None and current == stored
@@ -176,10 +196,19 @@ class ChangeDetector:
         survey_dir: Path,
         tenant_dir: Path | None = None,
         output_dir: Path | None = None,
+        tenant_hash: str | None = None,
     ) -> None:
-        """Record the survey's composite input hash after success."""
+        """Record the survey's composite input hash after success.
+
+        Must be given the SAME `tenant_hash` the matching `is_unchanged` used,
+        or the survey is stored under a hash the next run will not reproduce and
+        it re-tags forever. The orchestrator computes it once per tenant run and
+        threads the one value into both calls.
+        """
         key = self._survey_key(tenant_id, survey_no)
-        current = self.compute_survey_hash(survey_dir, tenant_dir, output_dir, tenant_id)
+        current = self.compute_survey_hash(
+            survey_dir, tenant_dir, output_dir, tenant_id, tenant_hash
+        )
         with self._lock:
             self._hashes[key] = current
             self._save()

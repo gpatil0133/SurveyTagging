@@ -5,7 +5,7 @@
 # is NEVER cached. Bump `version` whenever the cached_preamble shape changes —
 # the on-disk LLM response cache uses it as part of the key.
 
-version: "7.1"
+version: "7.2"
 description: "Project-level survey classification — relationship_type, project_purpose, industry_vertical, audience_type, survey_sub_type, dashboard_routing."
 
 cached_preamble: |
@@ -17,6 +17,18 @@ cached_preamble: |
   - The industry vertical and audience
   - Which dashboards this survey's data should feed into
   - The sub-type of survey program (Pulse, Engagement, 360 Feedback, Transactional, etc.)
+
+  What each dimension means:
+  {% for d in dimension_guide %}
+  - {{ d.name }}: {{ d.text }}
+  {%- endfor %}
+
+  Signal precedence when the inputs disagree:
+  - Survey content — the title, section headers and the question mix — is the primary evidence. It is the only input that records what was actually asked.
+  - Pre-computed hints are rules that already ran over that content. Treat them as a strong prior and override one only when the survey content plainly contradicts it; say which fragment contradicted it in `why`.
+  - Tenant intelligence and directory signals describe the account as a whole, not this survey. Use them to break a tie between two readings the survey content supports equally. Never use them to overrule what the questions say.
+  - Response statistics bound how the survey was fielded, not what it measures. They inform cadence and sub-type, not purpose.
+  - When the evidence is genuinely thin, pick the broader value over the more specific one and name the missing signal in `why`.
 
   Always respond with a single valid JSON object. No other text — no markdown, no preamble, no commentary.
 

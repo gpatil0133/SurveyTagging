@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -62,6 +63,16 @@ class EmbeddingModel:
         with self._lock:
             if self._model is not None:
                 return
+            # The import is timed and logged separately from the model
+            # construction because it is by far the more expensive half — ~98s
+            # on a cold Windows process against ~6s to build the model — and it
+            # used to be invisible. `embedding_model_load_start` was logged
+            # AFTER this import, so a log reader saw a half-second model load
+            # with a silent 94-second hole in front of it, and the obvious
+            # suspects (the share, the LLM) took the blame. Never move a log
+            # line back below this import.
+            t0 = time.monotonic()
+            logger.info("embedding_import_start", extra={"model": self.model_name})
             try:
                 from sentence_transformers import SentenceTransformer
             except ImportError as e:  # pragma: no cover — dep missing
@@ -69,9 +80,41 @@ class EmbeddingModel:
                     "sentence-transformers is required for canon embeddings. "
                     "Install with `pip install sentence-transformers`."
                 ) from e
+            import_ms = int((time.monotonic() - t0) * 1000)
+            logger.info("embedding_import_complete",
+                        extra={"model": self.model_name, "elapsed_ms": import_ms})
+
             logger.info("embedding_model_load_start", extra={"model": self.model_name})
             self._model = SentenceTransformer(self.model_name)
-            logger.info("embedding_model_load_complete", extra={"model": self.model_name})
+            logger.info(
+                "embedding_model_load_complete",
+                extra={"model": self.model_name,
+                       "import_ms": import_ms,
+                       "elapsed_ms": int((time.monotonic() - t0) * 1000)},
+            )
+
+    @classmethod
+    def warm(cls, model_name: str) -> bool:
+        """Load the model now so no request has to pay for it later.
+
+        The cost is a one-time ~105s (import + construction + first encode) that
+        `sys.modules` then caches for the life of the process. Paid lazily it
+        lands inside whichever request tags first, which is why a single-survey
+        tag looked like a two-minute operation. Called from the API lifespan on
+        a background thread.
+
+        Best-effort: returns whether the model is ready. A failure here is not
+        fatal — `_load()` still runs lazily and raises in context if the
+        dependency is genuinely missing.
+        """
+        try:
+            model = cls.get(model_name)
+            model.encode(["warmup"])  # _load() + first forward pass
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("embedding_warm_failed",
+                           extra={"model": model_name, "error": str(e)})
+            return False
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         """Encode a batch and return an L2-normalized matrix of shape (N, dim)."""

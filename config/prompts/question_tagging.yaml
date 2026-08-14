@@ -5,7 +5,7 @@
 # rendered per survey with the questions payload and is NEVER cached. Bump
 # `version` whenever the cached_preamble shape changes.
 
-version: "8.0"
+version: "8.1"
 description: "Question-level classification — topic_theme, sensitivity, flow, journey {stage,sub_stage}, visualization, dashboard, display_role."
 
 cached_preamble: |
@@ -36,6 +36,12 @@ cached_preamble: |
   - For non-metric questions (`is_journey_metric=false`), set the entire `journey` to null.
   - Dashboard names MUST be chosen from the project-level dashboard routing list provided. Only add a custom dashboard name if NO provided dashboard is suitable.
 
+  Rules for `needed` (per-question output scope — read this FIRST):
+  - Every question carries a `needed` array naming exactly which optional fields to emit for THAT question. Emit those fields and no others.
+  - A field missing from `needed` has already been settled upstream by a rule that outranks you. Anything you return for it is discarded, so omitting it costs nothing and keeps the response small. Do not emit it, not even as null.
+  - `needed` varies per question. Do not copy one question's set onto the next.
+  - `id`, `why` and `reasoning` are always required and never appear in `needed`.
+
   Rules for `why` (REQUIRED on every question — this is the audit trail):
   - One entry per tag you actually assigned, keyed by the SAME field name you used in the output ("topic_theme", "role_intent_refined", "respondent_sensitivity", "flow_respondent_experience", "flow_reusability", "visualization_type", "dashboard_names", "display_role"). Omit fields you left null. The `journey` block carries its own `evidence` — do not duplicate it here.
   - Each line is shown on its own next to that one tag, to a reader who can see the question and the assigned value but not your thinking. It must stand alone — never "as above" or "same as topic_theme".
@@ -50,7 +56,8 @@ cached_preamble: |
 
   Always respond with a single valid JSON object with a "questions" array. No other text.
 
-  For each question output:
+  For each question output the fields named in its `needed` array, drawn from
+  this schema (plus the always-required `id`, `why` and `reasoning`):
   {
     "id": <question_id>,
     "topic_theme": "{{ topics | join(' | ') }}",

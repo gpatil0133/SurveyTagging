@@ -29,7 +29,13 @@ class TaxonomyDimension(BaseModel):
     # Default to "" rather than being required, so a dimension added without
     # them still loads (it just shows blank columns).
     explanation: str = ""
-    """What the dimension is, in plain language, and what consumes it."""
+    """What the dimension is, in plain language, and what consumes it.
+
+    NOT documentation-only: `prompt_builder._dimension_guide` renders this into
+    the project prompt's cached preamble, so editing it changes what the model
+    is told and invalidates that prompt's cached responses. Keep it accurate and
+    bump `project_tagging.yaml`'s version when it changes materially.
+    """
     derivation: str = ""
     """Which inputs are read, the shape of the logic, the tagger module, and who
     gets the final say (rule vs LLM call)."""

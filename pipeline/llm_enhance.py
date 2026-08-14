@@ -53,6 +53,22 @@ def _journey_fingerprint(journey) -> dict:
     }
 
 
+def _batch(items: list, size: int) -> list[list]:
+    """Split `items` into consecutive batches of at most `size`.
+
+    A fixed cap rather than a token budget: the split for a given survey must be
+    a function of the question list alone. Sizing batches from estimated output
+    would move every boundary whenever tagger confidence shifted, and each moved
+    boundary is a silent cache miss for that batch and all after it.
+
+    Order is preserved so a question's neighbours — and the section context they
+    carry — stay with it.
+    """
+    if size < 1:
+        size = 1
+    return [items[i:i + size] for i in range(0, len(items), size)] or [[]]
+
+
 def _cache_key(parts: dict) -> str:
     """Hash the full set of inputs a cached response actually depends on.
 
@@ -154,49 +170,80 @@ def run_llm_enhancement(
             # The question response is only valid for the journey that produced
             # its candidate lists and the knobs that shaped them — a refreshed
             # tenant profile must invalidate it.
-            question_key = _cache_key(
-                {**survey_identity, **_journey_fingerprint(journey),
-                 "top_k": top_k, "min_score": min_score}
-            )
-            logger.debug("llm_question_call_start",
-                         extra={"cache_key": question_key,
-                                "non_cm_questions": len(context.non_cm_questions)})
+            base_key = {**survey_identity, **_journey_fingerprint(journey),
+                        "top_k": top_k, "min_score": min_score}
 
-            # Candidates are computed once here (inside the prompt build) and
-            # handed to the parser, which needs the identical ranking for its
-            # out-of-canon top-1 fallback.
-            rp, candidates_by_qid = build_question_prompt(
+            # Score the whole survey once, then render one prompt per batch from
+            # that single ranking. Scoring per batch would reinstate the repeated
+            # embedding pass, and a question's candidates must not depend on
+            # which batch it landed in.
+            _rp, candidates_by_qid = build_question_prompt(
                 context, accumulator, taxonomy, industry_stages,
                 top_k=top_k, embedding_model=settings.embedding_model,
                 min_score=min_score,
             )
-            result = loop.run_until_complete(
-                llm_client.complete(
-                    rp.user_prompt, "",
-                    cache_key=question_key, call_type="question",
-                    cached_system_preamble=rp.cached_preamble,
-                    prompt_version=rp.version,
+
+            batches = _batch(context.non_cm_questions,
+                             int(getattr(settings, "question_batch_size", 20) or 20))
+            logger.debug("llm_question_call_start",
+                         extra={"non_cm_questions": len(context.non_cm_questions),
+                                "batches": len(batches)})
+
+            parsed_all: list[dict] = []
+            for index, batch in enumerate(batches):
+                # The batch's own question ids are part of its identity — without
+                # them every batch of a survey collides on one cache entry.
+                batch_key = _cache_key(
+                    {**base_key, "batch": index,
+                     "batch_qids": [q.question_id for q in batch]}
                 )
-            )
-            if result and response_parser:
-                parsed_questions = response_parser.parse_question_response(
+                rp, _ = build_question_prompt(
+                    context, accumulator, taxonomy, industry_stages,
+                    top_k=top_k, embedding_model=settings.embedding_model,
+                    min_score=min_score,
+                    questions=batch, candidates_by_qid=candidates_by_qid,
+                )
+                try:
+                    result = loop.run_until_complete(
+                        llm_client.complete(
+                            rp.user_prompt, "",
+                            cache_key=batch_key, call_type="question",
+                            cached_system_preamble=rp.cached_preamble,
+                            prompt_version=rp.version,
+                        )
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # One bad batch must not cost the survey its other batches.
+                    logger.warning("llm_question_batch_failed",
+                                   extra={"batch": index, "of": len(batches),
+                                          "error": str(e)})
+                    continue
+
+                if not (result and response_parser):
+                    logger.warning("llm_question_batch_no_result",
+                                   extra={"batch": index, "of": len(batches),
+                                          "questions": len(batch)})
+                    continue
+
+                parsed_all.extend(response_parser.parse_question_response(
                     result, industry=industry, project_type=project_type,
                     candidates_by_qid=candidates_by_qid,
-                )
-                _apply_question_llm_results(parsed_questions, accumulator, context)
-                # Every eligible question the call did not place is still sitting
-                # at pending_llm. Resolve it here, where we know WHY it was not
-                # placed, rather than leaving a status that reads as "the call
-                # never landed" when in fact it landed and declined.
+                ))
+                calls_made += 1
+
+            if parsed_all:
+                _apply_question_llm_results(parsed_all, accumulator, context)
+            # Runs once over the whole survey, after every batch has landed: a
+            # question is only genuinely unplaced when no batch placed it.
+            if calls_made:
                 _close_unplaced_journeys(
                     context, accumulator, journey, _journey_index,
                     candidates_by_qid, min_score,
                 )
-                calls_made += 1
-                logger.debug("llm_question_call_applied",
-                             extra={"cache_key": question_key,
-                                    "parsed_questions": len(parsed_questions),
-                                    "candidates_qids": len(candidates_by_qid)})
+            logger.debug("llm_question_call_applied",
+                         extra={"batches": len(batches),
+                                "parsed_questions": len(parsed_all),
+                                "candidates_qids": len(candidates_by_qid)})
 
         loop.close()
     except Exception as e:

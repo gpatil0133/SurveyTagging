@@ -21,10 +21,27 @@ class Settings(BaseSettings):
     # LLM
     llm_model: str = "anthropic/claude-sonnet-4-6"
     llm_temperature: float = 0.1
-    # V2: bumped from 4096 → 8192 to accommodate +6 new fields × up to 80 questions
-    # in the Stage 5 question prompt without truncation.
     llm_max_tokens: int = 8192
+    # Hard ceiling on questions per Stage 5 request. The question call emits
+    # roughly 345 output tokens per question at the worst case (every field
+    # requested, a `why` line each, plus a journey block), so 20 questions is
+    # ~6,900 tokens — the largest batch that still clears `llm_max_tokens` when
+    # nothing is masked. Surveys at or under this size are sent in one call
+    # exactly as before; larger ones are split.
+    #
+    # This is a fixed cap, deliberately not a token budget: the split for a
+    # given survey must not move when tagger confidence shifts, or every batch
+    # boundary becomes a silent cache invalidator. Lower it if `llm_max_tokens`
+    # drops or the output schema grows.
+    question_batch_size: int = 20
     llm_rate_limit_rpm: int = 50
+    # Transport-level retries, handled inside litellm: 429s, 5xx, timeouts and
+    # connection errors, with the provider's `retry-after` honoured and proper
+    # jitter. Our own loop deliberately does NOT retry those — two layers would
+    # multiply attempts (outer × inner) and the outer one cannot see the header
+    # that says how long to wait. It retries only unparseable-JSON responses,
+    # which litellm sees as successes. 0 disables litellm's retries.
+    llm_num_retries: int = 2
     # V2: enable Anthropic native prompt caching (ephemeral 5-min cache on
     # stable portions of prompts: system instructions, taxonomy enum lists,
     # industry stage lists). Saves ~90% input token cost on cache hits.

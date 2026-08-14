@@ -111,6 +111,33 @@ async def lifespan(app: FastAPI):
     # no access lines in it.
     attach_uvicorn_handlers()
 
+    # Load the embedding model now, off the request path.
+    #
+    # `import sentence_transformers` costs ~98s on a cold process (plus ~6s to
+    # construct the model and a first forward pass). Left lazy, that whole ~105s
+    # lands inside whichever request tags first — which is how a single survey
+    # with 7 questions came to take 143 seconds, 66% of it a Python import. It
+    # is charged once per process either way; this just moves it somewhere it
+    # does not block a caller.
+    #
+    # On a thread, and never awaited: uvicorn will not serve a request until
+    # lifespan startup returns, so blocking here would trade a slow first tag
+    # for a two-minute-dead server (including /api/health/share and the UI).
+    # Anything that needs the model still calls _load(), which blocks on the
+    # same lock until this finishes — so a request arriving mid-warmup waits
+    # exactly as long as it would have anyway, and never longer.
+    if not _settings.skip_llm:
+        import threading
+
+        from llm.embeddings import EmbeddingModel
+
+        threading.Thread(
+            target=EmbeddingModel.warm,
+            args=(_settings.embedding_model,),
+            name="embedding-warmup",
+            daemon=True,
+        ).start()
+
     # Start the env-gated periodic auto-retag scheduler (OFF by default).
     from scheduler import AutoRetagScheduler
     app.state.scheduler = AutoRetagScheduler(_ctx)
@@ -1187,4 +1214,10 @@ async def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=False, log_level="debug")
+
+    # log_level follows the app's own setting rather than being pinned to
+    # "debug" — this path re-imports the module (see log_config.configure_logging
+    # on why that matters), and a hardcoded debug level here meant every
+    # `python api.py` run wrote a firehose to app.log regardless of .env.
+    uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=False,
+                log_level=str(_boot_settings.log_level).lower())
