@@ -349,7 +349,7 @@ window.ST = window.ST || {};
    * Everything else is detail and lives behind the disclosure. Ordered as
    * written — this list IS the reading order, not a filter over taxonomy order. */
   const PRIMARY_PROJECT_DIMS = [
-    "project_type", "project_purpose", "audience_type",
+    "project_type", "project_intent", "project_purpose", "audience_type",
     "relationship_type", "industry_vertical", "survey_sub_type",
   ];
   const PRIMARY_QUESTION_DIMS = [
@@ -1446,11 +1446,80 @@ window.ST = window.ST || {};
     "placeholder":   "No signal source yet: a constant or an empty value awaiting user input.",
   };
 
-  /* The taxonomy catalog. Two of these columns are the explanation layer —
-     "What it is" (explanation) and "How it's derived" (derivation), both
-     served straight from config/taxonomy.yaml via GET /api/taxonomy. The
-     multi-label / user-defined / count columns collapsed into chips on the
-     name and values cells to leave those two room to wrap and stay readable. */
+  /* What each `feeds` token means. Unlike `strategy`, the token is opaque —
+     "S3" tells a first-time reader nothing at all — so this drives BOTH the
+     chip tooltip and a legend rendered above the table. One list, so the two
+     cannot drift. Mirrors the `feeds` legend in config/taxonomy.yaml's header.
+
+     `group` is the distinction the token itself hides and the one that
+     actually matters: Pipeline and Reporting are consumers you can go and read
+     in this repo today; S1–S6 are the planned experience-platform services
+     (architecture doc 02) and are not built. So `feeds` is an observed
+     dependency for two tokens and a contract for the other six. */
+  const FEEDS_TOKENS = [
+    { token: "Pipeline",  group: "live",
+      name: "In-pipeline",
+      help: "Another tagger, or llm/prompt_builder.py, reads it inside this service." },
+    { token: "Reporting", group: "live",
+      name: "Artifact / survey view",
+      help: "Read from tagged_output.json or tenant_tags.json by an existing reader, or rendered by projections/survey_view.py." },
+    { token: "S1", group: "planned", name: "Onboarding & Goal Prediction",
+      help: "Predicts a tenant's goals, maturity stage and starter program at signup." },
+    { token: "S2", group: "planned", name: "Survey Program Recommender",
+      help: "Turns a goal or touchpoint into concrete survey blueprints." },
+    { token: "S3", group: "planned", name: "Dashboard Composer",
+      help: "Auto-assembles dashboards from what the tagged questions can render." },
+    { token: "S4", group: "planned", name: "Journey Builder",
+      help: "Instantiates the tenant's journey map and flags coverage gaps." },
+    { token: "S5", group: "planned", name: "Customer Profiling",
+      help: "Builds segment profiles and customer health scores." },
+    { token: "S6", group: "planned", name: "Recommendations, Alerts & Actions",
+      help: "Detects signals and routes closed-loop actions, honouring fatigue rules." },
+    { token: "None", group: "none", name: "Nothing yet",
+      help: "No consumer today — a placeholder dimension awaiting a signal source." },
+  ];
+
+  const FEEDS_BY_TOKEN = Object.fromEntries(FEEDS_TOKENS.map(f => [f.token, f]));
+
+  const FEEDS_GROUPS = [
+    { key: "live",    label: "Live today",
+      note: "a consumer you can read in this repo" },
+    { key: "planned", label: "Planned services",
+      note: "designed, not built — a contract, not a dependency" },
+    { key: "none",    label: "Unconsumed", note: "" },
+  ];
+
+  /* The legend for the Feeds column. Above the table rather than in a tooltip
+     because the tokens are unreadable cold, and a tooltip only helps someone
+     who already suspects there is something to hover. Grouped by liveness —
+     that is what a reader most needs and what the token itself cannot say. */
+  function feedsLegend() {
+    const groups = FEEDS_GROUPS.map(g => {
+      const items = FEEDS_TOKENS.filter(f => f.group === g.key).map(f =>
+        `<span class="tax-legend-item" title="${escapeHtml(f.help)}">
+           <span class="chip chip--mono">${escapeHtml(f.token)}</span>
+           <span class="tax-legend-name">${escapeHtml(f.name)}</span>
+         </span>`).join("");
+      if (!items) return "";
+      return `<div class="tax-legend-group">
+        <div class="tax-legend-label">${escapeHtml(g.label)}${
+          g.note ? ` <span class="tax-legend-note">${escapeHtml(g.note)}</span>` : ""}</div>
+        <div class="tax-legend-items">${items}</div>
+      </div>`;
+    }).join("");
+
+    return `<details class="tax-legend" open>
+      <summary><strong>Feeds</strong> — which outcome consumes the value</summary>
+      <div class="tax-legend-body">${groups}</div>
+    </details>`;
+  }
+
+  /* The taxonomy catalog. Four of these columns are the explanation layer —
+     "Purpose" (purpose), "Feeds" (feeds), "What it is" (explanation) and
+     "How it's derived" (derivation), all served straight from
+     config/taxonomy.yaml via GET /api/taxonomy. The multi-label /
+     user-defined / count columns collapsed into chips on the name and values
+     cells to leave the prose ones room to wrap and stay readable. */
   function taxonomyTable(taxonomy, search) {
     const tax = (taxonomy && typeof taxonomy === "object") ? taxonomy : {};
     const needle = String(search || "").toLowerCase().trim();
@@ -1458,13 +1527,18 @@ window.ST = window.ST || {};
       if (!needle) return true;
       const dim = tax[k] || {};
       // Search the prose too: "where does journey_stage come from" is a
-      // derivation-text question, not a dimension-name one.
-      return [k, dim.description, dim.explanation, dim.derivation, dim.strategy, dim.level]
+      // derivation-text question, not a dimension-name one. `feeds` is in
+      // here so "S3" lists every dimension the Dashboard Composer reads.
+      return [k, dim.description, dim.purpose, dim.explanation, dim.derivation,
+              dim.strategy, dim.level, (dim.feeds || []).join(" ")]
         .some(s => String(s || "").toLowerCase().includes(needle));
     });
 
+    // The legend stays on the no-match branch too: "S7" returning nothing is
+    // exactly the moment someone needs to see which tokens exist.
     if (!keys.length) {
-      return emptyState("No dimensions match", "Try a different search term.", "");
+      return feedsLegend() +
+        emptyState("No dimensions match", "Try a different search term.", "");
     }
 
     const rows = keys.map(k => {
@@ -1494,18 +1568,34 @@ window.ST = window.ST || {};
         ? escapeHtml(String(text))
         : `<span class="empty">&mdash;</span>`;
 
+      const feeds = Array.isArray(dim.feeds) ? dim.feeds : [];
+      const feedsCell = feeds.length
+        ? `<div class="multi-list">${feeds.map(f => {
+            const token = String(f);
+            const meta = FEEDS_BY_TOKEN[token];
+            // Tooltip repeats the legend rather than replacing it — the legend
+            // is the discoverable copy, this is the one under the cursor.
+            const hover = meta ? `${meta.name} — ${meta.help}` : token;
+            return `<span class="chip chip--mono" title="${escapeHtml(hover)}">${escapeHtml(token)}</span>`;
+          }).join("")}</div>`
+        : `<span class="empty">&mdash;</span>`;
+
       return `<tr>
         <td class="mono tax-name">${escapeHtml(k)}${flags ? `<div class="tax-flags">${flags}</div>` : ""}</td>
         <td><span class="status status--info">${escapeHtml(String(dim.level || "—"))}</span></td>
         <td>${strategyCell}</td>
+        <td class="tax-prose tax-purpose">${prose(dim.purpose)}</td>
+        <td class="tax-feeds">${feedsCell}</td>
         <td class="tax-prose">${prose(dim.explanation)}</td>
         <td class="tax-prose">${prose(dim.derivation)}</td>
         <td class="tax-values">${values}</td>
       </tr>`;
     }).join("");
 
-    const headers = ["Dimension", "Level", "Strategy", "What it is", "How it's derived", "Values"];
-    return `<div class="question-table-wrap"><table class="qtable qtable--taxonomy">
+    const headers = ["Dimension", "Level", "Strategy", "Purpose", "Feeds",
+                     "What it is", "How it's derived", "Values"];
+    return feedsLegend() +
+      `<div class="question-table-wrap"><table class="qtable qtable--taxonomy">
       <thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>
       <tbody>${rows}</tbody>
     </table></div>`;

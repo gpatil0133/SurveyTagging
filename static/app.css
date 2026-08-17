@@ -552,6 +552,18 @@ header.topbar {
 .dot.tagged   { background: var(--ok); }
 .dot.untagged { background: var(--border-strong); }
 .dot.unknown  { background: transparent; border: 1px solid var(--border-strong); }
+/* A tag run in flight. It outlives the survey being looked at — the user is
+   free to move on and the workspace will not be yanked back when it lands — so
+   the row itself has to carry the progress. */
+.dot.working {
+  background: var(--accent);
+  animation: dot-pulse 1.2s ease-in-out infinite;
+}
+.survey-item.tagging .sno { color: var(--accent-strong); }
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1;   transform: scale(1); }
+  50%      { opacity: 0.4; transform: scale(0.7); }
+}
 
 
 /* ===== WORKSPACE HEADER + TABS ===== */
@@ -1109,6 +1121,66 @@ table.qtable--taxonomy td.tax-prose {
 table.qtable--taxonomy td.tax-values { max-width: 320px; }
 table.qtable--taxonomy td.tax-values .empty { display: block; margin-top: var(--space-1); }
 .tax-flags { display: flex; gap: var(--space-1); margin-top: var(--space-1); }
+/* Purpose is the one-line answer, so it is narrower than the two long-prose
+   columns and carries the body colour — it is meant to be read first, before
+   the eye reaches "What it is". */
+table.qtable--taxonomy td.tax-purpose {
+  max-width: 260px;
+  min-width: 180px;
+  color: var(--text);
+}
+/* Feeds holds at most a handful of short tokens; let them wrap rather than
+   stretching the column, and keep it off the prose colour so the row's two
+   chip columns (strategy, feeds) read as one family. */
+table.qtable--taxonomy td.tax-feeds { max-width: 140px; }
+table.qtable--taxonomy td.tax-feeds .multi-list { flex-wrap: wrap; gap: var(--space-1); }
+
+/* Legend for the Feeds column. Sits above the table because "S3" is opaque
+   cold — a tooltip only reaches someone who already suspects there is
+   something to hover. A <details> so it can be folded away once learnt; open
+   by default, since the first visit is the one that needs it. */
+.tax-legend {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+  font-size: 12px;
+}
+.tax-legend > summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-muted);
+}
+.tax-legend > summary strong { color: var(--text); }
+.tax-legend-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+  margin-top: var(--space-2);
+}
+.tax-legend-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  margin-bottom: var(--space-1);
+}
+/* The caveat that keeps the six S-tokens honest — they are a contract, not an
+   observed dependency. Lowercase so it reads as an aside on the group label. */
+.tax-legend-note {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  font-style: italic;
+}
+.tax-legend-items { display: flex; flex-direction: column; gap: 3px; }
+.tax-legend-item { display: flex; align-items: center; gap: var(--space-2); }
+/* Fixed-width chip column so the names line up into a readable second column
+   instead of ragging against tokens of different lengths (S1 vs Reporting). */
+.tax-legend-item .chip { flex: none; min-width: 62px; justify-content: center; }
+.tax-legend-name { color: var(--text-muted); }
 
 
 /* ===== SUMMARY TAB ===== */
@@ -1790,4 +1862,6 @@ details.ev-superseded > div {
   #ribbon { animation: none; }
   /* Skeletons stay as a flat placeholder block rather than a moving sweep. */
   .skel::after { animation: none; display: none; }
+  /* The accent fill still distinguishes a row being tagged without pulsing. */
+  .dot.working { animation: none; }
 }

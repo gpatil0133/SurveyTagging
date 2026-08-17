@@ -89,7 +89,7 @@ def _build_tenant_profile_block(profile: TenantProfile | None) -> str:
 
 # Project dimensions the LLM assigns, in the order the guide renders them.
 _PROJECT_GUIDE_DIMS = (
-    "relationship_type", "project_purpose", "industry_vertical",
+    "relationship_type", "project_purpose", "project_intent", "industry_vertical",
     "audience_type", "survey_sub_type", "dashboard_routing",
 )
 
@@ -128,7 +128,8 @@ def _project_cached_context(taxonomy: TaxonomyRegistry) -> dict:
     return {
         "relationship_types": taxonomy.get_allowed_values("relationship_type"),
         "purposes":           taxonomy.get_allowed_values("project_purpose"),
-        "industries":         taxonomy.get_allowed_values("industry_vertical"),
+        # No `industries`: industry_vertical is user_defined free text, so its
+        # allowed_values list is empty and the prompt asks for prose instead.
         "audiences":          taxonomy.get_allowed_values("audience_type"),
         "sub_types":          taxonomy.get_allowed_values("survey_sub_type"),
         "canonical_dashboards": dashboard_list,
@@ -272,6 +273,12 @@ def _needed_fields(accumulator: TagAccumulator, q_id: int, *, has_candidates: bo
     ]
     # Always requested: the merge rules apply these no matter what ran first.
     needed.append("dashboard_names")
+    # Always requested, but nearly free: the field is a union onto whatever the
+    # structural pass found, so no confidence threshold can settle it — a
+    # question can be a known Branching Target AND an unlisted Branching Trigger.
+    # The prompt tells the model to OMIT the key unless it actually infers a
+    # role, and on measured surveys that is ~99% of questions.
+    needed.append("flow_logic_inferred")
     if has_candidates:
         needed.append("journey")
     return needed
@@ -465,6 +472,14 @@ def build_question_prompt(
             "matrix_group": q.matrix_group_title or None,
             "options": [o.answer_text for o in q.answer_options[:6] if o.answer_text],
             "current_role": accumulator.get_question_tag_value(q.question_id, "role_intent"),
+            # Flow context for `flow_logic_inferred`. The payload carries no
+            # skip-logic definitions, so these four platform flags plus the
+            # question's own position are the entire structural picture — the
+            # model has to be shown what IS known or it will re-assert it.
+            "position_pct": round(q.effective_position_ratio * 100),
+            "is_followup": bool(q.is_followup_question),
+            "flow_logic_detected": accumulator.get_question_tag_value(
+                q.question_id, "flow_logic_role") or [],
             "metric_type": accumulator.get_question_tag_value(q.question_id, "metric_type"),
             "metric_name": accumulator.get_question_tag_value(q.question_id, "metric_name"),
             "trend_trackable": accumulator.get_question_tag_value(q.question_id, "trend_trackable"),

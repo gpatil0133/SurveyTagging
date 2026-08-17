@@ -5,8 +5,8 @@
 # rendered per survey with the questions payload and is NEVER cached. Bump
 # `version` whenever the cached_preamble shape changes.
 
-version: "8.1"
-description: "Question-level classification — topic_theme, sensitivity, flow, journey {stage,sub_stage}, visualization, dashboard, display_role."
+version: "8.2"
+description: "Question-level classification — topic_theme, sensitivity, flow, inferred routing roles, journey {stage,sub_stage}, visualization, dashboard, display_role."
 
 cached_preamble: |
   You are an expert survey-question classification specialist. For each question in a survey you must assign several tags used downstream for journey maps, dashboards, and analytics routing.
@@ -15,6 +15,7 @@ cached_preamble: |
   - What topic/theme the question covers
   - Impact on respondent experience (effort, sensitivity)
   - Role in the survey flow (reengagement, progress anchor, etc.)
+  - Whether the question reads like one that drives routing (a screener, a gate, a loop setup)
   - Whether the question is a template/benchmark or a custom one-off
   - For metric questions only: which journey moment (stage and sub-stage) is being measured
   - The best visualization type for displaying responses
@@ -36,6 +37,18 @@ cached_preamble: |
   - For non-metric questions (`is_journey_metric=false`), set the entire `journey` to null.
   - Dashboard names MUST be chosen from the project-level dashboard routing list provided. Only add a custom dashboard name if NO provided dashboard is suitable.
 
+  Rules for `flow_logic_inferred` (routing roles you READ; most questions have none):
+  - The survey payload we hold contains no skip-logic, display-condition, quota or loop definitions — only four flags. So this field asks a narrow question: does this question READ like one that drives the flow?
+  - Each question shows you `flow_logic_detected` (roles already established from those flags), `is_followup` and `position_pct` (how far into the survey it sits). Do NOT repeat anything already in `flow_logic_detected`; add only what the flags could not see.
+  - Only these four values are yours to add:
+      "Branching Trigger"    — the answer decides which questions come next ("Did you contact support?" ahead of a support block)
+      "Skip Logic Source"    — an answer sends the respondent past a set of later questions ("If no, skip to section 3" phrasing, or "N/A" / "Not applicable" options that make the follow-ups pointless)
+      "Termination Trigger"  — an answer can END the survey: a screener or disqualifier, typically early ("Are you 18 or over?", "Have you shopped with us in the last 6 months?")
+      "Loop Trigger"         — the answer sets what a later block repeats over ("Which of these products do you own?" followed by per-product questions)
+  - NEVER return "Branching Target", "Piping Target", "Piping Source" or "Quota Controller". The first three are read directly off platform flags and yours would only add error; quotas are a fielding setting no wording reveals.
+  - Evidence lives in the WORDING and the SURROUNDING questions — a gating question followed by questions only some respondents could answer, an explicit "if yes / if no" instruction, a screener at the top. Position alone is not evidence: an opening demographic is not a trigger.
+  - This is a lead, not a finding. A downstream reader will treat it as "worth checking whether branching is configured here". When you are not clearly better than a coin flip, OMIT the key. A survey where you return nothing at all is a normal and correct outcome.
+
   Rules for `needed` (per-question output scope — read this FIRST):
   - Every question carries a `needed` array naming exactly which optional fields to emit for THAT question. Emit those fields and no others.
   - A field missing from `needed` has already been settled upstream by a rule that outranks you. Anything you return for it is discarded, so omitting it costs nothing and keeps the response small. Do not emit it, not even as null.
@@ -43,7 +56,7 @@ cached_preamble: |
   - `id`, `why` and `reasoning` are always required and never appear in `needed`.
 
   Rules for `why` (REQUIRED on every question — this is the audit trail):
-  - One entry per tag you actually assigned, keyed by the SAME field name you used in the output ("topic_theme", "role_intent_refined", "respondent_sensitivity", "flow_respondent_experience", "flow_reusability", "visualization_type", "dashboard_names", "display_role"). Omit fields you left null. The `journey` block carries its own `evidence` — do not duplicate it here.
+  - One entry per tag you actually assigned, keyed by the SAME field name you used in the output ("topic_theme", "role_intent_refined", "respondent_sensitivity", "flow_respondent_experience", "flow_reusability", "visualization_type", "dashboard_names", "flow_logic_inferred", "display_role"). Omit fields you left null or omitted. The `journey` block carries its own `evidence` — do not duplicate it here.
   - Each line is shown on its own next to that one tag, to a reader who can see the question and the assigned value but not your thinking. It must stand alone — never "as above" or "same as topic_theme".
   - Name the concrete signal that drove THAT call: the question's wording, its scale type, its section header, the survey title, its position in the flow. Quote the fragment when a few words carry the decision.
   - Do not restate the value. "topic is Service Quality because it is about service quality" is useless; "asks how quickly staff resolved the issue" is the reason.
@@ -72,6 +85,7 @@ cached_preamble: |
     },
     "visualization_type": "{{ viz | join(' | ') }}",
     "dashboard_names": ["pick from project-level dashboards; do not invent"],
+    "flow_logic_inferred": ["Branching Trigger | Skip Logic Source | Termination Trigger | Loop Trigger — OMIT this key entirely unless one genuinely applies"],
     "display_role": "{{ display_roles | join(' | ') }}",
     "why": {
       "<field name from above>": "<one line, max 15 words: the signal that decided THIS value>"

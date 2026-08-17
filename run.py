@@ -29,7 +29,7 @@ this file; see "Route layout" further down for why that order is what it is.
     GET    /tenants/{t}/profile/{agent}        raw envelope for org | cx | ex
     DELETE /tenants/{t}/profile
   §5  Catalog  — process-wide, read-only, no tenant
-    GET    /taxonomy               all 41 dimensions + the explanation layer
+    GET    /taxonomy               all 50 dimensions + the explanation layer
     GET    /config                 server config the UI shapes itself from
     GET    /me                     caller identity from the Bearer token
     GET    /health/share           is the data root reachable?
@@ -106,7 +106,7 @@ _settings = _ctx.settings
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Re-assert the file handler on uvicorn's loggers. When the server is
-    # started as `python api.py`, uvicorn installs its own logging config
+    # started as `python run.py`, uvicorn installs its own logging config
     # *after* this module was imported and would otherwise leave app.log with
     # no access lines in it.
     attach_uvicorn_handlers()
@@ -771,6 +771,29 @@ def _run_profile_fetch(tenant_id: int, website: str, agents: tuple[str, ...],
     return _run_parallel_fetch(tenant_id, website, agents, force)
 
 
+def _preflight_profile_fetch(website: str, token: str) -> None:
+    """Reject a fetch that cannot start, before the route commits to running it.
+
+    `?background=true` answers 202 and then runs fire-and-forget, so every
+    failure after that point is visible only in app.log while the UI polls for
+    artifacts that will never appear — for up to 40 minutes. A missing bearer
+    token is exactly that shape and is knowable now, so it is raised here as the
+    same 400 the synchronous path gives. Cheap and side-effect free: it resolves
+    the token and checks the website, and opens no connection.
+    """
+    if _settings.profile_source == "smx":
+        from tenant_profile.smx_client import SmxClientError
+        from tenant_profile.smx_runner import resolve_smx_token
+
+        try:
+            resolve_smx_token(_settings, token)
+        except SmxClientError as e:
+            raise HTTPException(400, str(e)) from e
+        return
+    if not website or len(website) < 4:
+        raise HTTPException(400, "profile_source='parallel' needs a `website` to research.")
+
+
 def _bearer(authorization: str | None) -> str:
     """The caller's raw JWT, for forwarding to apismx. Empty when absent.
 
@@ -908,6 +931,7 @@ async def tenant_profile_fetch(
     tenant_id = auth.resolve_tenant_id(tenant_id, authorization)
     agents = _normalize_agents(req.agents)
     token = _bearer(authorization)
+    _preflight_profile_fetch(req.website, token)
 
     if background:
         async def _run():
@@ -1060,7 +1084,13 @@ async def delete_tenant_profile(
 @app.get("/api/taxonomy")
 async def get_taxonomy() -> dict:
     """Full taxonomy — client dropdowns, plus the explanation layer the UI's
-    Taxonomy tab renders (`explanation` / `derivation` / `strategy`).
+    Taxonomy tab renders (`explanation` / `derivation` / `strategy` /
+    `purpose` / `feeds`).
+
+    `purpose` is the one-line "why does this exist"; `feeds` names which outcome
+    consumes it (S1..S6 for the planned experience-platform services, plus the
+    live `Pipeline` / `Reporting` / `None` tokens). See config/taxonomy.yaml's
+    header for the token legend.
 
     Covers all three levels; tenant dims are in here too, so a caller reading a
     tenant_tags.json artifact can look its dimensions up in the same catalog.
@@ -1070,6 +1100,8 @@ async def get_taxonomy() -> dict:
         dims[name] = {
             "level": dim.level,
             "description": dim.description,
+            "purpose": dim.purpose,
+            "feeds": dim.feeds,
             "explanation": dim.explanation,
             "derivation": dim.derivation,
             "strategy": dim.strategy,
@@ -1077,6 +1109,10 @@ async def get_taxonomy() -> dict:
             "multi_label": dim.multi_label,
             "user_defined": dim.user_defined,
             "canonical_values": dim.canonical_values,
+            # Usually empty. Present on crosstab_axis_role, where it publishes
+            # the filter/segment/search mapping that `control_role` used to
+            # state as a dimension of its own (removed in V7.3).
+            "derived_controls": dim.derived_controls,
         }
     return dims
 
@@ -1093,6 +1129,12 @@ async def ui_config() -> dict:
     return {
         "profile_source": _settings.profile_source,
         "smx_allow_generate": _settings.smx_allow_generate,
+        # Whether apismx can be called with NO caller token — i.e. whether the
+        # server holds a headless fallback. The browser knows if it has a token
+        # of its own; only this tells it whether the absence is fatal, which is
+        # what lets the profile panel refuse up front instead of after a round
+        # trip. The token itself is never exposed.
+        "smx_token_configured": bool((_settings.smx_token or "").strip()),
         "smx_generate_wait_seconds": int(
             _settings.smx_generate_poll_attempts * _settings.smx_generate_poll_interval
         ),
@@ -1215,9 +1257,15 @@ async def index():
 if __name__ == "__main__":
     import uvicorn
 
+    # The import string must match this file's module name. It is resolved by
+    # uvicorn at startup, not by Python at import, so a stale name here fails
+    # AFTER the whole app has booted — "Could not import module" arrives on the
+    # line below a successful taxonomy/tagger/LLM startup log, which reads like
+    # anything but a filename. Renaming this module means editing this string.
+    #
     # log_level follows the app's own setting rather than being pinned to
     # "debug" — this path re-imports the module (see log_config.configure_logging
     # on why that matters), and a hardcoded debug level here meant every
-    # `python api.py` run wrote a firehose to app.log regardless of .env.
-    uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=False,
+    # `python run.py` run wrote a firehose to app.log regardless of .env.
+    uvicorn.run("run:app", host="0.0.0.0", port=8001, reload=False,
                 log_level=str(_boot_settings.log_level).lower())

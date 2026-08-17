@@ -111,8 +111,8 @@ def configure_logging(
 
     Safe to call more than once: the file handler is created at most once per
     process and re-attaching is a no-op. That is not a theoretical nicety —
-    `python api.py` imports this module twice (once as `__main__`, then again as
-    `api` when `uvicorn.run("api:app")` resolves the import string), so this
+    `python run.py` imports this module twice (once as `__main__`, then again as
+    `run` when `uvicorn.run("run:app")` resolves the import string), so this
     function genuinely runs twice in one process. Without the guard the second
     call added a SECOND handler on the same file and every line from then on was
     written to app.log twice: 73.7% of the log was duplicate lines.

@@ -2,10 +2,10 @@
 
 Input: a tagged_output.json dict (or path).
 Output: a dict with:
-  - `project_tags`: passthrough of the 12 project-level dimensions (with
+  - `project_tags`: passthrough of the 13 project-level dimensions (with
     `category` already renamed to `project_type` in V6).
   - `questions`: list of per-question tag entries; each carries `journey_stage`
-    and `sub_stage_name` tags inline alongside the other 21 question dimensions.
+    and `sub_stage_name` tags inline alongside the other 30 question dimensions.
   - `survey_journey`: a small derived rollup — which journey stages and
     sub-stages the survey touches, derived from the question tags. Present
     only when `project_tags.project_type.value` ∈ {"CX", "EX"}.

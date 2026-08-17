@@ -23,7 +23,12 @@ from tenant_profile.smx_client import (
     SmxClientError,
     PROFILE_TYPE_TO_AGENT,
 )
-from tenant_profile.smx_runner import adapt_payload, build_client, fetch_tenant_profile
+from tenant_profile.smx_runner import (
+    adapt_payload,
+    build_client,
+    fetch_tenant_profile,
+    resolve_smx_token,
+)
 
 __all__ = [
     "run_org",
@@ -44,4 +49,5 @@ __all__ = [
     "fetch_tenant_profile",
     "adapt_payload",
     "build_client",
+    "resolve_smx_token",
 ]

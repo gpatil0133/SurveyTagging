@@ -284,31 +284,49 @@ def resolve_tenant_profile(
     )
 
 
+def resolve_smx_token(settings: Any, token: str = "") -> str:
+    """The bearer apismx will be called with, or raise saying there is none.
+
+    Split out of `build_client` so a caller can answer "could this run at all?"
+    without constructing (and having to close) an httpx client. `run.py` uses it
+    to reject a `?background=true` fetch up front: that branch answers 202 and
+    then runs fire-and-forget, so a token failure discovered inside the task is
+    visible only in app.log while the UI waits on artifacts that can never
+    appear.
+
+    Precedence: explicit argument, then the request-scoped token the middleware
+    parked (the browser puts one on every call, so a route that never threaded it
+    through still forwards it), then `settings.smx_token` — the headless fallback
+    for the CLI and the scheduler.
+    """
+    import request_context
+
+    resolved = (token or request_context.current_token() or settings.smx_token or "").strip()
+    if not resolved:
+        raise SmxClientError(
+            "profile_source='smx' needs a bearer token. Sign in to the platform "
+            "so the browser forwards its JWT, or set SURVEY_TAGGER_SMX_TOKEN in "
+            ".env for headless use."
+        )
+    return resolved
+
+
 def build_client(settings: Any, token: str = "") -> SmxClient:
     """Construct an SmxClient from Settings, preferring a request-scoped token.
 
-    `token` is the inbound caller's JWT when there is one; apismx accepts it
-    because it shares an issuer with our own auth. When it is not passed
-    explicitly the request-scoped token is used — the browser puts one on every
-    call, so a route that never threaded it through still forwards it.
-    `settings.smx_token` is the headless fallback (CLI, scheduler).
+    Token resolution — and the "no token at all" failure — lives in
+    `resolve_smx_token`.
 
     This is also the single place the wire trace is configured from Settings, so
     every client built for the app is traced identically and one constructed by
     hand (tests) is not traced at all.
     """
-    import request_context
     from tenant_profile.smx_trace import SmxTrace
 
     verify: bool | str = settings.sogo_verify_ssl
     if settings.sogo_ca_bundle_path:
         verify = settings.sogo_ca_bundle_path
-    resolved = (token or request_context.current_token() or settings.smx_token or "").strip()
-    if not resolved:
-        raise SmxClientError(
-            "profile_source='smx' needs a bearer token. Forward the caller's JWT "
-            "or set SURVEY_TAGGER_SMX_TOKEN in .env."
-        )
+    resolved = resolve_smx_token(settings, token)
     return SmxClient(
         base_url=settings.sogo_apismx_base_url,
         pmx_base_url=settings.sogo_apipmx_base_url,

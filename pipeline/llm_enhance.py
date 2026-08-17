@@ -257,11 +257,38 @@ def run_llm_enhancement(
     return calls_made
 
 
+# Dimensions whose non-LLM tiers are authoritative even though the tagger
+# reports `hybrid` rather than `deterministic`.
+#
+# `industry_vertical` is free text sourced from tenant research: when the org
+# agent supplied a label the tagger stores it verbatim above 0.80, and a model
+# reading one survey does not get to rewrite what a researcher read off the
+# tenant's own site. Every weaker tier of that tagger sits below 0.80, so the
+# threshold alone decides — no tier plumbing leaks in here.
+_HYBRID_AUTHORITATIVE = frozenset({"industry_vertical"})
+
+
+def _blocks_llm_override(existing, dimension: str) -> bool:
+    """True when the prior tag outranks whatever the model returned."""
+    if existing is None or existing.confidence < 0.80:
+        return False
+    if existing.source == "deterministic":
+        return True
+    return dimension in _HYBRID_AUTHORITATIVE and existing.source == "hybrid"
+
+
 def _apply_project_llm_results(parsed: dict, accumulator) -> None:
     """Apply LLM project-level results, upgrading low-confidence tags."""
     scalar_map = {
         "relationship_type": "relationship_type",
         "project_purpose": "project_purpose",
+        # Free text, and the tagger's title-derived seed sits at 0.45 by design,
+        # so the model's answer always wins here — the seed survives on
+        # `superseded` rather than being erased.
+        "project_intent": "project_intent",
+        # Free text too, but the opposite rule: a profile-sourced industry is
+        # authoritative (see `_HYBRID_AUTHORITATIVE`) and the model's answer is
+        # only used when the tagger had nothing better than a seed.
         "industry_vertical": "industry_vertical",
         "audience_type_refined": "audience_type",
         "survey_sub_type": "survey_sub_type",
@@ -276,7 +303,7 @@ def _apply_project_llm_results(parsed: dict, accumulator) -> None:
             continue
 
         existing = accumulator.get_project_tag(dimension)
-        if existing and existing.confidence >= 0.80 and existing.source == "deterministic":
+        if _blocks_llm_override(existing, dimension):
             continue
 
         accumulator.set_project_tag(dimension, TagResult(
@@ -382,6 +409,77 @@ def _close_unplaced_journeys(
             accumulator.set_question_tag(q.question_id, dimension, TagResult(
                 value=None, source="deterministic", status="skipped", evidence=detail,
             ))
+
+
+# Confidence for a role the model read out of question wording. Deliberately
+# well under the deterministic pass's 0.90: those roles are read off platform
+# flags, these are an inference about branching nobody configured in the payload.
+_FLOW_LOGIC_INFERRED_CONFIDENCE = 0.55
+
+
+def _apply_flow_logic_inference(
+    q_data: dict, accumulator, q_id: int, why: dict, q_reasoning: str | None
+) -> None:
+    """Union the model's inferred routing roles onto the deterministic ones.
+
+    Three rules, and the first is the one that matters: the LLM may only ADD.
+    The deterministic entries are read off platform flags (`questionType == HR`,
+    `isFollowupQuestion`, `metricQuestion`, piping markers) — facts — while these
+    are inferred from how the question is worded. A model that could delete a
+    fact would be trading a certainty for a guess.
+
+    Second: a question that already carries the inferred role keeps its
+    deterministic entry, so the union never demotes a 0.90 fact to a 0.55 guess.
+    Third: the resulting tag is `hybrid` only when both passes contributed —
+    `source` has to keep answering "where did this come from?" honestly, and a
+    tag holding nothing but deterministic roles is not a hybrid of anything.
+    """
+    inferred = q_data.get("flow_logic_inferred")
+    if not inferred or not isinstance(inferred, list):
+        return
+
+    existing = accumulator.get_question_tag(q_id, "flow_logic_role")
+    if existing is not None and existing.status == "skipped":
+        return  # content message — it has no flow role to reason about
+
+    prior = list(existing.value) if existing and isinstance(existing.value, list) else []
+    added = [r for r in inferred if r not in prior]
+    if not added:
+        return
+
+    merged = prior + added
+    detail = (
+        f"{len(added)} routing role(s) inferred from the question's wording and "
+        f"position: {', '.join(added)}. The survey payload carries no skip-logic or "
+        "branching definitions at all, so nothing here was read off a configured "
+        "rule — this says the question READS like a trigger, which is a lead to "
+        "verify, not a statement that branching exists."
+    )
+    if prior:
+        detail += (
+            f" Merged onto {len(prior)} role(s) the structural pass already "
+            f"established ({', '.join(prior)}); those are platform facts and were "
+            "kept as they were."
+        )
+
+    accumulator.set_question_tag(q_id, "flow_logic_role", TagResult(
+        value=merged,
+        source="hybrid" if prior else "llm",
+        confidence=_FLOW_LOGIC_INFERRED_CONFIDENCE,
+        evidence=ev.hybrid(
+            "question.flow_logic_role.llm_inferred",
+            detail,
+            components=[ev.component(r, "inferred from question wording") for r in added]
+            + [ev.component(r, "detected structurally") for r in prior],
+            stage=5,
+            inputs={"inferred": added, "structural": prior},
+        ),
+        reasoning=_rationale(why, "flow_logic_inferred", q_reasoning),
+        # Only when a rule actually said something. `_superseded` guards on
+        # `value is None`, and the no-logic tag's value is `[]` — recording
+        # "the rule previously said nothing" is noise, not provenance.
+        superseded=_superseded(existing) if prior else None,
+    ))
 
 
 def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=None) -> None:
@@ -513,6 +611,9 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                 reasoning=_rationale(why, "dashboard_names", q_reasoning),
                 superseded=_superseded(existing),
             ))
+
+        # Multi-label: flow_logic_inferred → flow_logic_role (union, never removal)
+        _apply_flow_logic_inference(q_data, accumulator, q_id, why, q_reasoning)
 
         # Role intent refinement
         refined_role = q_data.get("role_intent_refined")

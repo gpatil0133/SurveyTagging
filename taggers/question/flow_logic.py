@@ -1,4 +1,17 @@
-"""Flow logic role tagger: identifies branching, piping, and routing roles."""
+"""Flow logic role tagger: identifies branching, piping, and routing roles.
+
+The structural half of a hybrid dimension. Everything here is read off a platform
+flag — `questionType == "HR"`, `isFollowupQuestion`, `metricQuestion`, piping
+markers in the title — because `survey_structure.json` carries no skip-logic,
+display-condition, quota or loop definitions at all. That is also why the empty
+list is the overwhelmingly common answer, and why `Skip Logic Source`,
+`Loop Trigger` and `Quota Controller` never appear from this pass.
+
+LLM Call 2 adds the first two of those (plus wording-evident Branching and
+Termination triggers) at a much lower confidence, unioned on by
+`pipeline/llm_enhance._apply_flow_logic_inference`. It can only ADD: these entries
+are facts and an inference must not be able to delete one.
+"""
 
 from models import evidence as ev
 from models.context import UnifiedContext
@@ -80,10 +93,12 @@ class FlowLogicTagger(QuestionTagger):
                 confidence=1.0,
                 evidence=ev.rule(
                     "question.flow_logic_role.no_logic",
-                    "The question plays no routing role: it is not a hidden radio, not "
-                    "a follow-up, carries no piping markers, is not piped from, and is "
-                    "not an opening Yes/No screener. An empty list here is a finding, "
-                    "not a missing value.",
+                    "No routing role is visible in the platform's flags: not a hidden "
+                    "radio, not a follow-up, no piping markers, not piped from, not an "
+                    "opening Yes/No screener. An empty list here is a finding, not a "
+                    "missing value — though it is a finding about the FLAGS, since the "
+                    "payload holds no logic definitions to check. LLM Call 2 may still "
+                    "add a role it reads in the wording.",
                     stage=3,
                     inputs={"question_type": question.question_type},
                 ),

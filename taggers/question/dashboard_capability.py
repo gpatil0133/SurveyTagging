@@ -1,7 +1,7 @@
 """Dashboard capability taggers (V7) — the per-question capability layer that
 the downstream (LLM-driven) dashboard-composition service consumes.
 
-Six Stage-3 deterministic dimensions, all derived from raw QuestionContext
+Five Stage-3 deterministic dimensions, all derived from raw QuestionContext
 signals (rs_type, question_type, is_multi, answer-option weights). They state
 what a question is CAPABLE of; the dashboard service confirms data VIABILITY
 (response volume, null rate, distinct-value count) and does the contextual
@@ -11,12 +11,26 @@ selection / pairing / layout.
     scale_of_measurement .. Nominal / Ordinal / Interval / Ratio
     cardinality_class ..... Binary / Low / High / Continuous / Free-Text
     widget_compatibility .. SET of valid widgets (multi-label)
-    control_role .......... filter / segment control roles (multi-label)
     crosstab_axis_role .... Row / Column / Both / None (table widgets)
 
-The derivation lives once in `derive_capability()`; the six thin tagger
-classes each return their slice. `create_tagger()` returns all six so the
+The derivation lives once in `derive_capability()`; the five thin tagger
+classes each return their slice. `create_tagger()` returns all five so the
 registry auto-registers them from this single module.
+
+V7.3 removed a sixth, `control_role`. It restated `is_filterable`,
+`is_segmentable` and "is this Open-Text" in one multi-label field, which meant
+three dimensions had to be kept in agreement and — because this module is Stage 3
+and cannot see `role_intent` — it silently disagreed with `is_segmentable` on any
+question where role_intent was the deciding signal. What a dashboard composer
+needs from it is now read directly:
+
+    filter dropdown  ->  is_filterable == "Yes"
+    segment picker   ->  is_segmentable == "Yes"
+    text search      ->  response_format == "Open-Text"
+    date filter      ->  (never emitted; there is no date response format)
+
+See the `derived_controls` block on `crosstab_axis_role` in taxonomy.yaml, which
+states that mapping for consumers.
 """
 
 from __future__ import annotations
@@ -25,6 +39,7 @@ from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
+from taggers._metric_utils import is_platform_metric
 from taggers.base import QuestionTagger
 
 # Raw question_type code groups (consistent with metric_type / is_filterable).
@@ -111,46 +126,41 @@ def _cardinality(fmt: str, q: QuestionContext) -> str:
     return "N/A"
 
 
-def _control_roles(fmt: str, q: QuestionContext) -> list[str]:
-    """Which dashboard control roles this question can play (structural only;
-    the dashboard service confirms data viability)."""
-    roles: list[str] = []
+def _crosstab_axis(fmt: str, q: QuestionContext) -> str:
+    """Which axis of a cross-tab this question can occupy.
+
+    This used to be derived from `control_role`, a multi-label dimension that has
+    since been removed. Substituting its definition in collapses the whole thing
+    to two questions, because `control_role` gave EVERY select format
+    Dropdown-Filter unconditionally — which alone made a non-metric a grouping.
+    Its `Segment-Control` refinement (unweighted options, a 2-15 bucket window,
+    the Hidden-Select special case) could therefore never change the answer for a
+    select format, and mattered only on the metric branch, where the test reduces
+    to `is_platform_metric`. Checked exhaustively against the old pair over every
+    format x rs_type x option-count x weighting combination: identical.
+
+    A metric you can merely filter on stays Column-Eligible — it is still what
+    gets compared. Only the platform's bands put a metric on the row axis;
+    without that rule every metric would read "Both" and "put this in the cells"
+    would become inexpressible, which is the one instruction a dashboard composer
+    needs from this dimension.
+    """
+    if fmt in _METRIC_FORMATS or fmt == "Matrix-Row":
+        return "Both" if is_platform_metric(q) else "Column-Eligible"
     if fmt in ("Single-Select", "Multi-Select", "Hidden-Select"):
-        roles.append("Dropdown-Filter")
-        # Segment-eligible: unweighted, feasible bucket count (mirror is_segmentable).
-        if not _has_weights(q) and 2 <= q.option_count <= 15:
-            roles.append("Segment-Control")
-        if fmt == "Hidden-Select":  # routing question -> always a segmenter
-            if "Segment-Control" not in roles:
-                roles.append("Segment-Control")
-    elif fmt == "Open-Text":
-        roles.append("Search-Filter")
-    return roles
-
-
-def _crosstab_axis(fmt: str, roles: list[str]) -> str:
-    is_metric = fmt in _METRIC_FORMATS or fmt == "Matrix-Row"
-    is_grouping = "Segment-Control" in roles or "Dropdown-Filter" in roles
-    if is_metric and is_grouping:
-        return "Both"
-    if is_metric:
-        return "Column-Eligible"
-    if is_grouping:
         return "Row-Eligible"
     return "None"
 
 
 def derive_capability(q: QuestionContext) -> dict[str, object]:
-    """Compute all six capability values for one question in a single pass."""
+    """Compute all five capability values for one question in a single pass."""
     fmt = _response_format(q)
-    roles = _control_roles(fmt, q)
     return {
         "response_format": fmt,
         "scale_of_measurement": _scale(fmt, q),
         "cardinality_class": _cardinality(fmt, q),
         "widget_compatibility": list(_WIDGETS.get(fmt, [])),
-        "control_role": roles,
-        "crosstab_axis_role": _crosstab_axis(fmt, roles),
+        "crosstab_axis_role": _crosstab_axis(fmt, q),
     }
 
 
@@ -206,24 +216,19 @@ def explain_capability(q: QuestionContext, dimension: str, value: object) -> str
                 f"{', '.join(str(w) for w in widgets)}. This is the structural "
                 "shortlist only; the dashboard service still checks whether the "
                 "response volume and distinct-value count make each one worth showing.")
-    if dimension == "control_role":
-        roles = value if isinstance(value, list) else []
-        if not roles:
-            return (f"A {fmt} answer cannot drive a dashboard control — it is something "
-                    "you filter, not something you filter by.")
-        return (f"A {fmt} answer can act as {', '.join(str(r) for r in roles)}. "
-                "Segment-Control additionally requires unweighted options and 2-15 of "
-                "them, so the buckets stay populated; a routing question always "
-                "qualifies.")
     if dimension == "crosstab_axis_role":
         return {
-            "Both": (f"A {fmt} answer both measures something and groups respondents, "
-                     "so it can sit on either axis of a cross-tab."),
+            "Both": (f"A {fmt} answer measures something, and the platform bands it "
+                     "(rs_type 2/3/4 or is_custom_metric) so those bands can group the "
+                     "rest of the survey too — it sits on either axis of a cross-tab."),
             "Column-Eligible": (f"A {fmt} answer is a measure, so it belongs in the "
                                 "cells/columns of a cross-tab — it is what gets "
-                                "compared, not what does the comparing."),
-            "Row-Eligible": (f"A {fmt} answer groups respondents, so it belongs on the "
-                             "row axis — it is what other questions get broken out by."),
+                                "compared, not what does the comparing. An unbanded "
+                                "scale stays here: you can filter on it without having "
+                                "an agreed grouping to break other questions out by."),
+            "Row-Eligible": (f"A {fmt} answer is a bounded set of choices rather than a "
+                             "measure, so it belongs on the row axis — it is what other "
+                             "questions get broken out by."),
             "None": (f"A {fmt} answer neither measures nor groups, so it has no place "
                      "in a cross-tab."),
         }.get(str(value), f"Derived from response_format {fmt}.")
@@ -285,11 +290,6 @@ class WidgetCompatibilityTagger(_CapabilityTagger):
     _multi = True
 
 
-class ControlRoleTagger(_CapabilityTagger):
-    tag_dimension = "control_role"
-    _multi = True
-
-
 class CrosstabAxisRoleTagger(_CapabilityTagger):
     tag_dimension = "crosstab_axis_role"
 
@@ -300,6 +300,5 @@ def create_tagger() -> list[QuestionTagger]:
         ScaleOfMeasurementTagger(),
         CardinalityClassTagger(),
         WidgetCompatibilityTagger(),
-        ControlRoleTagger(),
         CrosstabAxisRoleTagger(),
     ]

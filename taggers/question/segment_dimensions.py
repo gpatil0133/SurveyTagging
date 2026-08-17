@@ -14,7 +14,15 @@ from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
+from taggers._metric_utils import is_platform_metric
 from taggers.base import QuestionTagger
+
+
+# rs_type → the band a platform metric segments by. A metric is segmentable by
+# its own score band, not by a respondent attribute, so it gets its own branch:
+# without one, every NPS item in the corpus would land in the "segmentable but
+# nothing matched — worth a human look" bucket below and drown that signal.
+_METRIC_BANDS = {2: "NPS Band", 3: "CES Band", 4: "CSAT Band"}
 
 
 # Title keyword -> canonical dimension name
@@ -88,6 +96,29 @@ class SegmentDimensionsTagger(QuestionTagger):
                     "tell 'no dimensions' from 'never evaluated'.",
                     stage=4,
                     inputs={"is_segmentable": segmentable or "(unset)"},
+                ),
+            )
+
+        # A platform metric segments by its own band. Handled before the title
+        # patterns on purpose: a metric's title describes what is measured, not
+        # an attribute of the respondent, so "how satisfied were you with your
+        # branch location?" must not be read as a Location dimension.
+        if is_platform_metric(q):
+            band = _METRIC_BANDS.get(q.rs_type)
+            if band is None:
+                label = (q.custom_metric_title or "").strip()
+                band = f"{label} Band" if label else "Custom Metric Band"
+            return TagResult(
+                value=[band], source="deterministic", confidence=0.90,
+                evidence=ev.rule(
+                    "question.segment_dimensions.metric_band",
+                    f"The platform scores this question, so what it segments by is its "
+                    f"own score band ({band}) rather than a respondent attribute — "
+                    "everything else in the survey can be compared across those bands.",
+                    stage=4,
+                    inputs={"rs_type": q.rs_type,
+                            "is_custom_metric": q.is_custom_metric,
+                            "band": band},
                 ),
             )
 

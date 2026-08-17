@@ -5,8 +5,8 @@
 # is NEVER cached. Bump `version` whenever the cached_preamble shape changes —
 # the on-disk LLM response cache uses it as part of the key.
 
-version: "7.2"
-description: "Project-level survey classification — relationship_type, project_purpose, industry_vertical, audience_type, survey_sub_type, dashboard_routing."
+version: "7.4"
+description: "Project-level survey classification — relationship_type, project_purpose, project_intent, industry_vertical (free text), audience_type, survey_sub_type, dashboard_routing."
 
 cached_preamble: |
   You are an expert survey-classification specialist. Your task is to classify entire surveys across several analytical dimensions that power downstream reporting dashboards, journey maps, and benchmarking.
@@ -14,6 +14,7 @@ cached_preamble: |
   You reason about:
   - What kind of relationship a survey is measuring (transactional vs relational vs journey vs pulse)
   - The business purpose behind the survey
+  - What this specific survey is about, in a few words of your own
   - The industry vertical and audience
   - Which dashboards this survey's data should feed into
   - The sub-type of survey program (Pulse, Engagement, 360 Feedback, Transactional, etc.)
@@ -36,7 +37,8 @@ cached_preamble: |
   {
     "relationship_type": "{{ relationship_types | join(' | ') }}",
     "project_purpose": "{{ purposes | join(' | ') }}",
-    "industry_vertical": "{{ industries | join(' | ') }}",
+    "project_intent": "free text, max 8 words — see the rules below",
+    "industry_vertical": "free text, max 5 words — see the rules below",
     "audience_type_refined": "{{ audiences | join(' | ') }}",
     "survey_sub_type": "{{ sub_types | join(' | ') }}",
     "dashboard_names": ["array — pick from canonical dashboards below; can add ONE custom name only if needed"],
@@ -46,8 +48,23 @@ cached_preamble: |
     "reasoning": "2-4 sentences: how the calls above hang together"
   }
 
+  Rules for `industry_vertical` (free text — there is no list to pick from):
+  - Name the industry this account operates in, as someone in that industry would say it: "Healthcare", "Regional Retail Banking", "SaaS / Developer Tools", "K-12 Education", "Hospitality / Hotels".
+  - 1-5 words. Title Case. No trailing period, no quotes, no sentence.
+  - You are being asked ONLY when nothing better was known. If the tenant intelligence block names an industry, that value has already been kept and yours is discarded — so read the questions and the directory signals, which are what you have that the profile did not.
+  - Name the industry of the ACCOUNT running the survey, not the topic of the survey. A hospital's employee-engagement survey is still "Healthcare".
+  - A narrower honest label beats a broad one ("Credit Unions" over "Financial Services"), but never invent specificity the evidence does not carry. With genuinely thin evidence, return the broad vertical, or "Other" if even that is a guess.
+
+  Rules for `project_intent` (REQUIRED — free text, same shape rules apply):
+  - Name what THIS survey is trying to find out, in the words a person would use out loud: "Branch visit feedback", "Post-discharge care follow-up", "New-hire onboarding check-in", "Annual engagement pulse".
+  - 3-8 words. Title Case. A noun phrase — not a sentence, no trailing period, no quotes.
+  - It must be specific to this survey. `project_purpose` already carries the broad objective, so "Measure Loyalty" or "Customer Feedback" adds nothing; name the subject, moment, channel or population being asked about.
+  - Do NOT include the words "survey", "questionnaire", "form" or "poll", the tenant's name, or an edition marker (a year, a quarter, "FY26").
+  - Read the questions, not just the title. A title like "Q3 CX Survey" tells you nothing; the questions do. Where the title IS specific ("Branch Visit Feedback Survey 2026"), keep its subject.
+  - If the questions genuinely do not agree on one subject, name the broadest honest one ("Multi-Touchpoint Experience Feedback") rather than inventing a narrow one.
+
   Rules for `why` (REQUIRED — this is the audit trail):
-  - One entry per dimension you actually assigned above, keyed by the SAME key you used in the output ("relationship_type", "project_purpose", "industry_vertical", "audience_type_refined", "survey_sub_type", "dashboard_names"). Omit dimensions you left null.
+  - One entry per dimension you actually assigned above, keyed by the SAME key you used in the output ("relationship_type", "project_purpose", "project_intent", "industry_vertical", "audience_type_refined", "survey_sub_type", "dashboard_names"). Omit dimensions you left null.
   - Each line is shown on its own next to that one tag, to a reader who can see the survey and the assigned value but not your thinking. It must stand alone — do not write "as above" or "same signal as the previous field".
   - Name the concrete signal that drove THAT call: the survey title, a section header, the question mix, an NPS/CSAT item, the tenant profile, a directory domain. Quote the fragment when a few words carry the decision.
   - Do not restate the value. "purpose is Engagement because it measures engagement" is useless; "12 of 18 items ask about manager support and growth" is the reason.

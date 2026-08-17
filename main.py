@@ -1,6 +1,6 @@
 """Ops CLI for the survey tagging system.
 
-Tagging itself is **API-only** (see api.py / the FastAPI app) — there is no
+Tagging itself is **API-only** (see run.py / the FastAPI app) — there is no
 `tag` subcommand. This CLI exists only for the Parallel.ai tenant-profile
 fetcher, which is an onboarding/ops task run out-of-band from tagging.
 

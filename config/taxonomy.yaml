@@ -10,8 +10,8 @@
 # ---------------------------------------------------------------------------
 # The explanation layer (V7)
 #
-# Every dimension carries three extra fields, served by GET /api/taxonomy and
-# rendered as columns in the UI's Taxonomy tab. They answer the two questions a
+# Every dimension carries five extra fields, served by GET /api/taxonomy and
+# rendered as columns in the UI's Taxonomy tab. They answer the questions a
 # reader has when they meet a tag for the first time:
 #
 #   explanation  What this dimension IS, in plain language — what it means and
@@ -25,17 +25,41 @@
 #                  llm-refined    a rule writes a prior, an LLM call may override.
 #                  llm-only       only the LLM can produce the value.
 #                  placeholder    no signal source yet; a constant or empty value.
+#   purpose      WHY the dimension exists, in one line. The short answer to
+#                "what is this for?" — `explanation` is the long one. Kept in
+#                sync with the per-level "Purpose in one line" tables in
+#                docs/dimension-reference.md.
+#   feeds        WHICH outcome consumes the value. A list, most-immediate
+#                consumer first. Six of the tokens are the planned
+#                experience-platform services (architecture/02-experience-
+#                platform-services.md); three describe consumption today:
+#                  S1         Onboarding & Goal Prediction
+#                  S2         Survey Program Recommender
+#                  S3         Dashboard Composer
+#                  S4         Journey Builder
+#                  S5         Customer Profiling
+#                  S6         Recommendations, Alerts & Actions
+#                  Pipeline   another tagger or an LLM prompt inside THIS
+#                             service reads it (live, verifiable in-repo)
+#                  Reporting  read from the artifact / rendered by the survey
+#                             view by an existing reader (live)
+#                  None       nothing consumes it yet — placeholder dimensions
+#                Only Pipeline and Reporting are live; S1–S6 are designed, not
+#                built, so `feeds` is a contract, not an observed dependency.
 #
 # `description` is left as the terse backend-facing line it has always been —
-# `explanation` is the human one. Neither is enforced; both are documentation.
-# Keep `derivation` honest: when a rule is a stub or a fallback, say so. The
-# per-dimension deep dive (including known weaknesses) lives in
-# docs/tagging-logic-audit.md.
+# `explanation` is the human one. None of the five is enforced; all are
+# documentation. Keep `derivation` honest: when a rule is a stub or a fallback,
+# say so. The per-dimension deep dive (including known weaknesses) lives in
+# docs/tagging-logic-audit.md; the long-form "purpose / where used" prose lives
+# in docs/dimension-reference.md.
 # ---------------------------------------------------------------------------
 
 tenant_level:
   compliance_posture:
     description: "Tenant's regulatory compliance signature; backend uses this to set anonymization defaults and identifier policies."
+    purpose: "Sets anonymization and identifier policy for the whole account."
+    feeds: [Reporting, S1, S6]
     strategy: deterministic
     explanation: >-
       The regulatory regime the whole account operates under. Downstream this sets
@@ -60,6 +84,8 @@ tenant_level:
 
   customer_segment_signature:
     description: "Normalized customer segment shape. Backend uses this to prioritize default segmentation dimensions."
+    purpose: "Prioritizes which segmentation dimensions a dashboard offers by default."
+    feeds: [S1, S3, S5]
     strategy: deterministic
     explanation: >-
       The shape of who this tenant sells to — enterprise B2B, SMB B2B, consumers, or
@@ -81,6 +107,8 @@ tenant_level:
 
   workforce_signature:
     description: "Workforce composition shape. Backend uses this to select EX dashboard layout (frontline-ops vs knowledge-engagement)."
+    purpose: "Picks the EX dashboard layout and the channel an EX program is reached on."
+    feeds: [S2, S3, S5]
     strategy: deterministic
     explanation: >-
       What the tenant's workforce looks like — frontline-heavy, knowledge workers,
@@ -103,6 +131,8 @@ tenant_level:
 
   ex_maturity_signature:
     description: "Tenant's EX program maturity. Backend uses this to pick dashboard complexity (simple vs full driver/cross-tab)."
+    purpose: "Picks EX dashboard complexity, and the maturity roadmap baseline."
+    feeds: [S1, S3]
     strategy: deterministic
     explanation: >-
       How far along the tenant's employee-experience program is. Drives how complex
@@ -123,6 +153,8 @@ tenant_level:
 
   key_cx_touchpoints:
     description: "Flat list of semantic CX touchpoint / journey-stage names extracted from tenant_profile.cx_journeys. Used by backend to align widgets with tenant-specific touchpoints."
+    purpose: "The tenant's own CX vocabulary for widgets and journey views."
+    feeds: [S2, S4]
     strategy: deterministic
     explanation: >-
       The tenant's own customer touchpoint names, in their words. Lets widgets and
@@ -138,6 +170,8 @@ tenant_level:
 
   key_ex_lifecycle_stages:
     description: "Flat list of semantic EX lifecycle stage names from tenant_profile.ex_lifecycle_stages. Used by backend to align EX widgets."
+    purpose: "The EX counterpart of key_cx_touchpoints."
+    feeds: [S2, S4]
     strategy: deterministic
     explanation: >-
       The tenant's own employee-lifecycle stage names (hire, onboard, develop, exit,
@@ -153,6 +187,8 @@ tenant_level:
 project_level:
   project_type:
     description: "Survey program type (CX/EX/general Survey/Assessment). Renamed from `category` in V6."
+    purpose: "The top-level branch nearly everything else reads first."
+    feeds: [Pipeline, Reporting, S1, S2, S3, S4, S5, S6]
     strategy: deterministic
     explanation: >-
       Which program the survey belongs to. This is the top-level branch almost every
@@ -170,6 +206,8 @@ project_level:
 
   survey_cadence:
     description: "Deployment frequency pattern"
+    purpose: "How often it actually ships - trend windows and fatigue caps."
+    feeds: [Pipeline, S2, S3, S6]
     strategy: statistical
     explanation: >-
       How often the survey actually goes out — once, on a repeating schedule,
@@ -189,6 +227,8 @@ project_level:
 
   relationship_type:
     description: "Nature of the respondent relationship being measured"
+    purpose: "Transaction vs relationship vs journey vs pulse; implies the follow-up window."
+    feeds: [Pipeline, S2, S6]
     strategy: llm-refined
     explanation: >-
       What kind of relationship the survey measures: a single transaction just
@@ -210,6 +250,8 @@ project_level:
 
   project_purpose:
     description: "Primary business objective of the survey"
+    purpose: "The business question the survey answers; the portfolio grouping key."
+    feeds: [Pipeline, S1, S2]
     strategy: llm-refined
     explanation: >-
       The business question the survey exists to answer. The single most useful
@@ -233,8 +275,32 @@ project_level:
       - Compliance / Audit
       - Event / Program Feedback
 
+  project_intent:
+    description: "Short free-text statement of what THIS survey is trying to find out"
+    purpose: "What THIS survey asks about, in <=8 words of the customer's language."
+    feeds: [Reporting, S1, S2]
+    strategy: llm-only
+    explanation: >-
+      The survey's intent in a handful of words — "Branch visit feedback",
+      "Post-discharge care follow-up", "New-hire onboarding check-in". Where
+      project_purpose picks one of eight business objectives, this names the specific
+      subject or moment being asked about, at the granularity a person would use to
+      describe the survey in one line. Free text on purpose: an enum cannot hold
+      "branch visit".
+    derivation: >-
+      LLM Call 1 writes it (max 8 words) from the title, description, section headers
+      and question mix. The tagger only seeds a fallback from the survey title with
+      the boilerplate stripped ("2026 Branch Visit Feedback Survey" -> "Branch Visit
+      Feedback"), held at 0.45 so the call always wins; with no usable title it
+      returns pending_llm. Stage 4, taggers/project/project_intent.py. user_defined,
+      so the value is never enum-checked — only trimmed and length-capped.
+    allowed_values: []
+    user_defined: true
+
   lifecycle_status:
     description: "Current deployment state of the survey"
+    purpose: "Whether the numbers are still moving."
+    feeds: [Reporting, S3, S4]
     strategy: deterministic
     explanation: >-
       Where the survey is in its own life: still being built, live and collecting, or
@@ -251,6 +317,8 @@ project_level:
 
   audience_type:
     description: "Target respondent group"
+    purpose: "Customers vs employees - gates dashboards and journey canon."
+    feeds: [Pipeline, S3, S5, S6]
     strategy: llm-refined
     explanation: >-
       Who is being asked — the tenant's customers, a bought panel, its own employees,
@@ -269,31 +337,35 @@ project_level:
       - Mixed
 
   industry_vertical:
-    description: "Industry domain of the survey"
-    strategy: llm-refined
+    description: "Industry domain of the survey (free text — the researcher's own words when a profile supplies them)"
+    purpose: "Selects the industry journey template and the benchmark family."
+    feeds: [Pipeline, S1, S2]
+    strategy: hybrid
     explanation: >-
-      The industry the survey is run in. Selects the industry journey-stage template
-      that seeds the tenant canon, and colours several downstream defaults.
+      The industry the survey is run in, in the words of whichever source knew it
+      best. Free text rather than an enum: the research agent already returns a
+      precise label ("Healthcare & Life Sciences", "Regional Retail Banking") and
+      collapsing that onto a ten-value list threw away the only part worth reading.
+      Familiar shapes — Healthcare, Financial Services, Retail / E-commerce, Higher
+      Education, K-12 Education, SaaS / Technology, Hospitality / Travel, Fitness &
+      Wellness, Government / Public Sector — are examples, not a closed set.
     derivation: >-
-      Four tiers, best available wins: (1) the Directory's `inferred_domains`;
-      (2) the tenant profile's industry through a fragment normalizer, confidence
-      keyed to `org_confidence`; (3) a caller-supplied industry override; (4) keyword
-      scoring over the survey title and question titles. Nothing matches -> Other.
-      Stage 1, taggers/project/industry.py — LLM Call 1 may override any tier.
-    allowed_values:
-      - Healthcare
-      - Financial Services
-      - "Retail / E-commerce"
-      - Higher Education
-      - K-12 Education
-      - "SaaS / Technology"
-      - "Hospitality / Travel"
-      - "Fitness & Wellness"
-      - "Government / Public Sector"
-      - Other
+      The tenant profile decides when it has an answer: the org research agent's
+      industry is stored VERBATIM (with its sub-vertical when it names one) at a
+      confidence above the LLM override threshold, so Call 1 leaves it alone — a
+      researched label is not something a survey-text reader improves on. With no
+      profile the tagger only seeds a guess — the Directory's `inferred_domains`,
+      a caller-supplied override, then keyword scoring over the survey and question
+      titles, and Other when nothing matches — all held below that threshold, so
+      LLM Call 1 rewrites it. Stage 1, taggers/project/industry.py. user_defined,
+      so the value is never enum-checked — only trimmed and length-capped.
+    allowed_values: []
+    user_defined: true
 
   ai_assist_flag:
     description: "How the survey was created"
+    purpose: "Authoring provenance. Not yet derivable - every value reads Manual."
+    feeds: [None]
     strategy: placeholder
     explanation: >-
       Whether a person wrote the survey, wrote it with AI help, or had AI generate it
@@ -310,6 +382,8 @@ project_level:
 
   program_initiative:
     description: "User-defined label grouping surveys under one business initiative"
+    purpose: "The customer's own initiative label. Human input."
+    feeds: [None]
     strategy: placeholder
     explanation: >-
       The customer's own label for the initiative a group of surveys belongs to
@@ -324,6 +398,8 @@ project_level:
 
   owner_team:
     description: "Department, team, or individual accountable for the project"
+    purpose: "Who answers for the results. The address on a routed action."
+    feeds: [S6]
     strategy: placeholder
     explanation: >-
       Who owns the survey and answers for its results. Used for routing and
@@ -340,6 +416,8 @@ project_level:
 
   survey_sub_type:
     description: "Detailed survey sub-classification within CX/EX"
+    purpose: "Which instrument inside the CX/EX program."
+    feeds: [Pipeline, S2, S3]
     strategy: llm-refined
     explanation: >-
       The finer classification inside the CX/EX programme — a pulse, a lifecycle
@@ -371,6 +449,8 @@ project_level:
 
   dashboard_routing:
     description: "Which dashboards this survey should appear on (multi-label)"
+    purpose: "Which dashboards the survey feeds; the allow-list for question placement."
+    feeds: [Pipeline, S3]
     strategy: llm-refined
     explanation: >-
       Which dashboards this survey feeds. Also acts as the allow-list that the
@@ -400,6 +480,8 @@ project_level:
 question_level:
   topic_theme:
     description: "Subject matter of the question"
+    purpose: "The subject axis you group results along."
+    feeds: [S3, S5, S6]
     strategy: llm-refined
     explanation: >-
       What the question is about, subject-wise. The axis you group questions along
@@ -426,6 +508,8 @@ question_level:
 
   role_intent:
     description: "Analytical function of the question within the survey"
+    purpose: "The job the question does; the most-read question dimension."
+    feeds: [Pipeline, S3, S5]
     strategy: llm-refined
     explanation: >-
       The job the question does in the analysis — is it the headline metric, a driver
@@ -455,6 +539,8 @@ question_level:
 
   data_sensitivity:
     description: "PII or sensitive data classification"
+    purpose: "PII classification - masking, retention, access."
+    feeds: [Reporting, S6]
     strategy: deterministic
     explanation: >-
       What personal or sensitive data an answer to this question would capture. The
@@ -480,6 +566,8 @@ question_level:
 
   respondent_sensitivity:
     description: "Impact on respondent experience"
+    purpose: "What the question costs the respondent; what to cut when a survey is too long."
+    feeds: [S2]
     strategy: llm-refined
     explanation: >-
       What the question costs the person answering it — emotional load, political
@@ -501,6 +589,8 @@ question_level:
 
   flow_placement:
     description: "Position within the survey flow"
+    purpose: "Positional slot in the respondent's path."
+    feeds: [Pipeline, S2]
     strategy: deterministic
     explanation: >-
       Where the question sits in the respondent's path through the survey. Purely
@@ -520,17 +610,27 @@ question_level:
 
   flow_logic_role:
     description: "Role in survey branching and logic"
-    strategy: deterministic
+    purpose: "Part played in the branching/piping machinery."
+    feeds: [S2]
+    strategy: hybrid
     explanation: >-
       The part the question plays in the survey's branching and piping machinery —
       what it triggers, what it feeds, what it can end. Empty for the majority of
-      questions, which simply sit in the flow.
+      questions, which simply sit in the flow. Read `source` before acting on a
+      value: the survey payload carries no logic definitions, so some entries are
+      platform facts and some are a model's reading of the wording.
     derivation: >-
-      Reads the platform's own logic signals: a hidden-routing question -> Branching
+      Two passes, unioned. Stage 3 (taggers/question/flow_logic.py, deterministic,
+      0.90) reads the platform's own signals: a hidden-routing question -> Branching
       Trigger; a follow-up -> Branching Target; piping markers in the text -> Piping
       Target; being named as another question's parent metric -> Piping Source; an
-      early yes/no -> Termination Trigger. Multi-label; empty list when none apply.
-      Stage 3, taggers/question/flow_logic.py. Never LLM-refined.
+      early yes/no -> Termination Trigger. Stage 5 (LLM Call 2, 0.55) may ADD
+      Branching Trigger, Skip Logic Source, Termination Trigger or Loop Trigger when
+      the wording reads like a gate, screener or loop setup — the other four values
+      are never inferable and the call may never remove a structural entry. A tag
+      holding both reads source=hybrid; the evidence names which pass produced each
+      role. Multi-label; empty list when none apply. Quota Controller is currently
+      unreachable — nothing in the payload reveals a quota.
     multi_label: true
     allowed_values:
       - Branching Trigger
@@ -544,6 +644,8 @@ question_level:
 
   flow_dependency:
     description: "Dependency relationships with other questions"
+    purpose: "Whether its response base is the full sample."
+    feeds: [S3, S5]
     strategy: deterministic
     explanation: >-
       How this question depends on what came before it — shown only under a
@@ -565,6 +667,8 @@ question_level:
 
   flow_respondent_experience:
     description: "Effect on respondent engagement and flow"
+    purpose: "Effect on engagement at that point in the flow."
+    feeds: [S2]
     strategy: llm-refined
     explanation: >-
       What the question does to engagement at that point in the flow — reassures,
@@ -583,6 +687,8 @@ question_level:
 
   flow_reusability:
     description: "Standardization and reuse potential"
+    purpose: "Benchmarkable / reusable / one-off."
+    feeds: [S1, S2, S3]
     strategy: llm-refined
     explanation: >-
       Whether this is a standard instrument you could benchmark against, a reusable
@@ -602,6 +708,8 @@ question_level:
 
   apply_method:
     description: "How the tag was assigned"
+    purpose: "System- vs user-applied provenance. Constant today."
+    feeds: [None]
     strategy: placeholder
     explanation: >-
       Whether the tags on this question were applied by the system or set by a
@@ -618,6 +726,8 @@ question_level:
 
   metric_type:
     description: "Classification of the question's measurement type"
+    purpose: "What kind of measurement it is."
+    feeds: [Pipeline, S3, S5]
     strategy: deterministic
     explanation: >-
       What kind of measurement the question is: a standard metric the platform knows
@@ -638,6 +748,8 @@ question_level:
 
   metric_name:
     description: "Named metric this question measures"
+    purpose: "The name of the measure - what a chart title says."
+    feeds: [Pipeline, S1, S3, S5]
     strategy: hybrid
     explanation: >-
       The name of the thing being measured — NPS, CSAT, CES, eNPS, or a short label
@@ -663,6 +775,8 @@ question_level:
 
   calculation_type:
     description: "How responses should be aggregated"
+    purpose: "How to aggregate the answers."
+    feeds: [Reporting, S3, S5]
     strategy: deterministic
     explanation: >-
       How answers should be rolled into a single number. Reporting reads this to know
@@ -686,37 +800,63 @@ question_level:
 
   is_filterable:
     description: "Whether this question can serve as a filter/facet in reporting UI"
+    purpose: "Drives the dashboard filter bar. Yes for choice lists AND scales."
+    feeds: [Reporting, S3, S5]
     strategy: deterministic
     explanation: >-
       Whether the reporting UI can offer this question as a filter. A structural
       capability, not a recommendation — the dashboard service still checks whether
-      the data makes it worth showing.
+      the data makes it worth showing. Two shapes qualify: a bounded list of
+      choices, and a bounded scale (a metric) — "Promoters only" is a filter.
     derivation: >-
-      Question-type whitelist: L, R, C, HR, ML and SR -> Yes, everything else -> No.
-      Stage 3, taggers/question/is_filterable.py. The V7 control_role dimension
-      states the same capability in richer form and supersedes it. Never LLM-refined.
+      Yes for anything whose answer falls in a bounded, discrete set. Metrics and
+      scales are checked first, because the platform's flags outrank the question
+      type: rs_type 2/3/4 (NPS/CES/CSAT) or the is_custom_metric flag -> Yes at 1.0;
+      a rating/ranking type (RS/RT/RW/RK) or a grid row (GR/GC/RG/GQ) -> Yes at 0.90
+      (inferred from the type, and weights are NOT required — an unweighted 1-5 scale
+      still has five discrete answers). Then the choice-type whitelist L, R, C, HR,
+      ML, SR -> Yes. Free text, contact/signature and unrecognized types -> No.
+      Stage 3, taggers/question/is_filterable.py; the scale predicate is shared with
+      the dashboard-capability layer via taggers/_metric_utils.py so the two cannot
+      resolve it differently. Since V7.3 this is the only statement of the
+      capability — control_role, which restated it, was removed. Note free text is
+      No here and still searchable: text search reads response_format ==
+      "Open-Text". Never LLM-refined.
     allowed_values:
       - "Yes"
       - "No"
 
   is_segmentable:
     description: "Whether responses can be used to segment/cross-tab other data"
+    purpose: "Whether it can break down other questions - incl. a platform metric's bands."
+    feeds: [Pipeline, S3, S5]
     strategy: deterministic
     explanation: >-
       Whether this question's answers can be used to break down other questions —
-      "NPS by region" needs region to be segmentable.
+      "NPS by region" needs region to be segmentable. A platform metric's own bands
+      count: "everything else by NPS band" is the same comparison seen from the
+      other side.
     derivation: >-
       From role_intent and structure: a Segmentation or Profiling / Demographic role
-      -> Yes; a hidden-routing question -> Yes; an unweighted choice question with
-      between 2 and 15 options -> Yes; otherwise No. Stage 4,
-      taggers/question/is_segmentable.py. Gates segment_dimensions. Never
-      LLM-refined.
+      -> Yes; a hidden-routing question -> Yes; a PLATFORM-scored metric (rs_type
+      2/3/4 or the is_custom_metric flag) -> Yes at 0.90, since the platform supplies
+      the bands to group by; an unweighted choice question (L/R/C/SR/ML) with between
+      2 and 15 options -> Yes; otherwise No. A rating scale the platform has not
+      flagged is deliberately filterable without being segmentable — scale points
+      make a facet, but there is no agreed banding to group other questions by.
+      Stage 4, taggers/question/is_segmentable.py. Gates segment_dimensions. Since
+      V7.3 this is the only statement of the capability: control_role's
+      Segment-Control was removed rather than kept in sync, because being derived at
+      Stage 3 it could not read role_intent and so disagreed with this dimension
+      wherever role_intent decides. Never LLM-refined.
     allowed_values:
       - "Yes"
       - "No"
 
   stat_test_eligible:
     description: "Whether statistical tests can be applied to responses"
+    purpose: "Whether significance testing is meaningful, and which family."
+    feeds: [Reporting, S3, S5]
     strategy: deterministic
     explanation: >-
       Whether significance testing is meaningful on this question, and which family
@@ -735,6 +875,8 @@ question_level:
 
   trend_trackable:
     description: "Whether this question should be tracked over time"
+    purpose: "Whether it is worth plotting across waves."
+    feeds: [Pipeline, S3, S6]
     strategy: deterministic
     explanation: >-
       Whether the question is worth plotting across waves. Metrics trend; "which
@@ -750,17 +892,22 @@ question_level:
 
   segment_dimensions:
     description: "Specific dimensions this question can segment data by"
+    purpose: "WHICH respondent attributes it slices by, comparably across surveys."
+    feeds: [S3, S5]
     strategy: hybrid
     explanation: >-
       Which respondent attributes this question actually slices by — department,
-      region, age, tenure, plan tier. Where is_segmentable says whether, this says
-      what.
+      region, age, tenure, plan tier — or, for a platform metric, its own score band.
+      Where is_segmentable says whether, this says what.
     derivation: >-
-      Only runs when is_segmentable is Yes; otherwise an empty list. Then 21 title
-      regexes (department, region, age, gender, role, tenure, product, plan/tier,
-      grade, ...) plus 17 answer-option keywords are unioned into a list; segmentable
-      but nothing matched -> an empty list at lower confidence. Multi-label and
-      user_defined, so labels are not enum-checked. Stage 4,
+      Only runs when is_segmentable is Yes; otherwise an empty list. A platform
+      metric returns its band ("NPS Band" / "CES Band" / "CSAT Band", or
+      "<custom metric title> Band") and stops there — its title describes what is
+      measured, not an attribute of the respondent. Everything else goes through 21
+      title regexes (department, region, age, gender, role, tenure, product,
+      plan/tier, grade, ...) plus 17 answer-option keywords, unioned into a list;
+      segmentable but nothing matched -> an empty list at lower confidence.
+      Multi-label and user_defined, so labels are not enum-checked. Stage 4,
       taggers/question/segment_dimensions.py.
     multi_label: true
     allowed_values: []
@@ -768,6 +915,8 @@ question_level:
 
   journey_stage:
     description: "Customer/employee lifecycle stage this question maps to (industry-dependent enum). Tagged ONLY for journey-eligible metric questions: NPS/CSAT/CES (rs_type 2/3/4) or platform-flagged custom metric (is_custom_metric=True). All other questions get status=skipped."
+    purpose: "The tenant journey stage a metric belongs to."
+    feeds: [Pipeline, Reporting, S2, S4]
     strategy: llm-only
     explanation: >-
       Which stage of this tenant's own customer or employee journey the metric
@@ -790,6 +939,8 @@ question_level:
 
   sub_stage_name:
     description: "LLM-derived semantic sub-stage label for this metric question's journey tag (2-5 word Title Case, e.g. 'Overall Satisfaction', 'Checkout Ease'). Tagged ONLY for journey-eligible metric questions; status=skipped otherwise. Clustered into canonical per-stage sub-stages at the tenant level."
+    purpose: "The readable label inside that stage."
+    feeds: [Reporting, S4]
     strategy: llm-only
     explanation: >-
       A short business-language label for what exactly the metric measures inside its
@@ -805,6 +956,8 @@ question_level:
 
   visualization_type:
     description: "Recommended chart type for this question's data"
+    purpose: "The single default chart pick."
+    feeds: [Reporting, S3]
     strategy: llm-refined
     explanation: >-
       The single recommended chart for this question — the default pick.
@@ -832,6 +985,8 @@ question_level:
 
   dashboard_placement:
     description: "Which dashboards this question should appear on (multi-label)"
+    purpose: "Which dashboards this question surfaces on."
+    feeds: [S3]
     strategy: llm-refined
     explanation: >-
       Which dashboards this specific question should surface on, inside the set the
@@ -850,6 +1005,8 @@ question_level:
 
   display_role:
     description: "How this question should be displayed on dashboards"
+    purpose: "How prominent it is once on a dashboard."
+    feeds: [S3]
     strategy: llm-refined
     explanation: >-
       How prominent the question should be once it is on a dashboard — the headline
@@ -880,6 +1037,8 @@ question_level:
 
   response_format:
     description: "Canonical answer shape of the question. The anchor field the rest of the capability layer derives from. Deterministic from rs_type + question_type + option weights."
+    purpose: "Canonical answer shape - the capability-layer anchor."
+    feeds: [Pipeline, S3]
     strategy: deterministic
     explanation: >-
       The canonical shape of the answer, independent of how the question is worded.
@@ -908,6 +1067,8 @@ question_level:
 
   scale_of_measurement:
     description: "Statistical level of measurement. Independently gates valid chart types AND stat_test_eligible. Nominal=categories, Ordinal=ranked, Interval=equal-spacing (e.g. NPS 0-10), Ratio=true zero."
+    purpose: "Which maths the answers legitimately support."
+    feeds: [Pipeline, S3]
     strategy: deterministic
     explanation: >-
       What maths the answers legitimately support. Nominal answers can only be
@@ -929,6 +1090,8 @@ question_level:
 
   cardinality_class:
     description: "Shape of the value space; gatekeeps pie-vs-bar-vs-histogram-vs-wordcloud. Derived from option_count and response_format."
+    purpose: "Size of the value space; the chart-readability gate."
+    feeds: [Pipeline, S3]
     strategy: deterministic
     explanation: >-
       How large the value space is. The practical question it answers is whether a
@@ -948,6 +1111,8 @@ question_level:
 
   widget_compatibility:
     description: "The SET of chart/widget types that can validly render this question. `visualization_type` remains the single DEFAULT pick; this is the full allow-list the dashboard service chooses from. Derived by rule table over response_format + scale_of_measurement + cardinality_class."
+    purpose: "Every widget that could validly render it."
+    feeds: [S3]
     strategy: deterministic
     explanation: >-
       Every widget that could validly render this question, not just the default one.
@@ -978,41 +1143,39 @@ question_level:
       - Scatter Plot
       - Map
 
-  control_role:
-    description: "Which dashboard control roles this question can play (multi-label). Supersedes and folds in is_filterable + is_segmentable — those remain as derived boolean projections. A demographic can be BOTH a Dropdown-Filter and a Segment-Control."
-    strategy: deterministic
-    explanation: >-
-      What dashboard controls the question can drive — a filter dropdown, a segment
-      control other questions get broken out by, or free-text search. The richer form
-      of is_filterable and is_segmentable, which remain as boolean projections; a
-      demographic is usually both.
-    derivation: >-
-      From response_format: the select formats -> Dropdown-Filter, plus
-      Segment-Control when the options are unweighted and number between 2 and 15 so
-      the buckets stay populated (a hidden-routing question always qualifies);
-      Open-Text -> Search-Filter; everything else -> none. Stage 3,
-      taggers/question/dashboard_capability.py. Never LLM-refined.
-    multi_label: true
-    allowed_values:
-      - Dropdown-Filter     # facet the UI can filter by
-      - Date-Filter
-      - Segment-Control     # can meaningfully segment OTHER questions
-      - Search-Filter       # free-text search over verbatims
-      - None
+  # `control_role` was removed in V7.3. It restated is_filterable, is_segmentable
+  # and "is this Open-Text" as one multi-label field, so three dimensions had to be
+  # held in agreement — and because it is derived at Stage 3 it could not see
+  # role_intent, so it disagreed with is_segmentable on exactly the questions where
+  # role_intent decides. Two of its five values (Date-Filter, None) were never
+  # emitted at all. Read the dashboard controls off the dimensions below instead;
+  # `derived_controls` on crosstab_axis_role states the mapping.
 
   crosstab_axis_role:
     description: "Eligibility as an axis when combining questions in a table / cross-tab widget. Column-Eligible = a measured metric; Row-Eligible = a grouping dimension."
+    purpose: "Which cross-tab axis it can occupy."
+    feeds: [S3]
     strategy: deterministic
     explanation: >-
       Which axis of a cross-tab the question can occupy: a measure belongs in the
       columns (it is what gets compared), a grouping attribute on the rows (it is
-      what does the comparing), and some questions can do both.
+      what does the comparing), and a platform-banded metric can do both.
     derivation: >-
-      Combines response_format and control_role: metric-shaped formats and matrix
-      rows are measures; anything holding a Dropdown-Filter or Segment-Control role
-      is a grouping. Both -> Both, measure only -> Column-Eligible, grouping only ->
-      Row-Eligible, neither -> None. Stage 3,
-      taggers/question/dashboard_capability.py. Never LLM-refined.
+      From response_format plus one flag: metric-shaped formats and matrix rows are
+      measures -> Column-Eligible, upgraded to Both when the platform scores the
+      metric (rs_type 2/3/4 or is_custom_metric) and therefore supplies bands the
+      rest of the survey can be grouped by; the select formats are groupings ->
+      Row-Eligible; everything else -> None. A metric you can merely filter on
+      stays Column-Eligible — it is still what gets compared — so an unflagged
+      rating scale or a grid row reads Column-Eligible while an NPS item reads
+      Both. Stage 3, taggers/question/dashboard_capability.py. Never LLM-refined.
+    # How a dashboard composer picks its controls now that `control_role` is gone.
+    # These are read off dimensions already in the output — no field restates them.
+    derived_controls:
+      filter_dropdown: 'is_filterable == "Yes"'
+      segment_picker:  'is_segmentable == "Yes"'
+      text_search:     'response_format == "Open-Text"'
+      date_filter:     "not derivable — there is no date response format"
     allowed_values:
       - Row-Eligible
       - Column-Eligible
@@ -1029,6 +1192,8 @@ question_level:
 
   driver_link:
     description: "For key-driver questions (raw is_key_driver=True): marks the question as an explanatory driver to be paired with the outcome metric it explains. Value carries the linked outcome metric question_id when resolvable, else the flag 'Key Driver'. status=skipped for non-drivers. Source: is_key_driver."
+    purpose: "Pairs a driver with the outcome metric it explains."
+    feeds: [S3, S5]
     strategy: deterministic
     explanation: >-
       Marks a question the platform treats as a key driver and points at the outcome
@@ -1044,6 +1209,8 @@ question_level:
 
   verbatim_link:
     description: "For follow-up / open-text questions attached to a parent metric (raw is_followup_question + metric_question_id): the parent metric question_id this question elaborates, so its verbatim/detail can be rendered alongside the parent's widget. status=skipped when standalone. Source: metric_question_id."
+    purpose: "Pairs a verbatim with its parent metric."
+    feeds: [S3, S6]
     strategy: deterministic
     explanation: >-
       The parent metric a follow-up question elaborates. "Why did you give that
@@ -1058,6 +1225,8 @@ question_level:
 
   block_id:
     description: "Grouping key for questions that belong to one matrix/grid block (raw matrix_group_title, matrix_group_size > 1), so the dashboard service can render the whole block as a single heat-map/table widget. Value is the matrix group identifier; status=skipped for standalone questions. Source: matrix_group_*."
+    purpose: "Groups matrix rows into one widget."
+    feeds: [S3]
     strategy: deterministic
     explanation: >-
       The matrix block a question belongs to. Rows in a block share a scale and are

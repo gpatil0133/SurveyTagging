@@ -2,10 +2,22 @@
 
 Stage 4, deterministic. Depends on role_intent (Stage 3).
 
+Since V7.3 this is the *only* statement of the capability: `control_role`'s
+`Segment-Control` was removed rather than kept in sync, because it was derived at
+Stage 3 and so could not see `role_intent` — the first and strongest rule here.
+A dashboard's segment picker reads this dimension.
+
 Distinction vs is_filterable:
   - filterable = "can be used as a filter facet in UI"
   - segmentable = "can MEANINGFULLY segment OTHER questions' results"
-    (demographics, behavioral groups, routing questions)
+    (demographics, behavioral groups, routing questions, metric bands)
+
+Metric bands qualify: "everything else by NPS band" is the standard driver read,
+and it is the same comparison as "NPS by region" seen from the other side. Only
+PLATFORM-scored metrics get it — they are the ones with canonical bands. An
+unflagged rating scale is filterable (a scale point is a facet) without being
+segmentable (no agreed banding to group by), which is exactly the difference
+this dimension exists to record.
 """
 
 from __future__ import annotations
@@ -14,10 +26,20 @@ from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
+from taggers._metric_utils import (
+    bounded_scale_kind,
+    describe_scale_kind,
+    is_platform_metric,
+)
 from taggers.base import QuestionTagger
 
 
 _SEGMENTING_ROLES = {"Segmentation", "Profiling / Demographic"}
+
+# Choice types whose options form groups you can break other questions out by.
+# Mirrors `_FILTERABLE_TYPES` in is_filterable.py minus HR, which is handled by
+# its own branch above (a routing question qualifies whatever its option count).
+_BUCKETING_TYPES = {"L", "R", "C", "SR", "ML"}
 
 
 class IsSegmentableTagger(QuestionTagger):
@@ -72,8 +94,31 @@ class IsSegmentableTagger(QuestionTagger):
                 ),
             )
 
-        # Categorical without weights AND feasible number of buckets (≤15)
-        if q.question_type in ("L", "R", "C", "SR"):
+        # Platform-scored metric = canonical bands = a grouping variable.
+        if is_platform_metric(q):
+            return TagResult(
+                value="Yes", source="deterministic", confidence=0.90,
+                evidence=ev.rule(
+                    "question.is_segmentable.platform_metric",
+                    f"This is {describe_scale_kind(bounded_scale_kind(q) or '')}. Those "
+                    "bands are a grouping variable, not just a filter: comparing every "
+                    "other answer across promoters and detractors is the standard "
+                    "driver read. Scales the platform has NOT flagged fall through to "
+                    "the bucket rule below — they have no agreed banding to group by.",
+                    stage=4,
+                    inputs={"rs_type": q.rs_type,
+                            "is_custom_metric": q.is_custom_metric,
+                            "role_intent": role or "(unset)"},
+                ),
+            )
+
+        # Categorical without weights AND feasible number of buckets (≤15).
+        # ML (multi-select) belongs here: a respondent picking several options
+        # lands in several groups, which is how "by product owned" is read. It
+        # was missing until V7.3, and the omission was invisible because the
+        # since-removed `control_role` computed the same capability from
+        # `response_format` (where ML *is* a select shape) and disagreed.
+        if q.question_type in _BUCKETING_TYPES:
             has_weights = any(o.weight is not None for o in q.answer_options)
             n_opts = len(q.answer_options)
             if not has_weights and 2 <= n_opts <= 15:
@@ -100,11 +145,13 @@ class IsSegmentableTagger(QuestionTagger):
                 "question.is_segmentable.not_a_grouping",
                 f"Nothing makes this a grouping variable: its role is "
                 f"{role or 'unset'} rather than segmentation or demographic, it is not "
-                f"a routing question, and type {q.question_type} with "
+                f"a routing question, the platform does not score it as a metric (so "
+                f"there are no bands to group by), and type {q.question_type} with "
                 f"{len(q.answer_options)} option(s) does not give clean unweighted "
-                "buckets.",
+                "buckets. It may still be filterable — see is_filterable.",
                 stage=4,
                 inputs={"question_type": q.question_type,
+                        "rs_type": q.rs_type,
                         "role_intent": role or "(unset)",
                         "option_count": len(q.answer_options)},
             ),

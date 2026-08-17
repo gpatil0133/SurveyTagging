@@ -49,8 +49,9 @@ window.ST = window.ST || {};
   /* Bump the version suffix whenever /api/taxonomy's response shape grows a
    * field the UI reads — a session that cached the old shape would otherwise
    * render blank columns until the tab is closed. v2 = the explanation layer
-   * (explanation / derivation / strategy) plus tenant-level dimensions. */
-  var SS = { taxonomy: "st.taxonomy.v2" };
+   * (explanation / derivation / strategy) plus tenant-level dimensions.
+   * v3 = purpose + feeds. */
+  var SS = { taxonomy: "st.taxonomy.v3" };
 
   /* The platform shell's access token, written to same-origin localStorage on
    * login and on every silent renewal. We only ever READ it: the shell owns the
@@ -159,6 +160,12 @@ window.ST = window.ST || {};
     activeSurveyNo: null,
     survey: null,                    // normalized payload
     surveyError: null,
+    surveyLoading: false,            // a GET for activeSurveyNo is in flight
+    /* Tag runs in flight, keyed corp|survey. A tag POST outlives the survey the
+     * user is looking at — they start one and move on — so "is this row being
+     * tagged?" cannot be answered by a single active-survey flag. The corp is
+     * part of the key because survey numbers repeat across corps. */
+    tagging: {},
     etags: {},                       // {"<no>|jc": etag}
     activeTab: "summary",            // summary | project | questions | journey | raw
     includeCandidates: false,
@@ -171,8 +178,8 @@ window.ST = window.ST || {};
     expandedQuestions: new Set(),
 
     tenantSection: "tags",           // tags | profile | batch | taxonomy
-    tenantTags: null, tenantTagsError: null,
-    profile: null, profileError: null,
+    tenantTags: null, tenantTagsError: null, tenantTagsLoading: false,
+    profile: null, profileError: null, profileLoading: false,
     profileAgents: {},               // {org: envelope|"loading"|"missing"|"error: …"}
     profileJob: null,                // {startedAt, website, agents, polls}
     profileTimer: null,
@@ -184,7 +191,7 @@ window.ST = window.ST || {};
     // shape, which is the stricter of the two (needs a website), so the form
     // can never submit something the server would reject.
     config: { profile_source: "parallel", smx_allow_generate: true,
-              smx_generate_wait_seconds: 90 },
+              smx_generate_wait_seconds: 90, smx_token_configured: false },
     busy: 0,
     slowWarn: false,
     banner: null,                    // {kind, text, actionsHtml}
@@ -217,8 +224,19 @@ window.ST = window.ST || {};
       var tab = localStorage.getItem(LS.tab);
       state.activeTab = SURVEY_TABS.some(function (t) { return t.key === tab; })
         ? tab : "summary";
+      // A stored job is only worth resuming while it could still be running.
+      // Past the watch ceiling it is a banner and a 30s poll that will never
+      // resolve — the run it described ended (or died) sessions ago.
       var job = localStorage.getItem(LS.profileJob);
-      if (job) state.profileJob = JSON.parse(job);
+      if (job) {
+        var parsed = JSON.parse(job);
+        var maxAge = PROFILE_MAX_POLLS * POLL_PROFILE_MS;
+        if (parsed && parsed.startedAt && (Date.now() - parsed.startedAt) < maxAge) {
+          state.profileJob = parsed;
+        } else {
+          localStorage.removeItem(LS.profileJob);
+        }
+      }
       var tax = sessionStorage.getItem(SS.taxonomy);
       if (tax) { state.taxonomy = JSON.parse(tax); D.set(state.taxonomy); }
     } catch (e) { /* ignore malformed storage */ }
@@ -646,13 +664,19 @@ window.ST = window.ST || {};
     }
 
     el.nav.innerHTML = rows.map(function (s) {
-      var dot = s.tagged === true ? "tagged" : (s.tagged === false ? "untagged" : "unknown");
+      // A row being tagged says so in the sidebar, which is what makes walking
+      // away from it safe to do: the job is still visibly running somewhere.
+      var busy = isTagging(s.survey_no);
+      var dot = busy ? "working"
+        : s.tagged === true ? "tagged" : (s.tagged === false ? "untagged" : "unknown");
       var name = state.surveyNames[s.survey_no] || "";
+      var title = busy ? "Tagging in progress" : name;
       return '<li class="survey-item' +
         (state.activeSurveyNo === s.survey_no ? " active" : "") +
+        (busy ? " tagging" : "") +
         '" role="button" tabindex="0"' +
         ' data-action="select-survey" data-survey-no="' + s.survey_no + '"' +
-        (name ? ' title="' + U.escapeHtml(name) + '"' : "") + ">" +
+        (title ? ' title="' + U.escapeHtml(title) + '"' : "") + ">" +
         '<span class="dot ' + dot + '"></span>' +
         '<span class="sno">' + s.survey_no + "</span>" +
         '<span class="stitle">' + U.escapeHtml(name) + "</span></li>";
@@ -718,10 +742,31 @@ window.ST = window.ST || {};
     }
 
     if (state.activeSurveyNo == null) {
-      el.content.innerHTML = state.surveysLoaded
-        ? R.emptyState("Corp " + state.corpNo,
-            "Pick a survey from the sidebar, or type a survey number in the topbar.", "")
-        : skeletonHtml(2, 6);
+      if (state.surveysLoaded) {
+        el.content.innerHTML = R.emptyState("Corp " + state.corpNo,
+          "Pick a survey from the sidebar, or type a survey number in the topbar.", "");
+      } else if (state.surveysLoading) {
+        el.content.innerHTML = skeletonHtml(2, 6);
+      } else {
+        // The listing failed or was never run. Say so — a skeleton here would
+        // shimmer indefinitely with nothing behind it.
+        el.content.innerHTML = R.errorState("Could not list surveys for corp " + state.corpNo,
+          state.surveysError || "The listing did not complete.", "reload-surveys");
+      }
+      return;
+    }
+
+    var busyNo = state.activeSurveyNo;
+    if (!state.survey && isTagging(busyNo)) {
+      // A tag run for this survey is in flight — started here or from another
+      // row before the user came back. Whatever is on disk right now (usually
+      // nothing, hence a 404) is about to be replaced, so the run is the truth
+      // to show, not the stale read. A survey already rendered keeps its
+      // content: the sidebar dot and the ribbon carry the progress instead.
+      el.content.innerHTML = R.emptyState(
+        "Tagging survey " + busyNo + "…",
+        "This takes 30–90 seconds. You can open another survey while it runs — " +
+        "the result will not pull you back here.", "") + skeletonHtml(2, 6);
       return;
     }
 
@@ -745,7 +790,14 @@ window.ST = window.ST || {};
     }
 
     if (!state.survey) {
-      el.content.innerHTML = skeletonHtml(3, 8);
+      // A skeleton is a promise that something is coming. When nothing is in
+      // flight it is a lie, and the one thing worse than an error is a loader
+      // that never resolves — so an idle empty state gets a way out instead.
+      el.content.innerHTML = state.surveyLoading
+        ? skeletonHtml(3, 8)
+        : R.emptyState("Survey " + state.activeSurveyNo + " is not loaded",
+            "Nothing was returned for this survey and no request is running.",
+            '<button class="btn primary" data-action="retry-survey">Load again</button>');
       return;
     }
 
@@ -911,14 +963,25 @@ window.ST = window.ST || {};
    * 9. TENANT SECTIONS
    * ================================================================== */
 
+  /* Three of the four tenant sections read a tenant's artifacts and are
+   * meaningless without a corp. Taxonomy is not one of them: GET /api/taxonomy
+   * is process-wide (no tenant in the path, no token), boot() loads it before
+   * the corp is even resolved, and the catalog answers "what does
+   * journey_stage mean?" — a question nobody should have to type a corp number
+   * to ask. So it is dispatched ahead of the gate, not behind it. */
+  var CORP_FREE_SECTIONS = { taxonomy: taxonomyHtml };
+
   function renderTenant() {
+    var free = CORP_FREE_SECTIONS[state.tenantSection];
+    if (free) { el.content.innerHTML = free(); return; }
+
     if (!state.corpNo) {
       el.content.innerHTML = R.emptyState(
         "Enter a corp number", "Tenant-level actions need a corp number.", "");
       return;
     }
-    var fn = { tags: tenantTagsHtml, profile: profileHtml, batch: batchHtml,
-               taxonomy: taxonomyHtml }[state.tenantSection];
+    var fn = { tags: tenantTagsHtml, profile: profileHtml,
+               batch: batchHtml }[state.tenantSection];
     el.content.innerHTML = fn ? fn() : "";
   }
 
@@ -945,9 +1008,35 @@ window.ST = window.ST || {};
       return head + R.errorState("Could not load tenant tags",
         state.tenantTagsError.detail, "reload-tenant-tags");
     }
-    if (!state.tenantTags) return head + skeletonHtml(1, 6);
+    if (!state.tenantTags) {
+      return head + (state.tenantTagsLoading
+        ? skeletonHtml(1, 6)
+        : R.emptyState("Tenant tags not loaded",
+            "Nothing is in flight for corp " + state.corpNo + ".",
+            '<button class="btn" data-action="reload-tenant-tags">Load</button>'));
+    }
     return head + R.tenantTags(state.tenantTags, state);
   }
+
+  /* Can an apismx call be made at all?
+   *
+   * The SMX path travels on a bearer token: the caller's JWT out of the shell's
+   * localStorage, or — for headless use — a static one in the server's .env,
+   * which `/api/config` reports as `smx_token_configured` (never the token
+   * itself). With neither, every apismx route answers 400 and there is nothing
+   * a retry can change. Checking it in the browser is what turns that into an
+   * instant, explained refusal instead of a request whose failure the
+   * background path would swallow entirely.
+   */
+  function smxTokenMissing() {
+    return state.config.profile_source === "smx" &&
+           !readToken() && !state.config.smx_token_configured;
+  }
+
+  var SMX_NO_TOKEN_TEXT =
+    "No sign-in token available, so the SoGo Research API (apismx) cannot be " +
+    "called. Reload the page from inside the platform to pick up a fresh " +
+    "sign-in, or set SURVEY_TAGGER_SMX_TOKEN on the server for headless use.";
 
   function profileHtml() {
     var head = '<div class="section-head"><h2>Tenant Profile</h2><div class="btn-row">' +
@@ -956,6 +1045,15 @@ window.ST = window.ST || {};
       '<button class="btn danger sm" data-action="profile-delete">Delete artifacts</button></div></div>';
 
     var isSmx = state.config.profile_source === "smx";
+    // Every SMX button is a round trip that cannot succeed without a token, so
+    // it is disabled up front and the reason sits above the form rather than
+    // arriving as a toast after the click.
+    var noToken = smxTokenMissing();
+    var lock = state.profileJob || noToken ? " disabled" : "";
+    var tokenWarn = noToken
+      ? '<div class="lc-banner warn"><span>' + U.escapeHtml(SMX_NO_TOKEN_TEXT) + "</span>" +
+        '<button class="btn sm" data-action="reload-page">Reload</button></div>'
+      : "";
     var agentBoxes =
       '<div class="field"><label>Agents</label><div class="btn-row">' +
       AGENTS.map(function (a) {
@@ -989,13 +1087,12 @@ window.ST = window.ST || {};
         "</div></div>" +
         '<div class="btn-row" style="margin-top:12px">' +
         '<button class="btn primary" data-action="profile-fetch-sync"' +
-        (state.profileJob ? " disabled" : "") + ">Resolve profile</button>" +
+        lock + ">Resolve profile</button>" +
         '<button class="btn ghost" data-action="profile-fetch"' +
-        (state.profileJob ? " disabled" : "") + ">Resolve in background</button>" +
+        lock + ">Resolve in background</button>" +
         // Read-only step 2 on its own: same endpoint, generation forced off, so
         // it can never start (or be billed for) research.
-        '<button class="btn ghost" data-action="profile-lookup"' +
-        (state.profileJob ? " disabled" : "") +
+        '<button class="btn ghost" data-action="profile-lookup"' + lock +
         ' title="GET /AIAccountProfile/Details only — never generates">' +
         "Look up in apismx</button>" +
         '<p class="micro" style="margin:6px 0 0">' +
@@ -1021,14 +1118,22 @@ window.ST = window.ST || {};
         "</div></div>";
     }
 
+    form = tokenWarn + form;
+
     var body;
     if (state.profileError && state.profileError.status === 404) {
       body = R.emptyState("No profile artifacts yet",
         "Nothing under this corp's tenant_profile folder on the share.", "");
     } else if (state.profileError) {
       body = R.errorState("Could not load profile", state.profileError.detail, "profile-reload");
-    } else if (!state.profile) {
+    } else if (state.profileLoading) {
       body = skeletonHtml(1, 4);
+    } else if (!state.profile) {
+      // No artifacts, no error, nothing in flight. The skeleton used to sit
+      // here shimmering with no request behind it.
+      body = R.emptyState("Profile not loaded",
+        "Nothing is in flight for corp " + state.corpNo + ".",
+        '<button class="btn" data-action="profile-reload">Load</button>');
     } else {
       body = R.profileSummary(state.profile) + R.profileAgents(state.profileAgents);
     }
@@ -1087,7 +1192,10 @@ window.ST = window.ST || {};
       state.config = {
         profile_source: r.data.profile_source || "parallel",
         smx_allow_generate: r.data.smx_allow_generate !== false,
-        smx_generate_wait_seconds: r.data.smx_generate_wait_seconds || 90
+        smx_generate_wait_seconds: r.data.smx_generate_wait_seconds || 90,
+        // Missing on an older server: assume no headless token, which is the
+        // strict reading — the browser's own token then has to carry the call.
+        smx_token_configured: r.data.smx_token_configured === true
       };
     });
   }
@@ -1122,15 +1230,25 @@ window.ST = window.ST || {};
     abortSurveyStream();
     state.corpNo = corpNo;
     state.surveys = [];
+    // Titles are keyed by survey number alone, which repeats across corps —
+    // keeping them would label this corp's rows with the last corp's names.
+    state.surveyNames = {};
     state.surveysLoaded = false;
     state.surveysError = null;
     state.activeSurveyNo = null;
     state.survey = null;
     state.surveyError = null;
+    state.surveyLoading = false;
     state.etags = {};
-    state.tenantTags = null; state.tenantTagsError = null;
+    clearViewCache();
+    state.tenantTags = null; state.tenantTagsError = null; state.tenantTagsLoading = false;
     state.profile = null; state.profileError = null; state.profileAgents = {};
+    state.profileLoading = false;
     state.batch.result = null; state.batch.progress = null;
+    // Set before the first paint, not by the listing itself: renderAll() runs
+    // synchronously below, and a workspace that read "not loading, not loaded"
+    // would flash an error for the frame before the request goes out.
+    state.surveysLoading = true;
     persist();
     renderAll();
     return loadSurveyList();
@@ -1392,11 +1510,16 @@ window.ST = window.ST || {};
       setBusy(1);
       rib = ribbonStart("Fetching surveys for corp " + corpNo + "…");
     }
+    state.surveysLoading = true;
     // No client deadline: on a big corp the server legitimately needs minutes,
     // and aborting at 30s guarantees the listing can never load.
     return api(ROUTES.surveyList(corpNo), { timeoutMs: null })
       .then(guarded).then(function (r) {
       if (!opts.quiet) { setBusy(-1); ribbonStop(rib); }
+      // Another corp was loaded while this was in flight — its own listing owns
+      // the sidebar now, and these rows belong to nobody.
+      if (state.corpNo !== corpNo) return r;
+      state.surveysLoading = false;
       if (r.status === 404) {
         // Empty state, not an error — the corp may simply have no surveys.
         state.surveys = []; state.surveysLoaded = true;
@@ -1421,8 +1544,24 @@ window.ST = window.ST || {};
 
   function selectSurvey(no) {
     if (no == null) return;
+    if (state.activeSurveyNo === no && state.survey) {
+      // Already on screen. Re-fetching would only replace it with itself, and
+      // the interim skeleton would look like the view had been lost.
+      state.topView = "surveys";
+      persist(); renderAll();
+      return Promise.resolve();
+    }
     state.topView = "surveys";
     state.activeSurveyNo = no;
+    // The previous survey's payload must not linger under the new one's header.
+    // A view already in hand goes up immediately and is revalidated behind the
+    // scenes; otherwise the workspace shows a skeleton until the GET lands.
+    state.survey = cachedView(no);
+    state.surveyError = null;
+    // Before the first paint, not inside loadSurveyView: renderAll() runs
+    // synchronously below and would otherwise show "not loaded" for the whole
+    // duration of the request it is about to make.
+    state.surveyLoading = true;
     state.expandedQuestions = new Set();
     if (!state.surveys.some(function (s) { return s.survey_no === no; })) {
       // Typed directly and not in the listing — show it anyway so the sidebar
@@ -1436,32 +1575,110 @@ window.ST = window.ST || {};
 
   function etagKey(no) { return no + (state.includeCandidates ? "|jc" : ""); }
 
+  /* ---- late responses ----
+   *
+   * Every per-survey call is slow enough to outlive the screen that started it:
+   * a tag POST runs 30-90s, and a view GET over the share is not instant. The
+   * user is expected to move on while one runs — that is the point of the
+   * sidebar — so a response arriving after they have is NOT allowed to drag the
+   * workspace back to the survey it belongs to.
+   *
+   * The rule, applied at every resolve:
+   *   - corp changed        -> the result belongs to nothing on screen. Drop it.
+   *   - same corp, other
+   *     survey selected     -> keep the corp-level facts (the sidebar dot, the
+   *                            remembered title, the toast) and leave the
+   *                            workspace alone.
+   *   - still on screen     -> paint it.
+   *
+   * `owns()` is that middle test; `sameCorp()` the first.
+   */
+  function sameCorp(corpNo) { return state.corpNo === corpNo; }
+  function owns(corpNo, no) { return sameCorp(corpNo) && state.activeSurveyNo === no; }
+
+  function tagKey(corpNo, no) { return corpNo + "|" + no; }
+  function isTagging(no) { return !!state.tagging[tagKey(state.corpNo, no)]; }
+
+  /* ---- the view cache ----
+   *
+   * An ETag is only useful while the body it validates is still in hand, and
+   * `state.survey` holds exactly one survey. Without this, coming back to a
+   * survey sent If-None-Match, got a 304, and had nothing to render — the
+   * workspace kept whatever was there before, or a skeleton forever. So the
+   * normalized payload is kept beside the ETag under the same key.
+   *
+   * Bounded because a corp can have thousands of surveys: oldest entry out
+   * first. Cleared wholesale on a corp switch (loadTenant), same as the ETags. */
+  var VIEW_CACHE_MAX = 12;
+  var viewCache = {}, viewOrder = [];
+
+  function cachedView(no) { return viewCache[etagKey(no)] || null; }
+
+  function cacheView(no, view, etag) {
+    var key = etagKey(no);
+    if (!viewCache[key]) {
+      viewOrder.push(key);
+      while (viewOrder.length > VIEW_CACHE_MAX) {
+        var old = viewOrder.shift();
+        delete viewCache[old];
+        delete state.etags[old];   // an ETag with no body is a 304 we cannot use
+      }
+    }
+    viewCache[key] = view;
+    if (etag) state.etags[key] = etag;
+  }
+
+  function dropView(no) {
+    var key = etagKey(no);
+    delete viewCache[key];
+    delete state.etags[key];
+    viewOrder = viewOrder.filter(function (k) { return k !== key; });
+  }
+
+  function clearViewCache() { viewCache = {}; viewOrder = []; }
+
   function loadSurveyView(no, opts) {
     opts = opts || {};
     if (no == null) return Promise.resolve();
+    var corpNo = state.corpNo;
     var key = etagKey(no);
-    var etag = opts.bustEtag ? null : state.etags[key];
+    // Only revalidate against an ETag whose body is still cached; otherwise a
+    // 304 would be an answer we cannot render.
+    var etag = opts.bustEtag || !viewCache[key] ? null : state.etags[key];
+    if (opts.bustEtag) dropView(no);
     setBusy(1);
     var rib = ribbonStart("Loading survey " + no + "…");
-    return api(ROUTES.surveyTags(state.corpNo, no, state.includeCandidates), { etag: etag })
+    if (owns(corpNo, no)) state.surveyLoading = true;
+    return api(ROUTES.surveyTags(corpNo, no, state.includeCandidates), { etag: etag })
       .then(guarded).then(function (r) {
         setBusy(-1); ribbonStop(rib);
-        if (r.status === 304) return r;          // cached view is current
+        if (!sameCorp(corpNo)) return r;         // another corp is loaded now
+        var mine = owns(corpNo, no);
+        if (mine) state.surveyLoading = false;
+        if (r.status === 304) {
+          // Still current: paint from the cache, since `mine` may have gone
+          // from false to true (or back) while this was in flight.
+          if (mine) { state.survey = viewCache[key] || state.survey; renderWorkspace(); }
+          return r;
+        }
         if (r.status === 404) {
-          state.survey = null;
-          state.surveyError = { status: 404, detail: r.detail };
+          dropView(no);
           markTagged(no, false);
+          if (mine) {
+            state.survey = null;
+            state.surveyError = { status: 404, detail: r.detail };
+          }
         } else if (!r.ok) {
-          state.surveyError = { status: r.status, detail: r.detail };
+          if (mine) state.surveyError = { status: r.status, detail: r.detail };
         } else {
-          state.survey = normalizeTagged(r.data);
-          state.surveyError = null;
-          if (r.etag) state.etags[key] = r.etag;
-          rememberName(state.survey);
+          var view = normalizeTagged(r.data);
+          rememberName(view);                    // the sidebar title is corp-level
           markTagged(no, true);
+          cacheView(no, view, r.etag);
+          if (mine) { state.survey = view; state.surveyError = null; }
         }
         renderNav(); renderTopStatus();
-        if (state.topView === "surveys") renderWorkspace();
+        if (mine && state.topView === "surveys") renderWorkspace();
         return r;
       });
   }
@@ -1477,32 +1694,65 @@ window.ST = window.ST || {};
     });
   }
 
+  /* A tag run belongs to the survey it was started for, not to the workspace.
+   * Whatever the user is looking at when it lands stays on screen — see the
+   * "late responses" note above. The toast names the survey precisely because
+   * it may no longer be the one in front of them. */
   function tagSurvey(no) {
     if (no == null || !state.corpNo) return;
+    var corpNo = state.corpNo;
+    var key = tagKey(corpNo, no);
+    if (state.tagging[key]) {
+      toast("info", "Survey " + no + " is already being tagged.");
+      return;
+    }
+    state.tagging[key] = true;
+    renderNav();
+    // Replace the "no tagged output yet" call to action with the run itself;
+    // an already-rendered survey keeps its content.
+    if (owns(corpNo, no) && state.topView === "surveys") renderWorkspace();
     setBusy(1);
     var rib = ribbonStart("Tagging survey " + no + " — this can take 30–90s…");
-    var url = ROUTES.tagSurvey(state.corpNo, no);
+    var url = ROUTES.tagSurvey(corpNo, no);
     // No timeout: a full LLM pass takes 30-90s.
     return api(url, { method: "POST", timeoutMs: null }).then(guarded).then(function (r) {
       setBusy(-1); ribbonStop(rib);
+      delete state.tagging[key];
+      var mine = owns(corpNo, no);
+
       if (!r.ok) {
-        toast("err", "Tag failed: " + (r.detail || r.status), true);
-        state.surveyError = { status: r.status, detail: r.detail };
-        renderWorkspace();
+        toast("err", "Tag failed for survey " + no + ": " + (r.detail || r.status), true);
+        // Only claim the workspace when there is nothing in it: a re-tag that
+        // fails should not throw away the view the user was reading. The toast
+        // has already said what happened.
+        if (mine && !state.survey) state.surveyError = { status: r.status, detail: r.detail };
+        if (sameCorp(corpNo)) { renderNav(); if (mine) renderWorkspace(); }
         return;
       }
-      state.activeSurveyNo = no;
-      delete state.etags[etagKey(no)];
-      markTagged(no, true);
+
       toast("ok", "Survey " + no + " tagged" +
         (r.data && r.data.llm_enabled === false ? " (deterministic — LLM disabled)" : "") + ".");
 
-      if (r.data && r.data.tagged) {
+      if (!sameCorp(corpNo)) return;             // a different corp is loaded now
+      dropView(no);                              // the file on disk just changed
+      markTagged(no, true);
+
+      var tagged = r.data && r.data.tagged ? normalizeTagged(r.data.tagged) : null;
+      if (tagged) rememberName(tagged);
+
+      if (!mine) {
+        // The user moved on. The row now reads "tagged" and the title is known;
+        // the view itself is loaded from disk if and when they come back.
+        renderNav(); renderTopStatus();
+        return;
+      }
+
+      if (tagged) {
         // Render straight from the POST body; then refresh in the background
         // purely to pick up the ETag so the next visit can 304.
-        state.survey = normalizeTagged(r.data.tagged);
+        state.survey = tagged;
         state.surveyError = null;
-        rememberName(state.survey);
+        state.surveyLoading = false;
         renderAll();
         loadSurveyView(no, { bustEtag: true });
       } else {
@@ -1514,16 +1764,22 @@ window.ST = window.ST || {};
 
   function deleteSurveyTags(no) {
     if (!window.confirm("Delete tagged_output.json for survey " + no + " on the share?")) return;
+    var corpNo = state.corpNo;
     setBusy(1);
-    return api(ROUTES.surveyTags(state.corpNo, no, false), { method: "DELETE" })
+    return api(ROUTES.surveyTags(corpNo, no, false), { method: "DELETE" })
       .then(guarded).then(function (r) {
         setBusy(-1);
         if (!r.ok && r.status !== 404) { toast("err", "Delete failed: " + r.detail, true); return; }
         toast("ok", r.status === 404 ? "Already gone." : "Deleted tags for survey " + no + ".");
-        delete state.etags[etagKey(no)];
-        state.survey = null;
-        state.surveyError = { status: 404, detail: "deleted" };
+        if (!sameCorp(corpNo)) return;
+        dropView(no);
         markTagged(no, false);
+        // Only blank the workspace if it is still showing what was deleted.
+        if (owns(corpNo, no)) {
+          state.survey = null;
+          state.surveyLoading = false;
+          state.surveyError = { status: 404, detail: "deleted" };
+        }
         renderAll();
       });
   }
@@ -1531,13 +1787,18 @@ window.ST = window.ST || {};
   // ---- tenant tags ----
 
   function loadTenantTags() {
+    var corpNo = state.corpNo;
     setBusy(1);
-    var rib = ribbonStart("Loading tenant tags for corp " + state.corpNo + "…");
-    return api(ROUTES.tenantTags(state.corpNo)).then(guarded).then(function (r) {
+    var rib = ribbonStart("Loading tenant tags for corp " + corpNo + "…");
+    state.tenantTagsLoading = true;
+    return api(ROUTES.tenantTags(corpNo)).then(guarded).then(function (r) {
       setBusy(-1); ribbonStop(rib);
+      if (!sameCorp(corpNo)) return r;
+      state.tenantTagsLoading = false;
       state.tenantTags = r.ok ? r.data : null;
       state.tenantTagsError = r.ok ? null : { status: r.status, detail: r.detail };
       renderTenant();
+      return r;
     });
   }
 
@@ -1579,13 +1840,17 @@ window.ST = window.ST || {};
 
   function loadProfile(opts) {
     opts = opts || {};
+    var corpNo = state.corpNo;
     var rib = null;
     if (!opts.quiet) {
       setBusy(1);
-      rib = ribbonStart("Loading tenant profile for corp " + state.corpNo + "…");
+      rib = ribbonStart("Loading tenant profile for corp " + corpNo + "…");
+      state.profileLoading = true;
     }
-    return api(ROUTES.profile(state.corpNo)).then(guarded).then(function (r) {
+    return api(ROUTES.profile(corpNo)).then(guarded).then(function (r) {
       if (!opts.quiet) { setBusy(-1); ribbonStop(rib); }
+      if (!sameCorp(corpNo)) return r;
+      state.profileLoading = false;
       state.profile = r.ok ? r.data : null;
       state.profileError = r.ok ? null : { status: r.status, detail: r.detail };
       if (r.ok) {
@@ -1649,6 +1914,11 @@ window.ST = window.ST || {};
    * regardless of the checkbox, so a miss is a 404 and never a research run. */
   function startProfileFetch(background, lookupOnly) {
     var isSmx = state.config.profile_source === "smx";
+    // The buttons are already disabled in this state; this catches the keyboard
+    // and any programmatic caller. Refusing here is the difference between an
+    // instant explanation and a 202 followed by 40 minutes of polling for
+    // artifacts the server never had the credentials to fetch.
+    if (smxTokenMissing()) { toast("err", SMX_NO_TOKEN_TEXT, true); return; }
     var f = collectProfileForm();
     if (!isSmx && f.website.length < 4) {
       toast("err", "Enter the tenant website first.", true); return;
@@ -1711,9 +1981,17 @@ window.ST = window.ST || {};
         });
     }
 
+    setBusy(1);
     return api(ROUTES.profileFetch(state.corpNo, true), { method: "POST", json: body })
       .then(guarded).then(function (r) {
-        if (!r.ok && r.status !== 202) { toast("err", "Fetch failed: " + r.detail, true); return; }
+        setBusy(-1);
+        // Nothing was accepted, so nothing is running: report it now rather than
+        // starting a poller that watches for artifacts that will never appear.
+        if (!r.ok && r.status !== 202) {
+          toast("err", "Fetch failed: " + (r.detail || r.status), true);
+          renderTenant();
+          return;
+        }
         state.profileJob = {
           corpNo: state.corpNo, startedAt: Date.now(),
           agents: f.agents, polls: 0

@@ -9,7 +9,7 @@ same user, correct audit trail.
 Passing it down explicitly stops being practical past the first call site, so
 it rides a ContextVar instead:
 
-    api.py        middleware sets it from the Authorization header
+    run.py        middleware sets it from the Authorization header
     smx_runner    build_client() falls back to it when no token was passed
 
 A ContextVar is the right carrier rather than a thread-local because the work

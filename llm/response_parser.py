@@ -18,18 +18,51 @@ logger = logging.getLogger(__name__)
 # Anything else in the model's `why` map is dropped — a hallucinated key would
 # otherwise surface as an explanation for a tag that call never assigned.
 _PROJECT_WHY_KEYS = frozenset({
-    "relationship_type", "project_purpose", "industry_vertical",
+    "relationship_type", "project_purpose", "project_intent", "industry_vertical",
     "audience_type_refined", "survey_sub_type", "dashboard_names",
 })
 _QUESTION_WHY_KEYS = frozenset({
     "topic_theme", "role_intent_refined", "respondent_sensitivity",
     "flow_respondent_experience", "flow_reusability", "visualization_type",
-    "dashboard_names", "display_role",
+    "dashboard_names", "display_role", "flow_logic_inferred",
+})
+
+# The `flow_logic_role` values a model may add by reading a question. The other
+# four are deliberately excluded, for two different reasons:
+#
+#   Branching Target / Piping Target / Piping Source are platform FACTS — the
+#   loader reads them off `isFollowupQuestion`, piping markers and
+#   `metricQuestion`. The structural pass already knows them exactly, and an
+#   inference can only be wrong where it disagrees.
+#
+#   Quota Controller is not inferable from wording at all. Quotas are a fielding
+#   configuration; no phrasing distinguishes a quota-controlling question from an
+#   ordinary demographic, so allowing it would produce confident noise.
+_LLM_INFERABLE_FLOW_ROLES = frozenset({
+    "Branching Trigger", "Skip Logic Source", "Termination Trigger", "Loop Trigger",
 })
 
 # A `why` line is one sentence by contract. Truncate rather than reject so a
 # chatty model still explains itself.
 _WHY_MAX_CHARS = 300
+
+# `project_intent` and `industry_vertical` are free text with no enum behind
+# them, so shape is the only thing left to enforce: one line, no wrapping quotes,
+# no trailing punctuation, and bounded — a chatty model must not be able to write
+# a paragraph into a tag the UI shows on one line.
+_INTENT_MAX_CHARS = 80
+_INDUSTRY_MAX_CHARS = 60
+
+
+def _clean_free_text(raw, max_chars: int) -> str | None:
+    """Normalize a free-text model answer, or None if it gave nothing usable."""
+    if not isinstance(raw, str):
+        return None
+    text = " ".join(raw.split()).strip("\"'“”‘’ \t")
+    text = text.rstrip(".;,:").strip()
+    if not text:
+        return None
+    return text[:max_chars].strip()
 
 
 def _clean_why(raw, allowed_keys: frozenset[str]) -> dict[str, str]:
@@ -90,7 +123,6 @@ class ResponseParser:
         scalar_map = {
             "relationship_type": "relationship_type",
             "project_purpose": "project_purpose",
-            "industry_vertical": "industry_vertical",
             "audience_type_refined": "audience_type",
             "survey_sub_type": "survey_sub_type",
         }
@@ -105,6 +137,21 @@ class ResponseParser:
             else:
                 result[field] = None
                 why.pop(field, None)  # explained a dimension it never set
+
+        # Free text: neither of these has an enum to snap to, so both are cleaned
+        # rather than validated — and kept out of the scalar loop above, whose
+        # normalization note ("not an allowed value") would be a lie about them.
+        result["project_intent"] = _clean_free_text(
+            data.get("project_intent"), _INTENT_MAX_CHARS
+        )
+        if not result["project_intent"]:
+            why.pop("project_intent", None)
+
+        result["industry_vertical"] = _clean_free_text(
+            data.get("industry_vertical"), _INDUSTRY_MAX_CHARS
+        )
+        if not result["industry_vertical"]:
+            why.pop("industry_vertical", None)
 
         # Multi-label: dashboard_names → dashboard_routing
         dashboard_names = data.get("dashboard_names")
@@ -122,6 +169,8 @@ class ResponseParser:
         logger.debug(
             "parse_project_response_done",
             extra={"scalar_fields": {k: result.get(k) for k in scalar_map},
+                   "project_intent": result.get("project_intent"),
+                   "industry_vertical": result.get("industry_vertical"),
                    "dashboard_names": result.get("dashboard_names")},
         )
         return result
@@ -192,6 +241,19 @@ class ResponseParser:
                 parsed["dashboard_names"] = [v for v in cleaned if v]
             else:
                 why.pop("dashboard_names", None)
+
+            # flow_logic_inferred multi-label — validated against the taxonomy AND
+            # narrowed to the roles wording can actually support.
+            inferred = q_data.get("flow_logic_inferred")
+            if inferred and isinstance(inferred, list):
+                cleaned = [self._validate_list_item("flow_logic_role", v)
+                           for v in inferred]
+                parsed["flow_logic_inferred"] = [
+                    v for v in cleaned if v in _LLM_INFERABLE_FLOW_ROLES
+                ]
+            if not parsed.get("flow_logic_inferred"):
+                parsed.pop("flow_logic_inferred", None)
+                why.pop("flow_logic_inferred", None)
 
             # Role intent refinement (preserved from v1)
             parsed["role_intent_refined"] = q_data.get("role_intent_refined")

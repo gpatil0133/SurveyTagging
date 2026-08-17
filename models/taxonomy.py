@@ -42,6 +42,31 @@ class TaxonomyDimension(BaseModel):
     strategy: str = ""
     """One-word label for the derivation: deterministic | statistical | hybrid |
     llm-refined | llm-only | placeholder. See config/taxonomy.yaml's header."""
+    purpose: str = ""
+    """Why the dimension exists, in one line — the short form of `explanation`.
+
+    Unlike `explanation` this is NOT rendered into any prompt, so editing it
+    invalidates no LLM cache."""
+    derived_controls: dict[str, str] = Field(default_factory=dict)
+    """Facts a consumer can read off OTHER dimensions, as `{name: predicate}`.
+
+    Added with the V7.3 removal of `control_role`, which existed only to state in
+    one field what `is_filterable`, `is_segmentable` and `response_format`
+    already state separately — and which drifted out of agreement with them
+    because it was derived a stage earlier, before `role_intent` existed. Rather
+    than reintroduce a field whose only job is to be kept in sync, the mapping is
+    published here and served by GET /api/taxonomy, so a dashboard composer can
+    read "which control does this question drive?" without re-deriving the rules.
+
+    Documentation only: no tagger reads it and nothing validates against it."""
+
+    feeds: list[str] = Field(default_factory=list)
+    """Which outcome consumes the value, most-immediate consumer first.
+
+    Tokens: S1..S6 (the planned experience-platform services), plus `Pipeline`
+    (another tagger / an LLM prompt in this service), `Reporting` (an existing
+    artifact or survey-view reader) and `None`. Only Pipeline and Reporting are
+    live today — see config/taxonomy.yaml's header."""
 
     def is_valid_value(self, value: str) -> bool:
         if self.user_defined:
@@ -88,6 +113,9 @@ class TaxonomyRegistry:
                     explanation=dim_config.get("explanation", ""),
                     derivation=dim_config.get("derivation", ""),
                     strategy=dim_config.get("strategy", ""),
+                    purpose=dim_config.get("purpose", ""),
+                    feeds=dim_config.get("feeds", []),
+                    derived_controls=dim_config.get("derived_controls", {}),
                 )
         return registry
 

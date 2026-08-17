@@ -1,22 +1,50 @@
-"""Industry vertical tagger: hybrid directory signals + tenant profile + LLM."""
+"""Industry vertical tagger: tenant profile verbatim, else a seed the LLM rewrites.
+
+`industry_vertical` is free text (user_defined). The ordering below follows from
+that: the org research agent already writes a precise label and it is now stored
+in its own words, so it goes first and sits above the 0.80 threshold at which
+`_apply_project_llm_results` declines to override a non-LLM tag. Every other tier
+is a guess about a survey rather than knowledge about a tenant, so each is held
+below that line and LLM Call 1 replaces it.
+
+Values are no longer coerced onto a ten-item enum. `_normalize_agent_industry`
+survives as a *derived* lookup key (journey_stages.yaml templates key on the short
+names) — never as the stored tag.
+"""
 
 from __future__ import annotations
 
 from models import evidence as ev
 from models.context import UnifiedContext
 from models.tags import TagAccumulator, TagResult
-from models.tenant_profile import _normalize_agent_industry
 from taggers.base import ProjectTagger
 
+# Keep a profile-sourced value clear of the LLM override threshold in
+# `pipeline/llm_enhance._apply_project_llm_results` (>= 0.80 and non-LLM wins).
+_PROFILE_CONFIDENCE = {"High": 0.95, "Medium": 0.90}
+_PROFILE_CONFIDENCE_DEFAULT = 0.85
 
-def _map_agent_industry(agent_value: str) -> str | None:
-    """Coerce agent's industry string into a taxonomy value, else None.
+# Everything below the profile is a seed. Held under 0.80 on purpose so LLM
+# Call 1 rewrites it — "no profile -> let the model decide" is the whole rule.
+_DIRECTORY_CONFIDENCE = 0.75
+_OVERRIDE_CONFIDENCE = 0.70
+_KEYWORD_CONFIDENCE_BASE = 0.55
+_KEYWORD_CONFIDENCE_CAP = 0.75
 
-    Thin wrapper around the shared normalizer — returns None instead of "" for
-    callers that gate on truthy/None semantics.
+
+def _profile_label(profile) -> str:
+    """The agent's industry in its own words, sub-vertical appended when distinct.
+
+    "Financial Services" + "Regional Retail Banking" reads better as one string
+    than either does alone, and the enum this replaced could hold neither.
     """
-    mapped = _normalize_agent_industry(agent_value)
-    return mapped or None
+    primary = (profile.industry_vertical or "").strip()
+    sub = (profile.industry_sub_vertical or "").strip()
+    if not primary:
+        return ""
+    if sub and sub.lower() != primary.lower():
+        return f"{primary} / {sub}"
+    return primary
 
 
 # Caller-supplied `industry` override → taxonomy mapping
@@ -49,21 +77,55 @@ class IndustryTagger(ProjectTagger):
     source_type = "hybrid"
 
     def tag(self, context: UnifiedContext, accumulator: TagAccumulator) -> TagResult:
-        # Tier 1: Directory schema signals (strongest — based on actual columns
-        # the customer configured in their respondent directory).
+        # Tier 1: the tenant profile, VERBATIM. The org research agent read the
+        # tenant's own site to write this; the tiers below only read one survey.
+        # Stored above 0.80 so LLM Call 1 keeps its hands off it.
+        profile = context.tenant_profile
+        if profile is not None and profile.has_org:
+            label = _profile_label(profile)
+            if label:
+                conf = _PROFILE_CONFIDENCE.get(
+                    profile.org_confidence, _PROFILE_CONFIDENCE_DEFAULT
+                )
+                return TagResult(
+                    value=label,
+                    source="hybrid",
+                    confidence=conf,
+                    evidence=ev.profile(
+                        "project.industry.tenant_profile",
+                        f'The org research agent reports "{label}", and that is stored '
+                        "as written rather than snapped to a short list — the agent "
+                        "researched this tenant, while every other tier here is "
+                        "inferring an industry from one survey. Confidence tracks the "
+                        f"agent's own rating ({profile.org_confidence or 'unrated'}) "
+                        "but stays above the threshold at which the LLM pass would "
+                        "overwrite it.",
+                        field="org.industry_vertical",
+                        stage=1,
+                        inputs={"primary": profile.industry_vertical,
+                                "sub_vertical": profile.industry_sub_vertical or "(none)",
+                                "agent_confidence": profile.org_confidence or "unknown"},
+                        quote=profile.industry_vertical,
+                    ),
+                )
+
+        # Tier 2: Directory schema signals — the columns the customer configured
+        # in their respondent directory. A real signal, but a coarse bucket name
+        # rather than a description, so it seeds and the LLM may replace it.
         dir_signals = context.directory_signals
         if dir_signals.inferred_domains:
             top_domain = dir_signals.inferred_domains[0]
             return TagResult(
                 value=top_domain,
                 source="hybrid",
-                confidence=0.95,
+                confidence=_DIRECTORY_CONFIDENCE,
                 evidence=ev.rule(
                     "project.industry.directory_schema",
-                    f"The respondent directory's own column names point at "
-                    f"{top_domain}. This is the strongest signal available — the "
-                    "customer configured those fields themselves to hold their real "
-                    "data, so it outranks both the research agent and the survey text.",
+                    f"No tenant profile, so the respondent directory decides: its own "
+                    f"column names point at {top_domain}. The customer configured those "
+                    "fields to hold real data, which makes this a solid seed — but it "
+                    "is a bucket name, not a description of the business, so it is held "
+                    "below the LLM override threshold.",
                     stage=1,
                     inputs={"matched_domain": top_domain,
                             "domain_keywords": dir_signals.domain_keywords[:5],
@@ -71,53 +133,25 @@ class IndustryTagger(ProjectTagger):
                 ),
             )
 
-        # Tier 2: Parallel.ai TenantProfile.industry_vertical (Phase 4 prior).
-        # Plan flags this as "Always use" — the org agent's industry was 9/10
-        # in the live audit. Confidence scales with org_confidence so a
-        # Low-confidence agent doesn't override the manual-override tier.
-        profile = context.tenant_profile
-        if profile is not None and profile.has_org:
-            mapped = _map_agent_industry(profile.industry_vertical)
-            if mapped:
-                conf = {"High": 0.85, "Medium": 0.75}.get(profile.org_confidence, 0.65)
-                return TagResult(
-                    value=mapped,
-                    source="hybrid",
-                    confidence=conf,
-                    evidence=ev.profile(
-                        "project.industry.tenant_profile",
-                        f"No directory columns gave a domain, so the tenant profile "
-                        f"decides: the org research agent reports "
-                        f'"{profile.industry_vertical}", which normalizes to {mapped}. '
-                        f"Confidence tracks the agent's own rating "
-                        f"({profile.org_confidence or 'unrated'}) so a shaky agent "
-                        "cannot outrank a caller-supplied override.",
-                        field="org.industry_vertical",
-                        stage=1,
-                        inputs={"normalized_to": mapped,
-                                "agent_confidence": profile.org_confidence or "unknown"},
-                        quote=profile.industry_vertical,
-                    ),
-                )
-
-        # Tier 3: caller-supplied industry override (ad-hoc /api/tag only)
+        # Tier 3: caller-supplied industry override (ad-hoc /api/tag only).
+        # Free text now, so the caller's own wording is kept; _INDUSTRY_MAP only
+        # expands the handful of shorthands the ad-hoc form offers.
         override_industry = context.overrides.industry.strip()
         if override_industry and override_industry != "--":
-            mapped = _INDUSTRY_MAP.get(override_industry)
-            if mapped:
-                return TagResult(
-                    value=mapped,
-                    source="hybrid",
-                    confidence=0.70,
-                    evidence=ev.rule(
-                        "project.industry.caller_override",
-                        f'The caller supplied industry "{override_industry}" on the '
-                        f"request, which maps to {mapped}. Reached only when neither "
-                        "the directory nor the tenant profile produced a domain.",
-                        stage=1,
-                        inputs={"override": override_industry, "mapped_to": mapped},
-                    ),
-                )
+            mapped = _INDUSTRY_MAP.get(override_industry, override_industry)
+            return TagResult(
+                value=mapped,
+                source="hybrid",
+                confidence=_OVERRIDE_CONFIDENCE,
+                evidence=ev.rule(
+                    "project.industry.caller_override",
+                    f'The caller supplied industry "{override_industry}" on the '
+                    "request. Reached only when neither the tenant profile nor the "
+                    "directory produced a domain.",
+                    stage=1,
+                    inputs={"override": override_industry, "stored_as": mapped},
+                ),
+            )
 
         # Tier 4: Survey content heuristics
         #
@@ -151,13 +185,15 @@ class IndustryTagger(ProjectTagger):
             return TagResult(
                 value=best_match,
                 source="hybrid",
-                confidence=min(0.60 + best_score * 0.05, 0.85),
+                confidence=min(_KEYWORD_CONFIDENCE_BASE + best_score * 0.05,
+                               _KEYWORD_CONFIDENCE_CAP),
                 evidence=ev.statistic(
                     "project.industry.content_keywords",
                     f"Last resort before defaulting: the survey title and question text "
                     f"contain {best_score} {best_match} keyword(s), more than any other "
-                    "vertical scored. Confidence rises with the hit count because a "
-                    "single stray word is not a vertical.",
+                    "vertical scored. Confidence rises with the hit count but is capped "
+                    "below the LLM override threshold — counting words in one survey is "
+                    "a weaker read of a tenant's industry than the model's.",
                     measure=f"{best_match}_keyword_hits",
                     observed=best_score,
                     threshold=2,
@@ -173,10 +209,10 @@ class IndustryTagger(ProjectTagger):
             confidence=0.40,
             evidence=ev.fallback(
                 "project.industry.no_signal",
-                "All four tiers came up empty: no directory domain columns, no usable "
-                "tenant profile industry, no caller override, and fewer than two "
+                "All four tiers came up empty: no usable tenant profile industry, no "
+                "directory domain columns, no caller override, and fewer than two "
                 "vertical keywords anywhere in the survey text. Other is a placeholder "
-                "and the 0.40 confidence invites the Stage 4 LLM pass to replace it.",
+                "and the 0.40 confidence invites the LLM pass to write the real one.",
                 stage=1,
                 inputs={"best_keyword_domain": best_match or "(none)",
                         "best_keyword_score": best_score},
