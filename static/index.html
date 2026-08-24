@@ -4,7 +4,36 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Survey Auto-Tagger</title>
-<link rel="stylesheet" href="/static/app.css" />
+
+<!-- Reverse-proxy sub-path.
+     `GET /` rewrites the ST_BASE_PATH line below from SURVEY_TAGGER_PATH_PREFIX
+     before serving this file (run.py:_shell_html), so the deployed prefix is
+     configuration rather than a string checked into the UI. Left empty — opened
+     straight off disk, or served by anything that is not this app — the second
+     script infers it from the document's own URL instead.
+
+     Both scripts MUST stay above the stylesheet: <base> only governs the
+     elements that follow it, and every asset reference below is relative so
+     that it does. -->
+<script>window.ST_BASE_PATH = "";</script>
+<script>
+(function () {
+  var b = window.ST_BASE_PATH || "";
+  if (!b) {
+    /* Nothing injected — fall back to where this document was served from.
+       "/apisurveytagging/" and "/apisurveytagging/index.html" both yield
+       "/apisurveytagging"; the origin root yields "". */
+    b = window.location.pathname.replace(/\/index\.html$/i, "").replace(/\/+$/, "");
+  }
+  window.ST_BASE_PATH = b;
+  /* document.write, not appendChild: <base> has to be in the DOM before the
+     parser reaches the first relative href, and an injected node would land
+     after the stylesheet had already been resolved against the wrong root. */
+  document.write('<base href="' + window.location.origin + b + '/">');
+})();
+</script>
+
+<link rel="stylesheet" href="static/app.css" />
 </head>
 <body>
 
@@ -101,7 +130,9 @@
   <p style="padding:24px">This tool needs JavaScript enabled.</p>
 </noscript>
 
-<script src="/static/render.js"></script>
-<script src="/static/app.js"></script>
+<!-- Relative, so the <base> injected in <head> resolves them under whatever
+     sub-path this app is mounted at. -->
+<script src="static/render.js"></script>
+<script src="static/app.js"></script>
 </body>
 </html>

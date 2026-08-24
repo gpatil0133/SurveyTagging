@@ -82,14 +82,45 @@ window.ST = window.ST || {};
     return "low";
   }
 
+  /* One chip's text for a multi-label entry. V8 made two dimensions structured
+   * rather than flat: `segment_dimensions` entries became {label, question_id}
+   * so a composer stops resolving label back to id, and `preferred_segments`
+   * holds bare question ids. Without this, both render as "[object Object]" —
+   * the value is still correct in the JSON, but the card stops saying anything. */
+  const chipText = (x) => {
+    if (x === null || x === undefined) return "";
+    if (typeof x !== "object") return String(x);
+    if (typeof x.label === "string") {
+      return x.question_id === undefined ? x.label : `${x.label} (#${x.question_id})`;
+    }
+    return Object.entries(x).map(([k, val]) => `${k}: ${val}`).join(", ");
+  };
+
+  /* `favorable_options` is a scalar tag whose value is an object of three id
+   * lists. The ids mean nothing to a reader, so the card shows how the options
+   * split; the full lists stay in the artifact for the composer. */
+  const isBucketMap = (v) =>
+    v && typeof v === "object" && !Array.isArray(v) &&
+    Object.values(v).every(x => Array.isArray(x));
+
   const fmtValue = (v) => {
     if (isEmpty(v)) return { html: '<span class="empty">— not set —</span>', empty: true };
     if (Array.isArray(v)) {
       return {
-        html: `<div class="multi-list">${v.map(x => `<span class="chip">${escapeHtml(String(x))}</span>`).join("")}</div>`,
+        html: `<div class="multi-list">${v.map(x => `<span class="chip">${escapeHtml(chipText(x))}</span>`).join("")}</div>`,
         empty: false
       };
     }
+    if (isBucketMap(v)) {
+      const parts = Object.entries(v).filter(([, ids]) => ids.length);
+      if (!parts.length) return { html: '<span class="empty">— not set —</span>', empty: true };
+      return {
+        html: `<div class="multi-list">${parts.map(([k, ids]) =>
+          `<span class="chip">${escapeHtml(`${k}: ${ids.length}`)}</span>`).join("")}</div>`,
+        empty: false
+      };
+    }
+    if (typeof v === "object") return { html: escapeHtml(chipText(v)), empty: false };
     return { html: escapeHtml(String(v)), empty: false };
   };
 
@@ -214,7 +245,9 @@ window.ST = window.ST || {};
   // earlier deterministic/statistical assignment.
   function supersededHtml(sup) {
     if (!sup) return "";
-    const prior = Array.isArray(sup.value) ? sup.value.join(", ") : String(sup.value ?? "");
+    const prior = Array.isArray(sup.value)
+      ? sup.value.map(chipText).join(", ")
+      : chipText(sup.value ?? "");
     const detail = (sup.evidence && typeof sup.evidence === "object")
       ? (sup.evidence.detail || "")
       : (typeof sup.evidence === "string" ? sup.evidence : "");
@@ -229,7 +262,7 @@ window.ST = window.ST || {};
     if (!tag) return "";
     const p = evidenceParts(tag);
     const sup = p.superseded
-      ? `overrode ${p.superseded.source || "earlier"} value "${Array.isArray(p.superseded.value) ? p.superseded.value.join(", ") : p.superseded.value}"`
+      ? `overrode ${p.superseded.source || "earlier"} value "${Array.isArray(p.superseded.value) ? p.superseded.value.map(chipText).join(", ") : chipText(p.superseded.value)}"`
       : "";
     return [p.statistic, p.detail, p.reasoning, sup].filter(Boolean).join(" — ");
   }

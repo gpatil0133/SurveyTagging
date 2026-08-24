@@ -128,10 +128,32 @@ class TaggedQuestion(BaseModel):
 class TaggedSurvey(BaseModel):
     """Complete tagged output for a single survey."""
 
-    # V5.0: atomic journey assignment (stage + sub_stage emitted together by LLM),
-    # canon-namespace journey_stage values, low_confidence_assigned status,
-    # coverage_metadata on per-question tags.
-    schema_version: str = "5.0"
+    # The taxonomy generation that produced the artifact. It tracks the SHAPE of
+    # this file, not every taxonomy release: V6 and V7 added and removed
+    # dimensions without changing how one is represented, so no 6.0 or 7.0 was
+    # ever issued and a reader correlating an artifact to a taxonomy should not
+    # go looking for them.
+    #
+    # 8.0 — the widget-API alignment. Three shape changes, in the order a
+    # consumer will hit them:
+    #   * `segment_dimensions` entries are `{label, question_id}` objects, not
+    #     bare strings. The one genuinely BREAKING change: a reader that joins
+    #     or renders these gets objects where it expected text.
+    #   * `favorable_options` is the first tag whose value is an OBJECT
+    #     (`{positive, negative, neutral}` id lists) rather than a string or a
+    #     list of strings. Value handling that assumed those two shapes needs a
+    #     third branch — see static/render.js::fmtValue.
+    #   * Six new question dimensions appear (platform_metric,
+    #     favorable_options, trend_granularity, widget_footprint,
+    #     preferred_segments, display_label), and the chart vocabulary in
+    #     widget_compatibility / visualization_type was rewritten onto the
+    #     platform's own names. Additive, but no V7 value survives unchanged in
+    #     those two.
+    #
+    # 5.0 — atomic journey assignment (stage + sub_stage emitted together by the
+    # LLM), canon-namespace journey_stage values, low_confidence_assigned
+    # status, coverage_metadata on per-question tags.
+    schema_version: str = "8.0"
     generated_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

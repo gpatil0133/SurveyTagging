@@ -50,9 +50,10 @@ def _bearer_token(authorization: str | None) -> str:
 # --------------------------------------------------------------------------
 # Token reading (independent of enforcement)
 #
-# The browser UI puts the platform's `access_token` from localStorage on every
-# request (static/app.js). Two things are done with it, neither of which waits
-# for `auth_enabled` to be flipped on:
+# The browser UI puts a bearer token on every request (static/app.js,
+# readToken): the platform's `access_token` from localStorage, or one pasted
+# into the Tenant Profile panel, which takes precedence over it. Two things are
+# done with it, neither of which waits for `auth_enabled` to be flipped on:
 #
 #   1. It is forwarded verbatim to apismx and any other SoGo service we call
 #      outbound — they share an issuer with us, so the caller's own token is

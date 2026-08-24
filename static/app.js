@@ -45,7 +45,8 @@ window.ST = window.ST || {};
   var STREAM_RENDER_MS = 150;    // sidebar repaint throttle while rows arrive
 
   var LS = { corp: "st.corp", topView: "st.topview", profileJob: "st.profilejob",
-             tab: "st.tab", theme: "st.theme", density: "st.density" };
+             tab: "st.tab", theme: "st.theme", density: "st.density",
+             token: "st.token" };
   /* Bump the version suffix whenever /api/taxonomy's response shape grows a
    * field the UI reads — a session that cached the old shape would otherwise
    * render blank columns until the tab is closed. v2 = the explanation layer
@@ -59,26 +60,49 @@ window.ST = window.ST || {};
    * on the same key. Attached to every API call so the server can (a) work out
    * which corp an embedded session belongs to and (b) forward the same token
    * outbound to apismx and friends. Absent (plain ops use at localhost) is a
-   * normal state, not an error — the API is open. */
+   * normal state, not an error — the API is open.
+   *
+   * A second source sits beside it: a token pasted by hand into the Tenant
+   * Profile panel, kept under our OWN key (LS.token) and never written back to
+   * `access_token` — that key belongs to the shell, and clobbering it would
+   * break every sibling app on this origin at the next renewal. See
+   * readToken() for which of the two wins. */
   var TOKEN_KEY = "access_token";
 
+  /* The sub-path this app is mounted under: "" at the origin root,
+   * "/apisurveytagging" (or whatever SURVEY_TAGGER_PATH_PREFIX says) behind the
+   * IIS virtual application. index.html sets it — injected by the server, or
+   * inferred from the document URL when nothing was injected; see the head of
+   * that file.
+   *
+   * Every route below is written the way the server sees it — root-relative,
+   * prefix-free, because ARR strips the prefix before uvicorn — and `u()` puts
+   * the deployment back on. Keeping the two apart is the point: a route string
+   * never has to know where the app is mounted.
+   *
+   * These stay absolute-from-origin rather than relative-to-<base>: fetch()
+   * resolves relative URLs against the document base, which would work, but
+   * only for as long as nobody adds a route string with a leading slash. */
+  var BASE = (window.ST_BASE_PATH || "").replace(/\/+$/, "");
+  function u(path) { return BASE + path; }
+
   var ROUTES = {
-    taxonomy:        function ()      { return "/api/taxonomy"; },
-    config:          function ()      { return "/api/config"; },
-    me:              function ()      { return "/api/me"; },
-    shareHealth:     function ()      { return "/api/health/share"; },
-    surveyList:      function (t)     { return "/api/tenants/" + t + "/tag-surveys"; },
-    surveyListStream:function (t)     { return "/api/tenants/" + t + "/tag-surveys/stream"; },
-    batchTag:        function (t)     { return "/api/tenants/" + t + "/tag-surveys"; },
-    tenantTags:      function (t)     { return "/api/tenants/" + t + "/tags"; },
-    tenantTagsBuild: function (t)     { return "/api/tenants/" + t + "/tag"; },   // NOTE: singular
-    surveyTags:      function (t,s,jc){ return "/api/tenants/" + t + "/surveys/" + s + "/tags" +
-                                               (jc ? "?include_journey_candidates=true" : ""); },
-    tagSurvey:       function (t,s)   { return "/api/tenants/" + t + "/surveys/" + s + "/tag"; },
-    profile:         function (t)     { return "/api/tenants/" + t + "/profile"; },
-    profileAgent:    function (t,a)   { return "/api/tenants/" + t + "/profile/" + a; },
-    profileFetch:    function (t,bg)  { return "/api/tenants/" + t + "/profile/fetch" +
-                                               (bg ? "?background=true" : ""); }
+    taxonomy:        function ()      { return u("/api/taxonomy"); },
+    config:          function ()      { return u("/api/config"); },
+    me:              function ()      { return u("/api/me"); },
+    shareHealth:     function ()      { return u("/api/health/share"); },
+    surveyList:      function (t)     { return u("/api/tenants/" + t + "/tag-surveys"); },
+    surveyListStream:function (t)     { return u("/api/tenants/" + t + "/tag-surveys/stream"); },
+    batchTag:        function (t)     { return u("/api/tenants/" + t + "/tag-surveys"); },
+    tenantTags:      function (t)     { return u("/api/tenants/" + t + "/tags"); },
+    tenantTagsBuild: function (t)     { return u("/api/tenants/" + t + "/tag"); },   // NOTE: singular
+    surveyTags:      function (t,s,jc){ return u("/api/tenants/" + t + "/surveys/" + s + "/tags" +
+                                               (jc ? "?include_journey_candidates=true" : "")); },
+    tagSurvey:       function (t,s)   { return u("/api/tenants/" + t + "/surveys/" + s + "/tag"); },
+    profile:         function (t)     { return u("/api/tenants/" + t + "/profile"); },
+    profileAgent:    function (t,a)   { return u("/api/tenants/" + t + "/profile/" + a); },
+    profileFetch:    function (t,bg)  { return u("/api/tenants/" + t + "/profile/fetch" +
+                                               (bg ? "?background=true" : "")); }
   };
 
   // A downed share surfaces as a Windows error code buried in a 500 detail, or
@@ -198,6 +222,13 @@ window.ST = window.ST || {};
     shareDown: false,
     authExpired: false,              // a 401 came back — see showAuthExpired()
     tokenCorpNo: null,               // corp_no the JWT claims, from /api/me
+    manualToken: null,               // JWT pasted into the Tenant Profile panel
+    tokenPrincipal: null,            // last /api/me answer — {corp_no, subject, …}
+    /* What is currently typed in the token box, and whether it is unmasked.
+     * The profile section re-renders on its own schedule (the fetch poller
+     * repaints it every 30s), and a half-pasted token must survive that. */
+    tokenDraft: null,
+    tokenShow: false,
     toasts: [],
     nextToastId: 1,
     ribbons: [],                     // [{id, text}] — stack; newest is on screen
@@ -237,6 +268,11 @@ window.ST = window.ST || {};
           localStorage.removeItem(LS.profileJob);
         }
       }
+      // A hand-pasted token outlives the reload that follows pasting it —
+      // otherwise it would have to be typed again on every refresh, and the
+      // background profile poller spans reloads by design.
+      var manual = localStorage.getItem(LS.token);
+      if (typeof manual === "string" && manual.trim()) state.manualToken = manual.trim();
       var tax = sessionStorage.getItem(SS.taxonomy);
       if (tax) { state.taxonomy = JSON.parse(tax); D.set(state.taxonomy); }
     } catch (e) { /* ignore malformed storage */ }
@@ -279,13 +315,45 @@ window.ST = window.ST || {};
    * each silent renewal, and a sibling tab's renewal has to be picked up too.
    * A blank/whitespace value is the same as missing — `Bearer ` with nothing
    * after it is never a token the server can do anything with. */
-  function readToken() {
+  function readShellToken() {
     try {
       var raw = localStorage.getItem(TOKEN_KEY);
       if (typeof raw !== "string") return null;
       raw = raw.trim();
       return raw.length ? raw : null;
     } catch (e) { return null; }   // private mode / storage disabled
+  }
+
+  /* The token every call travels on.
+   *
+   * Two sources, and the hand-pasted one wins — same rule the corp number
+   * follows at boot: explicit beats implied. Someone who pasted a token into
+   * the Tenant Profile panel is deliberately overriding whatever the shell
+   * left behind (typically a token for a different corp, or an expired one),
+   * and silently preferring localStorage would make the field look broken.
+   *
+   * The shell's key stays the default and the fallback, so an embedded session
+   * that never touches the panel behaves exactly as it always has. */
+  function readToken() {
+    return state.manualToken || readShellToken();
+  }
+
+  function tokenSource() {
+    if (state.manualToken) return "manual";
+    return readShellToken() ? "shell" : "none";
+  }
+
+  /* Three dot-separated base64url segments. Not a signature check — the server
+   * does that — just enough to catch the usual paste accidents: a copied
+   * `Bearer ` prefix, surrounding quotes, half a token, or a whole JSON blob
+   * that happened to be on the clipboard. */
+  var JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
+
+  function normalizeToken(raw) {
+    var v = String(raw == null ? "" : raw).trim();
+    v = v.replace(/^["']|["']$/g, "").trim();
+    v = v.replace(/^Bearer\s+/i, "").trim();
+    return v;
   }
 
   function isShareError(res) {
@@ -513,19 +581,23 @@ window.ST = window.ST || {};
     renderBanner();
   }
 
-  /* A 401 means the token in localStorage is gone, expired, or rejected. We do
-   * not refresh it ourselves — the shell owns that lifecycle and rotates the
-   * key we read — so the honest move is to say so and let the user reload,
-   * which picks up whatever the shell has written since. Distinct from the
-   * share banner: nothing is wrong with the server or the share. */
+  /* A 401 means the token we sent is gone, expired, or rejected. We do not
+   * refresh it ourselves — the shell owns that lifecycle and rotates the key we
+   * read — so the honest move is to say so and let the user reload, which picks
+   * up whatever the shell has written since. Failing that they can paste a
+   * token straight into the Tenant Profile panel, which is the only recourse
+   * when this app is open outside the platform shell. Distinct from the share
+   * banner: nothing is wrong with the server or the share. */
   function showAuthExpired() {
     if (state.authExpired) return;      // one banner, not one per in-flight call
     state.authExpired = true;
     state.banner = {
       kind: "lc-banner",
       text: "Your session has expired or is not recognized. Reload the page to " +
-            "pick up a fresh sign-in.",
-      actionsHtml: '<button class="btn sm" data-action="reload-page">Reload</button>'
+            "pick up a fresh sign-in, or paste a token under Tenant Profile.",
+      actionsHtml: '<button class="btn sm" data-action="reload-page">Reload</button>' +
+                   '<button class="btn sm ghost" data-action="open-token-panel">' +
+                   "Paste a token</button>"
     };
     renderBanner();
   }
@@ -1036,7 +1108,67 @@ window.ST = window.ST || {};
   var SMX_NO_TOKEN_TEXT =
     "No sign-in token available, so the SoGo Research API (apismx) cannot be " +
     "called. Reload the page from inside the platform to pick up a fresh " +
-    "sign-in, or set SURVEY_TAGGER_SMX_TOKEN on the server for headless use.";
+    "sign-in, paste one into the token panel below, or set " +
+    "SURVEY_TAGGER_SMX_TOKEN on the server for headless use.";
+
+  /* Where the token every call rides on is coming from, in one line. Worth
+   * stating outright: "shell" and "manual" fail in completely different ways
+   * (rotate on reload vs. sit here until cleared), and a pasted token that is
+   * quietly being ignored — or quietly overriding an embedded session — is the
+   * kind of thing someone debugs for an hour. */
+  function tokenStatusHtml() {
+    var src = tokenSource();
+    var me = state.tokenPrincipal;
+    var claim = "";
+    if (me && me.has_token) {
+      // Both claims empty means the server took the header but could not decode
+      // it — say that rather than printing "reads it as" and trailing off.
+      if (me.corp_no == null && !me.subject) {
+        claim = " The server cannot read any claims from it (malformed or expired).";
+      } else {
+        claim = " Server reads it as" +
+          (me.corp_no != null ? " corp " + U.escapeHtml(String(me.corp_no)) : "") +
+          (me.subject ? " (" + U.escapeHtml(String(me.subject)) + ")" : "") +
+          (me.verified === false ? ", signature unverified" : "") + ".";
+      }
+    }
+    var text = {
+      manual: "Using the token pasted here" +
+              (readShellToken()
+                ? ", which overrides the platform sign-in in localStorage"
+                : "") + ". It stays in use until cleared.",
+      shell: "Using the platform sign-in from localStorage (access_token). " +
+             "Paste a token below only to override it.",
+      none: "No token is being sent. Open this app from inside the platform, " +
+            "or paste a token below."
+    }[src];
+    return '<div class="lc-banner ' + (src === "none" ? "warn" : "info") +
+           '"><span>' + text + claim + "</span></div>";
+  }
+
+  function tokenPanelHtml() {
+    var manual = state.manualToken || "";
+    var shown = state.tokenDraft != null ? state.tokenDraft : manual;
+    return '<div class="tenant-panel"><h3>Sign-in token (JWT)</h3>' +
+      '<p class="micro" style="margin-top:0;text-transform:none;letter-spacing:0">' +
+      "Sent as <span class=\"mono\">Authorization: Bearer …</span> on every call " +
+      "and forwarded outbound to apismx. Stored under this app's own " +
+      '<span class="mono">st.token</span> key — the shell\'s ' +
+      '<span class="mono">access_token</span> is never written to.</p>' +
+      tokenStatusHtml() +
+      '<div class="form-grid"><div class="field" style="grid-column:1/-1">' +
+      '<label for="pfToken">Token</label>' +
+      '<input type="' + (state.tokenShow ? "text" : "password") +
+      '" id="pfToken" class="control" autocomplete="off" spellcheck="false" ' +
+      'placeholder="eyJhbGciOi…" value="' + U.escapeHtml(shown) + '" /></div></div>' +
+      '<div class="btn-row" style="margin-top:10px">' +
+      '<button class="btn primary" data-action="token-save">Use this token</button>' +
+      '<button class="btn ghost" data-action="token-clear"' +
+      (manual ? "" : " disabled") + ">Clear</button>" +
+      '<label class="checkline"><input type="checkbox" id="pfTokenShow"' +
+      (state.tokenShow ? " checked" : "") + " /> Show</label>" +
+      "</div></div>";
+  }
 
   function profileHtml() {
     var head = '<div class="section-head"><h2>Tenant Profile</h2><div class="btn-row">' +
@@ -1118,7 +1250,7 @@ window.ST = window.ST || {};
         "</div></div>";
     }
 
-    form = tokenWarn + form;
+    form = tokenWarn + tokenPanelHtml() + form;
 
     var body;
     if (state.profileError && state.profileError.status === 404) {
@@ -1206,9 +1338,86 @@ window.ST = window.ST || {};
    * typed in by hand. */
   function loadMe() {
     return api(ROUTES.me()).then(function (r) {
-      if (!r.ok || !r.data) return;
+      if (!r.ok || !r.data) return null;
+      state.tokenPrincipal = r.data;
       state.tokenCorpNo = validNumber(r.data.corp_no);
+      return r.data;
     });
+  }
+
+  /* Adopt (or drop) the hand-pasted token.
+   *
+   * Everything downstream reads it through readToken() on the next call, so
+   * nothing has to be re-plumbed — but the *claims* we cached from the previous
+   * token are now stale, so /api/me is asked again and its answer reported.
+   * That round trip is also the only honest confirmation that the token works:
+   * a JWT that parses can still be expired, wrong-issuer, or for another corp.
+   *
+   * A 401 banner raised by the old token is cleared first: the whole point of
+   * pasting a new one is that the old failure no longer applies. */
+  function applyManualToken(tok) {
+    state.manualToken = tok || null;
+    state.tokenDraft = null;            // the box now mirrors what was adopted
+    // Claims read from the token being replaced describe nobody now. Dropped
+    // before the round trip so a failed /api/me leaves the panel saying
+    // nothing rather than saying something stale.
+    state.tokenPrincipal = null;
+    state.tokenCorpNo = null;
+    try {
+      if (tok) localStorage.setItem(LS.token, tok);
+      else localStorage.removeItem(LS.token);
+    } catch (e) { /* private mode — it still holds for this session */ }
+
+    if (state.authExpired) {
+      state.authExpired = false;
+      state.banner = null;
+      renderBanner();
+    }
+
+    setBusy(1);
+    return loadMe().then(function (me) {
+      setBusy(-1);
+      renderAll();
+      if (!tok) {
+        toast("info", tokenSource() === "shell"
+          ? "Pasted token cleared — back to the sign-in from the platform shell."
+          : "Pasted token cleared. No token is being sent now.");
+        return;
+      }
+      if (!me || me.has_token !== true) {
+        // The call failed, or the server saw no bearer header at all. Saying
+        // "accepted" here would be a lie the next apismx call would expose.
+        toast("warn", "Token saved, but the server did not confirm it. " +
+                      "/api/me could not be reached or saw no token.", true);
+        return;
+      }
+      // has_token only means a header arrived — auth.principal() sets it before
+      // it tries to decode. Claims coming back empty is how a malformed or
+      // expired token looks from here, and it is worth saying out loud.
+      var corp = validNumber(me.corp_no);
+      if (corp == null && !me.subject) {
+        toast("warn", "Token saved, but the server could not read any claims " +
+                      "from it — it may be malformed or expired.", true);
+        return;
+      }
+      toast("ok", "Token accepted" +
+                  (corp != null ? " — it identifies corp " + corp : "") +
+                  (me.verified === false
+                    ? ". Signature not verified by the server (advisory)." : "."));
+    });
+  }
+
+  function saveTokenFromField() {
+    var box = document.getElementById("pfToken");
+    if (!box) return;
+    var tok = normalizeToken(box.value);
+    if (!tok) { toast("err", "Paste a token first, or use Clear.", true); return; }
+    if (!JWT_RE.test(tok)) {
+      toast("err", "That does not look like a JWT — expected three " +
+                   "dot-separated segments (header.payload.signature).", true);
+      return;
+    }
+    applyManualToken(tok);
   }
 
   function loadTaxonomy() {
@@ -2242,6 +2451,21 @@ window.ST = window.ST || {};
     "profile-delete": function () { deleteProfile(); },
     "load-agent": function (n) { loadAgent(n.dataset.agent); },
 
+    "token-save": function () { saveTokenFromField(); },
+    "token-clear": function () { applyManualToken(null); },
+    "open-token-panel": function () {
+      state.topView = "tenant";
+      state.tenantSection = "profile";
+      persist();
+      renderAll();
+      var box = document.getElementById("pfToken");
+      // The section — and so the field — is gated on a corp number like the
+      // rest of Tenant Profile. Say why the box is not there rather than
+      // dropping the user on an empty state with no explanation.
+      if (box) box.focus();
+      else toast("info", "Load a corp number first — the token field is on this tab.");
+    },
+
     "batch-tag": function () { runBatch(); },
     "batch-stop-watch": function () { stopBatchPoll(false); },
 
@@ -2397,9 +2621,36 @@ window.ST = window.ST || {};
     });
 
     document.addEventListener("input", function (e) {
-      if (e.target && e.target.id === "qSearch") {
+      if (!e.target) return;
+      if (e.target.id === "qSearch") {
         state.questionSearch = e.target.value;
         renderTabBody();
+      } else if (e.target.id === "pfToken") {
+        // Held so a repaint underneath the user (the profile poller) does not
+        // wipe what they are pasting. Not persisted — only "Use this token" is.
+        state.tokenDraft = e.target.value;
+      }
+    });
+
+    // Enter in the token box means the same as the button beside it. The field
+    // is deliberately not inside a <form>: this section already owns two of
+    // them and a stray submit would reload the page with the token in tow.
+    document.addEventListener("keydown", function (e) {
+      if (e.target && e.target.id === "pfToken" && e.key === "Enter") {
+        e.preventDefault();
+        saveTokenFromField();
+      }
+    });
+
+    document.addEventListener("change", function (e) {
+      if (e.target && e.target.id === "pfTokenShow") {
+        state.tokenShow = !!e.target.checked;
+        // Keep whatever is typed; only the masking changes.
+        var box = document.getElementById("pfToken");
+        if (box) state.tokenDraft = box.value;
+        renderTenant();
+        var again = document.getElementById("pfToken");
+        if (again) again.focus();
       }
     });
 

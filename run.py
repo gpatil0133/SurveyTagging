@@ -57,6 +57,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -76,9 +77,12 @@ except ImportError:
 
 from contextlib import asynccontextmanager
 
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -148,7 +152,67 @@ async def lifespan(app: FastAPI):
         await app.state.scheduler.stop()
 
 
-app = FastAPI(title="Survey Auto-Tagger", version="7.0", lifespan=lifespan)
+# Swagger is hand-rolled below rather than configured through `root_path`.
+#
+# The obvious move behind a sub-path is FastAPI(root_path=path_prefix), and it
+# is wrong here. ASGI's contract is that `root_path` is a prefix the incoming
+# `path` still CARRIES; our proxy strips it (web.config rewrites
+# /apisurveytagging/api/x to /api/x), so the two disagree. Top-level routes
+# survive that — Starlette's `get_route_path` leaves a path alone when it does
+# not start with the root_path — but a Mount does not: it appends its own
+# segment to root_path, gets "/apisurveytagging/static" versus a path of
+# "/static/app.css", takes the same escape hatch, and hands StaticFiles the
+# UNSTRIPPED path. Every asset under /static then 404s. Measured, not theorised.
+#
+# So the prefix is applied only where it is actually needed — the `servers[]`
+# entry that makes Swagger's "Try it out" hit the public URL — and the docs
+# routes are declared with a relative openapi_url so they work at the origin
+# root and under a virtual path with no configuration at all.
+app = FastAPI(
+    title="Survey Auto-Tagger",
+    version="7.0",
+    lifespan=lifespan,
+    docs_url=None,
+    openapi_url=None,
+    redoc_url=None,
+)
+
+
+@app.get("/openapi.json", include_in_schema=False)
+async def openapi_spec(request: Request) -> dict:
+    """The schema, with `servers[]` pointing at the app's public base.
+
+    `path_prefix` is the answer when it is configured. When it is not, the
+    request itself is asked: ARR forwards X-Forwarded-Prefix, and failing that
+    the Referer of the /docs page that fetched this carries the prefix in its
+    own path. Both are guesses, which is why the setting wins.
+    """
+    spec = dict(app.openapi())
+    prefix = _settings.path_prefix
+    if not prefix:
+        prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+    if not prefix:
+        referer_path = urlparse(request.headers.get("referer", "")).path.rstrip("/")
+        if referer_path.endswith("/docs"):
+            prefix = referer_path[: -len("/docs")]
+    if prefix:
+        spec["servers"] = [{"url": prefix}]
+    return spec
+
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_ui() -> HTMLResponse:
+    """Swagger UI. `openapi_url` is RELATIVE on purpose — from /docs it resolves
+    to /openapi.json and from /apisurveytagging/docs to
+    /apisurveytagging/openapi.json, with nothing to configure either way.
+
+    Note this page loads swagger-ui's assets from a CDN, so on the air-gapped
+    deployment network it renders blank. The spec at /openapi.json is the part
+    that works everywhere.
+    """
+    return get_swagger_ui_html(
+        openapi_url="openapi.json", title="Survey Auto-Tagger — Swagger UI"
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -220,8 +284,9 @@ def _endpoint_name(request: Request) -> str | None:
 async def capture_bearer_token(request: Request, call_next):
     """Put the caller's JWT in the request context for the life of the request.
 
-    The UI reads the platform's `access_token` out of localStorage and sends it
-    on every call; this is what lets anything downstream (apismx today) forward
+    The UI sends one on every call — the platform's `access_token` out of
+    localStorage, or a token pasted into its Tenant Profile panel, which wins
+    over it; this is what lets anything downstream (apismx today) forward
     that same token outbound without every intermediate signature having to
     carry it. Absent header → empty string → callers fall back to
     SURVEY_TAGGER_SMX_TOKEN, exactly as before.
@@ -234,6 +299,79 @@ async def capture_bearer_token(request: Request, call_next):
         return await call_next(request)
     finally:
         request_context.reset_token(handle)
+
+
+class PathPrefixMiddleware:
+    """Accept the app's own public prefix in the request path.
+
+    `path_prefix` exists so the app can EMIT correct URLs behind an IIS virtual
+    application — the UI shell bakes it into `ST_BASE_PATH`, so the browser then
+    asks for `/apisurveytagging/static/app.css` and `/apisurveytagging/api/...`.
+    On the deployed box ARR strips that prefix before uvicorn ever sees it, so
+    the app only has to match `/static/...` and `/api/...`.
+
+    Run the same app directly — `python run.py`, no IIS — and there is nothing in
+    front to do the stripping, so every asset and every API call arrives with a
+    prefix no route matches. The UI comes up blank against a server that is
+    working perfectly. That is the entire local/IIS incompatibility, and this is
+    the whole of the fix: strip the prefix here too, so the app answers on BOTH
+    URL shapes and one `.env` serves both ways of running it.
+
+    Safe in front of a proxy that already stripped it: a path that does not
+    carry the prefix is passed through untouched, which is the case on every
+    deployed request. Same `_strip_prefix` contract as `wsgi_app.py`, which has
+    to do this for the FastCGI path for the same reason.
+
+    Pure ASGI rather than `@app.middleware("http")` because it must also cover
+    WebSocket scopes and, more importantly, run OUTSIDE `track_request` — the
+    ledger's `path` field should read the same on a local request as on a
+    deployed one, and it only does if the prefix is gone before that middleware
+    sees it.
+    """
+
+    def __init__(self, app, prefix: str) -> None:
+        self.app = app
+        self.prefix = prefix
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "") or ""
+            stripped = _strip_path_prefix(path, self.prefix)
+            if stripped != path:
+                # Copied, not mutated: the server owns the scope dict.
+                scope = dict(scope)
+                scope["path"] = stripped
+                raw = scope.get("raw_path")
+                if raw:
+                    # raw_path is bytes and keeps the query string off; strip the
+                    # same number of bytes so the two cannot disagree about which
+                    # path was requested.
+                    scope["raw_path"] = raw[len(self.prefix.encode()):] or b"/"
+        await self.app(scope, receive, send)
+
+
+def _strip_path_prefix(path: str, prefix: str) -> str:
+    """The path to route on, with the mount prefix removed.
+
+    Only a whole leading SEGMENT is stripped, so a route that merely starts with
+    the same letters is left alone. Returns the path unchanged when there is
+    nothing to strip — including when something in front already stripped it.
+    """
+    if not prefix:
+        return path
+    if path == prefix:
+        return "/"
+    if path.startswith(f"{prefix}/"):
+        return path[len(prefix):]
+    return path
+
+
+# Added last so it ends up OUTERMOST: Starlette builds the stack in reverse, so
+# the final `add_middleware` call is the first to see a request. Registered only
+# when there is a prefix — an empty one makes every branch above a no-op, and a
+# middleware that can never do anything is worth not having in the stack.
+if _settings.path_prefix:
+    app.add_middleware(PathPrefixMiddleware, prefix=_settings.path_prefix)
 
 
 # ====================================================================
@@ -1128,6 +1266,11 @@ async def ui_config() -> dict:
     """
     return {
         "profile_source": _settings.profile_source,
+        # The sub-path this app is mounted under, "" at the origin root. The UI
+        # already got it baked into index.html, so this is for non-browser
+        # callers and for confirming what the server thinks it is when a
+        # deployment's links come out wrong.
+        "path_prefix": _settings.path_prefix,
         "smx_allow_generate": _settings.smx_allow_generate,
         # Whether apismx can be called with NO caller token — i.e. whether the
         # server holds a headless fallback. The browser knows if it has a token
@@ -1244,13 +1387,50 @@ if static_dir.exists():
     app.mount("/static", _RevalidatingStaticFiles(directory=str(static_dir)), name="static")
 
 
+# The one line in index.html that carries the deployment's sub-path. Matched
+# literally rather than by regex so a mismatch is a loud "prefix never got
+# injected" in the browser, not a silently half-applied rewrite.
+_BASE_PATH_MARKER = 'window.ST_BASE_PATH = "";'
+
+
+def _shell_html(index_file: Path) -> str:
+    """index.html with `path_prefix` baked into its ST_BASE_PATH line.
+
+    The UI is static files with no build step, so there is nowhere else to put
+    a deployment-time value: the alternative is the browser guessing its own
+    prefix from `location.pathname`, which index.html still does as a fallback
+    but which is only ever a guess. One `str.replace` on a few KB, per hit on
+    `/`, is not worth caching — and not caching is what keeps editing the file
+    during dev behave the way the rest of the static tree does.
+
+    An empty prefix rewrites the line to itself; the marker is still asserted
+    so a rename in index.html surfaces in the log rather than at the next
+    deploy under a virtual path.
+    """
+    html = index_file.read_text(encoding="utf-8")
+    if _BASE_PATH_MARKER not in html:
+        logger.warning(
+            "shell_base_path_marker_missing",
+            extra={"marker": _BASE_PATH_MARKER, "path_prefix": _settings.path_prefix},
+        )
+        return html
+    # json.dumps, not an f-string: this lands inside a <script>, and a prefix
+    # with a quote in it would otherwise end the string and run as code.
+    return html.replace(
+        _BASE_PATH_MARKER,
+        f"window.ST_BASE_PATH = {json.dumps(_settings.path_prefix)};",
+    )
+
+
 @app.get("/")
 async def index():
     """The UI shell. Same no-cache reasoning as the static mount above — this
     one matters most, since a stale index.html pins every asset it references."""
     index_file = static_dir / "index.html"
     if index_file.exists():
-        return FileResponse(str(index_file), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse(
+            _shell_html(index_file), headers={"Cache-Control": "no-cache"}
+        )
     return {"message": "Survey Tagger API is running. See /docs."}
 
 
@@ -1267,5 +1447,40 @@ if __name__ == "__main__":
     # "debug" — this path re-imports the module (see log_config.configure_logging
     # on why that matters), and a hardcoded debug level here meant every
     # `python run.py` run wrote a firehose to app.log regardless of .env.
-    uvicorn.run("run:app", host="0.0.0.0", port=8001, reload=False,
-                log_level=str(_boot_settings.log_level).lower())
+    app_env = os.environ.get("APP_ENV", "").strip().lower()
+    is_local = "local" in app_env
+    port = int(os.environ.get("API_PORT", "8001"))
+    log_level = str(_boot_settings.log_level).lower()
+
+    # Which URL actually serves the UI. With a `path_prefix` configured the shell
+    # bakes it into ST_BASE_PATH, so the browser loads its assets from under the
+    # prefix — PathPrefixMiddleware makes both spellings work, but only one of
+    # them matches what the address bar will show afterwards, and guessing wrong
+    # is how "the UI only works on IIS" starts. Printed rather than logged: it is
+    # for the person who just typed the command.
+    _prefix = _boot_settings.path_prefix
+    print(f"  UI    http://127.0.0.1:{port}{_prefix or ''}/")
+    print(f"  Docs  http://127.0.0.1:{port}{_prefix or ''}/docs")
+    if _prefix:
+        print(f"  (SURVEY_TAGGER_PATH_PREFIX={_prefix} — the origin root serves the "
+              "same app and redirects itself under the prefix.)")
+
+    if not is_local:
+        host = os.environ.get("SERVER_HOST", "127.0.0.1")
+        uvicorn.run(
+            "run:app",
+            host=host,
+            port=port,
+            reload=False,
+            log_level=log_level,
+            proxy_headers=True,
+            forwarded_allow_ips="*",
+        )
+    else:
+        uvicorn.run(
+            "run:app",
+            host="0.0.0.0",
+            port=port,
+            reload=False,
+            log_level=log_level,
+        )

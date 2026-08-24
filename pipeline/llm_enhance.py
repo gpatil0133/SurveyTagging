@@ -240,6 +240,7 @@ def run_llm_enhancement(
                     context, accumulator, journey, _journey_index,
                     candidates_by_qid, min_score,
                 )
+                _close_unfilled_widget_fields(context, accumulator)
             logger.debug("llm_question_call_applied",
                          extra={"batches": len(batches),
                                 "parsed_questions": len(parsed_all),
@@ -411,6 +412,58 @@ def _close_unplaced_journeys(
             ))
 
 
+# The V8 widget fields a tagger may leave `pending_llm`, with what an unfilled
+# one means once the call HAS landed and declined. Each sentence is the honest
+# reading of that decline, not an error — the prompt tells the model to omit
+# these fields when they do not apply, so most of these are correct answers.
+_WIDGET_FIELD_DECLINED: dict[str, str] = {
+    "favorable_options": (
+        "No favorability split was recorded: either the question's role marks its "
+        "options as alternatives (a demographic, a segmentation list, a screener), so "
+        "it was never asked about, or the options were shown to the model with their "
+        "ids and it returned nothing. Both are the right answer for a list that is not "
+        "a good-to-bad scale — Percent Favorable and Net Intent are not metrics this "
+        "question can carry."
+    ),
+    "preferred_segments": (
+        "The survey's segmentable questions were offered as candidates and the model "
+        "judged that none of them is a cut of this metric worth showing. An unsegmented "
+        "widget is a correct outcome, not a gap."
+    ),
+    "display_label": (
+        "The question has no metric name and no usable title text, and the model wrote "
+        "no label from its options or section header. The widget will fall back to the "
+        "question text."
+    ),
+}
+
+
+def _close_unfilled_widget_fields(context, accumulator) -> None:
+    """Turn leftover `pending_llm` widget tags into skips that say why.
+
+    Same reasoning as `_close_unplaced_journeys`: `pending_llm` documents "that
+    call never landed", so once it has landed and declined, leaving the status
+    in place is a lie the output tells about itself. Only runs when at least one
+    question call succeeded — a survey whose batches all failed keeps
+    `pending_llm`, which is then true.
+    """
+    for q in context.questions:
+        if q.is_content_message:
+            continue
+        for dimension, reason in _WIDGET_FIELD_DECLINED.items():
+            existing = accumulator.get_question_tag(q.question_id, dimension)
+            if existing is None or existing.status != "pending_llm":
+                continue
+            accumulator.set_question_tag(q.question_id, dimension, TagResult(
+                value=[] if dimension == "preferred_segments" else None,
+                source="deterministic", status="skipped",
+                evidence=ev.rule(
+                    f"question.{dimension}.llm_declined", reason, stage=5,
+                    inputs={"question_type": q.question_type},
+                ),
+            ))
+
+
 # Confidence for a role the model read out of question wording. Deliberately
 # well under the deterministic pass's 0.90: those roles are read off platform
 # flags, these are an inference about branching nobody configured in the payload.
@@ -480,6 +533,88 @@ def _apply_flow_logic_inference(
         # "the rule previously said nothing" is noise, not provenance.
         superseded=_superseded(existing) if prior else None,
     ))
+
+
+# Confidence for the three V8 widget fields. The same 0.80 every other
+# LLM-assigned question tag carries: high enough to beat the seeds the taggers
+# deliberately hold below it, low enough that a future deterministic rule wins.
+_WIDGET_FIELD_CONFIDENCE = 0.80
+
+
+def _apply_widget_fields(
+    q_data: dict, accumulator, q_id: int, question, why: dict, q_reasoning: str | None,
+) -> None:
+    """Apply favorable_options, preferred_segments and display_label.
+
+    This is where MEMBERSHIP is enforced, because this is the first place that
+    holds the question and the survey. The parser guaranteed clean int lists;
+    what it could not know is whether those ids exist. Both id fields are
+    filtered against the namespace the prompt actually offered, so a model that
+    invents an option or names a question that cannot segment writes nothing
+    rather than writing a dangling reference into the payload.
+
+    Each field is written only over a tag the tagger left open (`pending_llm`,
+    or a seed below the override threshold) — the same merge rule the scalar
+    fields use, applied through `_blocks_llm_override`'s sibling test here so a
+    settled rule always wins.
+    """
+    # --- favorable_options: ids must be this question's own answer options ---
+    favorable = q_data.get("favorable_options")
+    if favorable and question is not None:
+        valid = {o.answer_id for o in question.answer_options}
+        filtered = {b: [i for i in ids if i in valid] for b, ids in favorable.items()}
+        dropped = sum(len(ids) for ids in favorable.values()) - sum(
+            len(ids) for ids in filtered.values())
+        if any(filtered.values()):
+            existing = accumulator.get_question_tag(q_id, "favorable_options")
+            if not (existing and (existing.status == "skipped"
+                                  or existing.confidence >= _WIDGET_FIELD_CONFIDENCE)):
+                line = _rationale(why, "favorable_options", q_reasoning)
+                if dropped:
+                    note = (f"{dropped} answer id(s) the model returned are not options "
+                            "on this question and were dropped.")
+                    line = f"{line} — {note}" if line else note
+                accumulator.set_question_tag(q_id, "favorable_options", TagResult(
+                    value=filtered, source="llm",
+                    confidence=_WIDGET_FIELD_CONFIDENCE,
+                    reasoning=line, superseded=_superseded(existing),
+                ))
+
+    # --- preferred_segments: ids must be segmentable questions in this survey ---
+    segments = q_data.get("preferred_segments")
+    if segments:
+        filtered = [
+            qid for qid in segments
+            if qid != q_id
+            and accumulator.get_question_tag_value(qid, "is_segmentable") == "Yes"
+        ]
+        if filtered:
+            existing = accumulator.get_question_tag(q_id, "preferred_segments")
+            if not (existing and (existing.status == "skipped"
+                                  or existing.confidence >= _WIDGET_FIELD_CONFIDENCE)):
+                line = _rationale(why, "preferred_segments", q_reasoning)
+                if len(filtered) != len(segments):
+                    note = (f"{len(segments) - len(filtered)} id(s) the model returned "
+                            "are not segmentable questions in this survey and were "
+                            "dropped.")
+                    line = f"{line} — {note}" if line else note
+                accumulator.set_question_tag(q_id, "preferred_segments", TagResult(
+                    value=filtered, source="llm",
+                    confidence=_WIDGET_FIELD_CONFIDENCE,
+                    reasoning=line, superseded=_superseded(existing),
+                ))
+
+    # --- display_label: free text, nothing to check membership against ---
+    label = q_data.get("display_label")
+    if label:
+        existing = accumulator.get_question_tag(q_id, "display_label")
+        if not (existing and (existing.status == "skipped"
+                              or existing.confidence >= _WIDGET_FIELD_CONFIDENCE)):
+            accumulator.set_question_tag(q_id, "display_label", TagResult(
+                value=label, source="llm", confidence=_WIDGET_FIELD_CONFIDENCE,
+                reasoning=_rationale(why, "display_label", q_reasoning),
+                superseded=_superseded(existing),
+            ))
 
 
 def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=None) -> None:
@@ -614,6 +749,9 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
 
         # Multi-label: flow_logic_inferred → flow_logic_role (union, never removal)
         _apply_flow_logic_inference(q_data, accumulator, q_id, why, q_reasoning)
+
+        # V8 widget fields, with their id namespaces enforced.
+        _apply_widget_fields(q_data, accumulator, q_id, question, why, q_reasoning)
 
         # Role intent refinement
         refined_role = q_data.get("role_intent_refined")

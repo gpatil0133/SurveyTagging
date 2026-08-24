@@ -1,8 +1,9 @@
 """Wire-level trace for the apismx / apipmx exchange.
 
-Everything this service knows about a tenant's profile arrives over three calls
-(`/AIAccountProfile/Details`, `/AIAccountProfile/Generate`, apipmx `/dcdata`),
-and until this module existed none of them left a usable record. httpx logs a
+Everything this service knows about a tenant's profile moves over four calls
+(`/AIAccountProfile/Details`, `/AIAccountProfile/Generate`, and apipmx
+`/ecdata` / `/dcdata` — the platform encrypts in both directions), and until
+this module existed none of them left a usable record. httpx logs a
 one-line `HTTP Request: POST ... 500 Internal Server Error` and `SmxClient`
 truncated the server's explanation to 200 characters into an exception that only
 ever reached the browser. So the log said a call failed and nothing about why —

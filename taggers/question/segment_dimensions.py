@@ -4,6 +4,16 @@ Stage 4, multi_label, deterministic. Depends on is_segmentable (Stage 4).
 
 Returns [] (empty list, NOT skipped) for non-segmentable questions to keep
 the tag present in the output schema.
+
+V8 changed the SHAPE, not the labels. Entries used to be bare strings —
+"Region", "Department" — which meant a dashboard composer had to resolve the
+label back to a question id for every widget it segmented, once per widget.
+Each entry now carries both: `{"label": "Region", "question_id": 4471}`. The
+round-trip disappears and the label still reads the same to a human.
+
+No new dimension was added for the id. That would restate what this one already
+says and leave two fields to keep in agreement, which is exactly why
+`control_role` was removed in V7.3.
 """
 
 from __future__ import annotations
@@ -62,6 +72,17 @@ _OPTION_KEYWORDS_TO_DIM: dict[str, str] = {
 }
 
 
+def _entry(label: str, question_id: int) -> dict[str, object]:
+    """One `{label, question_id}` pair.
+
+    The id is always this question's own: `segment_dimensions` says what THIS
+    question segments by, so the question a composer must send as
+    `segmentationQuestion` is this one. Carrying it here is what removes the
+    label-to-id lookup the composer used to do per widget.
+    """
+    return {"label": label, "question_id": question_id}
+
+
 class SegmentDimensionsTagger(QuestionTagger):
     name = "question.segment_dimensions"
     tag_dimension = "segment_dimensions"
@@ -109,7 +130,8 @@ class SegmentDimensionsTagger(QuestionTagger):
                 label = (q.custom_metric_title or "").strip()
                 band = f"{label} Band" if label else "Custom Metric Band"
             return TagResult(
-                value=[band], source="deterministic", confidence=0.90,
+                value=[_entry(band, q.question_id)], source="deterministic",
+                confidence=0.90,
                 evidence=ev.rule(
                     "question.segment_dimensions.metric_band",
                     f"The platform scores this question, so what it segments by is its "
@@ -139,7 +161,8 @@ class SegmentDimensionsTagger(QuestionTagger):
         if dims:
             title_hits = sorted({d for p, d in _TITLE_PATTERNS if p.search(q.title)})
             return TagResult(
-                value=sorted(dims), source="deterministic", confidence=0.85,
+                value=[_entry(d, q.question_id) for d in sorted(dims)],
+                source="deterministic", confidence=0.85,
                 evidence=ev.hybrid(
                     "question.segment_dimensions.extracted",
                     f"Recognized {len(dims)} standard segmentation dimension(s) in this "

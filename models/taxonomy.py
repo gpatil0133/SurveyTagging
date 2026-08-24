@@ -60,6 +60,20 @@ class TaxonomyDimension(BaseModel):
 
     Documentation only: no tagger reads it and nothing validates against it."""
 
+    metric_constraints: dict[str, str] = Field(default_factory=dict)
+    """Which values of a multi-label dimension need which metric family, as
+    `{group: prose}`.
+
+    Added in V8 for `widget_compatibility`, whose allowed set genuinely flips on
+    the metric — the count/percentage family unlocks the charts that divide a
+    whole, a scored metric collapses the set to bars plus gauge and number. The
+    dimension states the UNION over a question's valid metrics, which could not
+    be honest without somewhere to record that the union is conditional. Read it
+    alongside `platform_metric` to narrow the list for one widget.
+
+    Documentation only, same as `derived_controls`: no tagger reads it and
+    nothing validates against it."""
+
     feeds: list[str] = Field(default_factory=list)
     """Which outcome consumes the value, most-immediate consumer first.
 
@@ -116,6 +130,7 @@ class TaxonomyRegistry:
                     purpose=dim_config.get("purpose", ""),
                     feeds=dim_config.get("feeds", []),
                     derived_controls=dim_config.get("derived_controls", {}),
+                    metric_constraints=dim_config.get("metric_constraints", {}),
                 )
         return registry
 

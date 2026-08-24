@@ -333,6 +333,7 @@ def build_client(settings: Any, token: str = "") -> SmxClient:
         token=resolved,
         timeout=settings.smx_request_timeout,
         verify=verify,
+        encrypt_requests=bool(getattr(settings, "smx_encrypt_requests", True)),
         trace=SmxTrace(
             enabled=bool(getattr(settings, "smx_debug_wire", False)),
             log_dir=getattr(settings, "log_dir", None),

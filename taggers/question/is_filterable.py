@@ -14,6 +14,19 @@ Since V7.3 this is the *only* statement of the capability: `control_role`'s
 filter bar reads this dimension; free-text search reads `response_format ==
 "Open-Text"`, which is the one control this boolean deliberately says No to (an
 unbounded answer builds no facet, even though it can be searched).
+
+V8 re-verified this against the three response formats the Phase 1 split added,
+which is the whole of the change here — no rule moved. All three are `T`
+questions narrowed by `question_sub_type`, so all three fall through to No, and
+all three are right to:
+
+    Date .......... a date filter is a RANGE control, not a facet built from a
+                    bounded answer set. `derived_controls` routes it to
+                    `date_filter`, which V8 made derivable for the first time.
+    Numeric-Open .. a real scale, but an unbounded one — there is no discrete
+                    answer set to build a facet from. Decided explicitly in
+                    Phase 1; see the invariant in `taggers/_metric_utils.py`.
+    File-Upload ... there is no answer at all.
 """
 
 from __future__ import annotations
@@ -93,12 +106,16 @@ class IsFilterableTagger(QuestionTagger):
             value="No", source="deterministic", confidence=1.0,
             evidence=ev.rule(
                 "question.is_filterable.unbounded_answer",
-                f"Question type {q.question_type} is free text, a contact block or a "
-                "signature — the answer is neither one of a fixed list of choices nor a "
-                "point on a scale, so there is no bounded set to build a facet from. "
-                "(Metrics and rating scales are checked first and do qualify.)",
+                f"Question type {q.question_type} is free text, a date, a number, a file "
+                "upload, a contact block or a signature — the answer is neither one of a "
+                "fixed list of choices nor a point on a BOUNDED scale, so there is no "
+                "discrete set to build a facet from. A date still gets a filter, but a "
+                "range control rather than a facet (read response_format == \"Date\"); a "
+                "numeric answer is a real scale with no discrete answer set. (Metrics and "
+                "rating scales are checked first and do qualify.)",
                 stage=3,
                 inputs={"question_type": q.question_type,
+                        "question_sub_type": q.question_sub_type,
                         "rs_type": q.rs_type,
                         "filterable_types": sorted(_FILTERABLE_TYPES)},
             ),

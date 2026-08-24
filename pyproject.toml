@@ -14,6 +14,11 @@ requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
+    # Imported directly by run.py and main.py to hop .env into os.environ, which
+    # pydantic-settings does not do — litellm and parallel-web read their keys
+    # from the environment, not from Settings. It arrives transitively via
+    # pydantic-settings today; declared here because we import it by name.
+    "python-dotenv>=1.0",
     "pyarrow>=14.0",
     # SMB client. Lets SURVEY_TAGGER_SHARE_ROOT be a UNC path
     # (//server/share/...) that the process opens itself, instead of requiring
@@ -51,6 +56,13 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",
     "respx>=0.21",
+]
+# IIS FastCGI fallback only — `pip install -e .[iis]`. NOT needed for the
+# supported Windows deployment, which is uvicorn behind an ARR reverse proxy
+# and imports nothing extra. Install this only when ARR is unavailable and
+# wsgi_app.py is doing the hosting. See docs/deployment-iis.md §9.
+iis = [
+    "a2wsgi>=1.10",
 ]
 
 [project.scripts]

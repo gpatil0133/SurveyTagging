@@ -1,7 +1,8 @@
 """The caller's bearer token, scoped to the request that carried it.
 
-The browser sends the platform's `access_token` (read from localStorage by
-static/app.js) on every call. Anything this process does *outbound* on that
+The browser sends a bearer token on every call — the platform's `access_token`
+out of localStorage, or one pasted by hand into the Tenant Profile panel, which
+overrides it (static/app.js, readToken). Anything this process does *outbound* on that
 caller's behalf — apismx today, any other SoGo service later — should travel
 with that same token rather than with a shared service credential: same issuer,
 same user, correct audit trail.

@@ -25,7 +25,20 @@ _QUESTION_WHY_KEYS = frozenset({
     "topic_theme", "role_intent_refined", "respondent_sensitivity",
     "flow_respondent_experience", "flow_reusability", "visualization_type",
     "dashboard_names", "display_role", "flow_logic_inferred",
+    # V8 widget fields.
+    "favorable_options", "preferred_segments", "display_label",
 })
+
+# The three favorability buckets, in the order they are emitted.
+_FAVORABILITY_BUCKETS = ("positive", "negative", "neutral")
+
+# At most this many segment ids are kept. Past three a widget carries more
+# breakdowns than a reader compares, and the prompt asks for 1-3.
+_MAX_PREFERRED_SEGMENTS = 3
+
+# `display_label` is a chart title on a tile. Same treatment as project_intent:
+# free text with no enum behind it, so shape is the only thing left to enforce.
+_DISPLAY_LABEL_MAX_CHARS = 60
 
 # The `flow_logic_role` values a model may add by reading a question. The other
 # four are deliberately excluded, for two different reasons:
@@ -55,14 +68,71 @@ _INDUSTRY_MAX_CHARS = 60
 
 
 def _clean_free_text(raw, max_chars: int) -> str | None:
-    """Normalize a free-text model answer, or None if it gave nothing usable."""
+    """Normalize a free-text model answer, or None if it gave nothing usable.
+
+    Quotes and terminal punctuation are stripped in two passes because they
+    nest: a model that answers `"Region".` leaves a trailing quote behind after
+    one pass, and that quote is then inside the value the UI renders. Two passes
+    settle every ordering that occurs in practice.
+    """
     if not isinstance(raw, str):
         return None
-    text = " ".join(raw.split()).strip("\"'“”‘’ \t")
-    text = text.rstrip(".;,:").strip()
+    text = " ".join(raw.split())
+    for _ in range(2):
+        text = text.strip("\"'“”‘’ \t").strip().rstrip(".;,:!?").strip()
     if not text:
         return None
     return text[:max_chars].strip()
+
+
+def _int_ids(raw, limit: int | None = None) -> list[int]:
+    """Coerce a model-returned id list to ints, in order, without repeats.
+
+    Tolerant about the wire type — a model that writes "4471" rather than 4471
+    has still named the right question — and strict about everything else. The
+    caller checks membership; this only guarantees a clean list of ints.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[int] = []
+    for item in raw:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            value = item
+        elif isinstance(item, str) and item.strip().lstrip("-").isdigit():
+            value = int(item.strip())
+        else:
+            continue
+        if value not in out:
+            out.append(value)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
+def _clean_favorable_options(raw) -> dict[str, list[int]] | None:
+    """Normalize the model's favorability split, or None if it gave nothing.
+
+    Shape only: three int lists with no id repeated ACROSS buckets — an option
+    that is both favorable and neutral would be double-counted by the metric.
+    First bucket named wins, which matches the order the prompt lists them in.
+    Membership against the question's own options is checked by the caller,
+    which has the question.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, list[int]] = {b: [] for b in _FAVORABILITY_BUCKETS}
+    claimed: set[int] = set()
+    for bucket in _FAVORABILITY_BUCKETS:
+        for answer_id in _int_ids(raw.get(bucket)):
+            if answer_id in claimed:
+                continue
+            claimed.add(answer_id)
+            out[bucket].append(answer_id)
+    if not claimed:
+        return None
+    return out
 
 
 def _clean_why(raw, allowed_keys: frozenset[str]) -> dict[str, str]:
@@ -254,6 +324,32 @@ class ResponseParser:
             if not parsed.get("flow_logic_inferred"):
                 parsed.pop("flow_logic_inferred", None)
                 why.pop("flow_logic_inferred", None)
+
+            # ---------- V8 widget fields ----------
+            # All three are shape-checked here and MEMBERSHIP-checked in
+            # `llm_enhance._apply_question_llm_results`, which holds the
+            # question and so knows which ids actually exist. Splitting it that
+            # way keeps the parser free of survey context, the way the journey
+            # block keeps its namespace in `candidates_by_qid`.
+            favorable = _clean_favorable_options(q_data.get("favorable_options"))
+            if favorable:
+                parsed["favorable_options"] = favorable
+            else:
+                why.pop("favorable_options", None)
+
+            segments = _int_ids(q_data.get("preferred_segments"),
+                                limit=_MAX_PREFERRED_SEGMENTS)
+            if segments:
+                parsed["preferred_segments"] = segments
+            else:
+                why.pop("preferred_segments", None)
+
+            label = _clean_free_text(q_data.get("display_label"),
+                                     _DISPLAY_LABEL_MAX_CHARS)
+            if label:
+                parsed["display_label"] = label
+            else:
+                why.pop("display_label", None)
 
             # Role intent refinement (preserved from v1)
             parsed["role_intent_refined"] = q_data.get("role_intent_refined")

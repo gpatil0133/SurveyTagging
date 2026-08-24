@@ -8,6 +8,7 @@ from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
+from taggers import _sub_types
 from taggers.base import QuestionTagger
 
 _DEMOGRAPHIC_PATTERNS = [
@@ -101,7 +102,7 @@ class RoleIntentTagger(QuestionTagger):
             )
 
         # Profiling / Demographic: email subtype
-        if q.question_type == "T" and q.question_sub_type == 31:
+        if q.question_type == "T" and q.question_sub_type in _sub_types.EMAIL:
             return TagResult(
                 value="Profiling / Demographic", source="deterministic", confidence=0.95,
                 evidence=ev.rule(
@@ -110,7 +111,8 @@ class RoleIntentTagger(QuestionTagger):
                     "collects an identifier about the respondent rather than an "
                     "opinion.",
                     stage=3,
-                    inputs={"question_type": "T", "question_sub_type": 31},
+                    inputs={"question_type": "T",
+                            "question_sub_type": q.question_sub_type},
                 ),
             )
 
@@ -167,7 +169,7 @@ class RoleIntentTagger(QuestionTagger):
                 )
 
         # Contextual / Situational: date picker
-        if q.question_type == "T" and q.question_sub_type == 1:
+        if q.question_type == "T" and q.question_sub_type in _sub_types.DATE:
             return TagResult(
                 value="Contextual / Situational", source="deterministic", confidence=0.85,
                 evidence=ev.rule(
@@ -176,12 +178,13 @@ class RoleIntentTagger(QuestionTagger):
                     "context for interpreting the other answers, not an opinion in "
                     "itself.",
                     stage=3,
-                    inputs={"question_type": "T", "question_sub_type": 1},
+                    inputs={"question_type": "T",
+                            "question_sub_type": q.question_sub_type},
                 ),
             )
 
         # Contextual / Situational: file upload
-        if q.question_type == "T" and q.question_sub_type == 71:
+        if q.question_type == "T" and q.question_sub_type in _sub_types.FILE_UPLOAD:
             return TagResult(
                 value="Contextual / Situational", source="deterministic", confidence=0.80,
                 evidence=ev.rule(
@@ -189,7 +192,8 @@ class RoleIntentTagger(QuestionTagger):
                     "Sub-type 71 is a file upload — supporting evidence attached to the "
                     "response (a receipt, a photo), not a measurable answer.",
                     stage=3,
-                    inputs={"question_type": "T", "question_sub_type": 71},
+                    inputs={"question_type": "T",
+                            "question_sub_type": q.question_sub_type},
                 ),
             )
 

@@ -18,6 +18,19 @@ PLATFORM-scored metrics get it — they are the ones with canonical bands. An
 unflagged rating scale is filterable (a scale point is a facet) without being
 segmentable (no agreed banding to group by), which is exactly the difference
 this dimension exists to record.
+
+V8 re-verified this against the three response formats the Phase 1 split added
+(`Date`, `Numeric-Open`, `File-Upload`). All three are `T` questions, which is
+not in `_BUCKETING_TYPES`, so all three resolve to No unless the platform has
+flagged them as a metric — and none of them can be, since a text question
+carries no rs_type. Nothing to group other answers by: a date is continuous, a
+number is unbounded, an attachment is not an answer. No rule changed.
+
+Since V8 this dimension also gates `preferred_segments`, which asks the
+reciprocal question — not "can this question segment?" but "which segmenting
+question is worth cutting THIS metric by?". That is a one-way cascade: the
+candidate list for `preferred_segments` is every question this dimension says
+Yes to.
 """
 
 from __future__ import annotations

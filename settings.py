@@ -164,6 +164,19 @@ class Settings(BaseSettings):
     smx_token: str = ""
     smx_request_timeout: float = 60.0
 
+    # Encrypt outbound request BODIES through apipmx `/ecdata` before posting
+    # them to apismx. On everywhere real: the platform's write controllers
+    # Base-64 decode the body before parsing it, so a plain JSON body is
+    # answered with HTTP 500 "input is not a valid Base-64 string".
+    #
+    # Query strings are not encrypted by the platform, so this only affects
+    # calls that carry a body (`/AIAccountProfile/Generate`), not the GETs.
+    #
+    # The off switch exists for one case: a local stub or an older deploy that
+    # has not turned request encryption on. Turning it off in a real
+    # environment breaks every write.
+    smx_encrypt_requests: bool = True
+
     # When a tenant has no profile on the share AND none in SMX, trigger
     # /AIAccountProfile/Generate and wait for it. Generation is a write that
     # starts paid research, so it is gated here as well as per-request.
@@ -186,6 +199,34 @@ class Settings(BaseSettings):
     smx_debug_wire: bool = False
     # Body clipping for the app.log lines only; the JSONL keeps the full body.
     smx_debug_max_chars: int = 2000
+
+    # Reverse-proxy sub-path (IIS virtual application).
+    #
+    # Empty when the service owns its origin — localhost, or an IIS site whose
+    # root IS this app. Set it to the virtual path when IIS mounts the app under
+    # one (e.g. /apisurveytagging) and two things follow:
+    #
+    #   * FastAPI takes it as `root_path`, so /docs and /openapi.json describe
+    #     the public URL rather than the stripped one Swagger would otherwise
+    #     tell you to curl;
+    #   * `GET /` bakes it into the UI shell (run.py:index), so every /api call
+    #     and every static asset resolves under the prefix instead of at the
+    #     origin root.
+    #
+    # It is NOT about routing: web.config's ARR rule strips the prefix before
+    # the request reaches uvicorn, so the app only ever matches `/api/...`.
+    # This is purely about the URLs the app *emits*. Starlette's
+    # `get_route_path` tolerates both — a prefix already stripped by the proxy
+    # and one still present — so a mismatched value degrades to "URLs point at
+    # the wrong place", never to a 404 storm.
+    #
+    # Accepted with or without the leading slash; trailing slashes are dropped.
+    # `API_PATH_PREFIX` is accepted unprefixed to match the sibling stats
+    # module, whose .env spells it that way.
+    path_prefix: str = Field(
+        default="",
+        validation_alias=AliasChoices("SURVEY_TAGGER_PATH_PREFIX", "API_PATH_PREFIX"),
+    )
 
     # Logging
     log_level: str = "DEBUG"
@@ -258,16 +299,20 @@ class Settings(BaseSettings):
     sogo_apicx_base_url: str = "https://sogolyticsintuc.sevenpv.com/apicx"
     sogo_apipmx_base_url: str = "https://sogolyticsintuc.sevenpv.com/apipmx"
     # Research API — /AIAccountProfile lives here (profile_source="smx").
-    # apismx responses come back encrypted; apipmx /dcdata decrypts them, which
-    # is why both URLs must track the same host.
+    # apismx traffic is encrypted in BOTH directions: apipmx /ecdata encrypts
+    # what we send, /dcdata decrypts what comes back. That is why apipmx must
+    # track the same host as apicx and apismx — a mismatched pair produces
+    # ciphertext the target host cannot read.
     sogo_apismx_base_url: str = "https://sogolyticsintuc.sevenpv.com/apismx"
     sogo_request_timeout: float = 30.0
     sogo_max_retries: int = 3
     sogo_concurrency: int = 5
 
     # apicx endpoint paths (relative to sogo_apicx_base_url). Captured from
-    # SoGo intuc's network trace — every endpoint here accepts the same
-    # encrypted POST envelope handled by `_encrypted_post`. The PMX
+    # SoGo intuc's network trace — every endpoint here takes the same encrypted
+    # POST body as apismx does: compact JSON through apipmx `/ecdata`, posted as
+    # raw ciphertext with `Content-Type: text/plain` (see
+    # `tenant_profile.smx_client.SmxClient._encrypt`). The PMX
     # (encrypt/decrypt) paths are not configurable — those are stable
     # platform-wide.
     sogo_category_create_path: str = "/AddEditDeleteCategory/detail/search"
@@ -291,17 +336,40 @@ class Settings(BaseSettings):
     #   2. `sogo_verify_ssl=False` → disable verification. Logged at
     #      WARNING on every client init. Acceptable for *intuc* dev only;
     #      MUST be true on qauc/beta/live.
-    #   3. Default (verify_ssl=True, no bundle): httpx uses the certifi
-    #      bundle. If the SoGo deployment uses a publicly-trusted cert
-    #      (qauc, prod), this Just Works. If it uses an internal CA
-    #      (intuc), this is what raises the "unable to get local issuer
-    #      certificate" error you see in the logs.
+    #   3. Default (verify_ssl=True, no bundle): `tls_trust.install` routes
+    #      verification through the OS trust store via `truststore`, so
+    #      Windows finds the corporate CA and this needs no config at all.
+    #      This is the option to stay on.
     #
-    # If `truststore` is installed (`pip install truststore`), the client
-    # uses the OS trust store automatically — Windows will find the
-    # corporate CA and verify without any config here.
+    # On (3), the OS store is what makes an internal CA (intuc) verify.
+    # Without it httpx falls back to the certifi bundle, which holds only
+    # public roots — that is the "unable to get local issuer certificate"
+    # error, and it is what happened for as long as nothing called
+    # `truststore.inject_into_ssl()`. The install is done once from
+    # `bootstrap.build_context` (service) and from main.py (CLI); it is
+    # skipped when a CA bundle is set or verification is off, since those
+    # two branches already have an answer. If `truststore` is somehow not
+    # installed, `tls_trust` logs a WARNING naming the remedy rather than
+    # letting the failure surface later as an opaque TLS error.
     sogo_verify_ssl: bool = True
     sogo_ca_bundle_path: str = ""
+
+    @field_validator("path_prefix", mode="before")
+    @classmethod
+    def _normalize_path_prefix(cls, value: object) -> object:
+        """One canonical spelling: "" or "/segment[/segment...]".
+
+        Operators write the IIS virtual path the way IIS shows it, which is any
+        of `apisurveytagging`, `/apisurveytagging` or `/apisurveytagging/`. All
+        three have to end up identical, because the value is concatenated with
+        route paths that already start with `/` — a trailing slash would emit
+        `//api/config` and a missing leading one `apisurveytagging/api/config`,
+        both of which resolve somewhere other than intended.
+        """
+        if not isinstance(value, str):
+            return value
+        trimmed = value.strip().strip("/")
+        return f"/{trimmed}" if trimmed else ""
 
     @field_validator("share_root", mode="before")
     @classmethod

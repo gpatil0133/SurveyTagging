@@ -1543,11 +1543,13 @@ table.qtable--taxonomy td.tax-feeds .multi-list { flex-wrap: wrap; gap: var(--sp
 .field input[type="text"],
 .field input[type="number"],
 .field input[type="url"],
+.field input[type="password"],
 .field select,
 .field textarea,
 input[type="text"].control,
 input[type="number"].control,
 input[type="url"].control,
+input[type="password"].control,
 select.control,
 textarea.control {
   width: 100%;
@@ -1563,15 +1565,19 @@ textarea.control {
 .field input[type="text"]:focus,
 .field input[type="number"]:focus,
 .field input[type="url"]:focus,
+.field input[type="password"]:focus,
 .field select:focus,
 .field textarea:focus,
 input[type="text"].control:focus,
 input[type="number"].control:focus,
 input[type="url"].control:focus,
+input[type="password"].control:focus,
 select.control:focus,
 textarea.control:focus {
   border-color: var(--accent);
 }
+/* The JWT box: long, opaque, and only ever read back to check a paste. */
+#pfToken { font-family: var(--font-mono); font-size: 12px; }
 textarea.code {
   font-family: var(--font-mono);
   font-size: 12px;

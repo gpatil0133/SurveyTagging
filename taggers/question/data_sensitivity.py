@@ -8,6 +8,7 @@ from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
+from taggers import _sub_types
 from taggers.base import QuestionTagger
 
 # Compiled regex patterns for each sensitivity category
@@ -101,8 +102,10 @@ class DataSensitivityTagger(QuestionTagger):
         group_title = question.matrix_group_title
         check_text = f"{title} {group_title}"
 
-        # Special subType checks
-        if question.question_sub_type == 31:
+        # Special subType checks. The code lives in `taggers/_sub_types.py` so
+        # this tagger, `role_intent` and the capability layer's
+        # `_response_format` cannot disagree about what an email field is.
+        if question.question_sub_type in _sub_types.EMAIL:
             matches.append("PII \u2013 Email")
 
         # Regex pattern matching

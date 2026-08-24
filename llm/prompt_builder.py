@@ -248,10 +248,44 @@ _MASKABLE_FIELDS: dict[str, tuple[str, float]] = {
     "visualization_type":         ("visualization_type", 0.80),
     "display_role":               ("display_role", 0.80),
     "role_intent_refined":        ("role_intent", 0.70),
+    # V8. All three follow the same rule as the rest — a settled tag wins the
+    # merge, so asking again buys nothing — and all three are settled far more
+    # often than not: `favorable_options` only reaches the model on an
+    # UNWEIGHTED scale, `display_label` only when the question has no metric
+    # name, and `preferred_segments` only when a metric has candidates to rank.
+    # The taggers mark exactly those cases `pending_llm`, which `_is_settled`
+    # reads as unsettled.
+    "favorable_options":          ("favorable_options", 0.80),
+    "preferred_segments":         ("preferred_segments", 0.80),
+    "display_label":              ("display_label", 0.80),
 }
 
+# Output field -> the per-question input the model needs to answer it. Asking
+# for one of these without supplying its input would invite the model to invent
+# ids, so the two are gated together in `_needed_fields`.
+_FIELD_REQUIRES_INPUT = {
+    "favorable_options": "options_for_favorability",
+    "preferred_segments": "segment_candidates",
+}
 
-def _needed_fields(accumulator: TagAccumulator, q_id: int, *, has_candidates: bool) -> list[str]:
+# Roles whose options are alternatives rather than points on a good-to-bad
+# scale, so there is no favorability to split. The tagger cannot rule these out
+# itself — it runs at Stage 3, before `role_intent` — but by the time a prompt
+# is built the role is known, and "Which region are you in?" is a list where no
+# option is favorable. Skipping them here drops the option payload AND the
+# request from `needed`, on what is otherwise the most common shape in a survey.
+_NEVER_FAVORABILITY_ROLES = frozenset({
+    "Segmentation", "Profiling / Demographic", "Screener",
+})
+
+
+def _needed_fields(
+    accumulator: TagAccumulator,
+    q_id: int,
+    *,
+    has_candidates: bool,
+    available_inputs: set[str] | None = None,
+) -> list[str]:
     """The output fields still worth asking the model for on this question.
 
     A deterministic tagger that already answered with enough confidence wins the
@@ -265,11 +299,19 @@ def _needed_fields(accumulator: TagAccumulator, q_id: int, *, has_candidates: bo
 
     Order is fixed (dict insertion order) so the rendered prompt stays stable
     for identical input — a shuffled list would be a silent cache invalidator.
+
+    `available_inputs` names the per-question inputs the caller actually
+    attached. A field in `_FIELD_REQUIRES_INPUT` is dropped when its input is
+    missing, because asking a model to pick from a list it was not shown is an
+    invitation to invent ids. Defaults to none attached, which is the safe
+    direction for a caller that does not build the payload.
     """
+    supplied = (available_inputs or set()) | {""}
     needed = [
         field
         for field, (dimension, threshold) in _MASKABLE_FIELDS.items()
         if not _is_settled(accumulator.get_question_tag(q_id, dimension), threshold)
+        and _FIELD_REQUIRES_INPUT.get(field, "") in supplied
     ]
     # Always requested: the merge rules apply these no matter what ran first.
     needed.append("dashboard_names")
@@ -282,6 +324,19 @@ def _needed_fields(accumulator: TagAccumulator, q_id: int, *, has_candidates: bo
     if has_candidates:
         needed.append("journey")
     return needed
+
+
+def _awaiting_llm(accumulator: TagAccumulator, q_id: int, dimension: str) -> bool:
+    """True when a tagger deliberately left this dimension for LLM Call 2.
+
+    The V8 taggers mark exactly the cases a rule cannot decide `pending_llm` —
+    an unweighted scale for `favorable_options`, a metric with candidates for
+    `preferred_segments` — so this is what gates attaching their (non-trivial)
+    prompt inputs. Anything settled, skipped, or answered by a rule sends no
+    extra payload at all.
+    """
+    existing = accumulator.get_question_tag(q_id, dimension)
+    return existing is not None and existing.status == "pending_llm"
 
 
 def _is_settled(existing, threshold: float) -> bool:
@@ -494,9 +549,39 @@ def build_question_prompt(
             q_entry["signature"] = build_question_signature(context, q)
             q_entry["candidates"] = ranked
 
+        # V8 inputs, attached only when the matching tag is still open. Both are
+        # id lists the model picks FROM rather than writes, the same shape as
+        # the journey candidates — nothing the model types becomes a tag value,
+        # so it cannot invent an option or a question that does not exist.
+        available_inputs: set[str] = set()
+
+        if (_awaiting_llm(accumulator, q.question_id, "favorable_options")
+                and q_entry["current_role"] not in _NEVER_FAVORABILITY_ROLES):
+            # The full option list with ids, not the six-title preview above:
+            # a favorability split has to cover every option exactly once.
+            options = [{"id": o.answer_id, "text": o.answer_text}
+                       for o in q.answer_options if o.answer_text]
+            if options:
+                q_entry["options_for_favorability"] = options
+                available_inputs.add("options_for_favorability")
+
+        if _awaiting_llm(accumulator, q.question_id, "preferred_segments"):
+            candidates = [
+                {"id": other.question_id, "title": other.title}
+                for other in context.questions
+                if not other.is_content_message
+                and other.question_id != q.question_id
+                and accumulator.get_question_tag_value(
+                    other.question_id, "is_segmentable") == "Yes"
+            ]
+            if candidates:
+                q_entry["segment_candidates"] = candidates
+                available_inputs.add("segment_candidates")
+
         # Ask only for what the merge rules will actually keep.
         q_entry["needed"] = _needed_fields(
             accumulator, q.question_id, has_candidates=bool(ranked),
+            available_inputs=available_inputs,
         )
 
         questions_data.append(q_entry)

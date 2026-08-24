@@ -1,5 +1,49 @@
-# Master Survey Tagging Taxonomy (V7 — adds the explanation layer)
+# Master Survey Tagging Taxonomy (V8 — aligns the vocabulary to the widget API)
 # Defines tag dimensions across tenant, project, and question levels.
+#
+# ---------------------------------------------------------------------------
+# What V8 changed, and why
+#
+# The goal was narrow: every tag a dashboard composer reads should resolve to a
+# field the /Widget/insertupdate payload actually accepts, without guessing.
+# Six dimensions were added, seven reshaped, eight values dropped.
+#
+#   Phase 1  response_format was branching on question_type alone, collapsing
+#            five distinct question shapes into Open-Text — a numeric "how many
+#            days since your last visit?" became a word cloud. It now reads
+#            question_sub_type too, adding Date, Numeric-Open and File-Upload
+#            and widening Contact to absorb the email sub-type. scale_of_
+#            measurement's Ratio, emitted by nothing before, gets its first
+#            source. Everything below the anchor inherited that error, so this
+#            phase had to land before the other two meant anything.
+#
+#   Phase 2  metricType is required on every widget insert and nothing here
+#            could produce one. platform_metric (NEW) carries the ordered code
+#            list; calculation_type became a COARSENING of it rather than a
+#            second opinion, so the two cannot drift. Weighted Score — the
+#            platform default for every grid and rating question, and the most
+#            used code there is — was missing entirely.
+#
+#   Phase 3  The chart vocabulary moved onto the platform's own names.
+#            Orientation is not cosmetic: horizontal and vertical are separate
+#            codes, and for a grid question the two stacked variants are the
+#            ONLY legal charts. Four values with no code behind them were
+#            dropped (Heat Map, Distribution Chart, Sentiment, Map) along with
+#            two that were something else wearing a chart's name (Trend Line is
+#            a display mode; Ranking Bar is a horizontal bar with a Weighted
+#            Score metric).
+#
+#   Phase 4  Six payload fields no dimension spoke to: favorable_options,
+#            trend_granularity, widget_footprint, preferred_segments,
+#            display_label, plus a shape change to segment_dimensions.
+#
+# Phase 0 remains OPEN and gates one value. Our question_sub_type enum
+# (1 date, 31 email, 71 file upload) is not RMX's qSubType enum (1-5 for date /
+# time / datetime / date-range / statistical), and our numeric/statistical code
+# has not been enumerated from live payloads. `Numeric-Open` is declared and
+# wired but unreachable until it is; see taggers/_sub_types.py, where turning it
+# on is a one-line change. `Ratio` and `Sum` depend on it.
+# ---------------------------------------------------------------------------
 #
 # V6 added: tenant_level (compliance_posture, customer_segment_signature,
 #          workforce_signature, ex_maturity_signature, key_cx_touchpoints,
@@ -779,24 +823,127 @@ question_level:
     feeds: [Reporting, S3, S5]
     strategy: deterministic
     explanation: >-
-      How answers should be rolled into a single number. Reporting reads this to know
-      whether to average, count, take a percentage, or run the NPS formula.
+      How answers should be rolled into a single number, in vendor-neutral terms.
+      Reporting reads this to know whether to average, count, take a percentage, or run
+      the NPS formula. `platform_metric` says the same thing in the platform's own
+      enum; this one is deliberately the coarser statement, because Reporting and S5
+      have no business knowing RMX codes.
     derivation: >-
-      The platform's own calculation hint wins when present; then metric_name
-      (NPS/eNPS -> NPS Score, CSAT/CES -> Mean); ranking types -> Mean Rank;
-      open-ended -> Count; categorical -> Percentage for two options, Distribution
-      for more; other metrics -> Mean; fallback Not Applicable. Stage 4,
-      taggers/question/calculation_type.py. Never LLM-refined.
+      A COARSENING of platform_metric, not a second opinion: the derivation lives once
+      in taggers/_platform_metrics.py and both dimensions call it, so they cannot
+      disagree by construction. Take the primary (first) platform metric and fold it —
+      NPS -> NPS Score; CSAT/CES/Custom Metric/Weighted Score -> Weighted Score; Group
+      Percentage/Group Count -> Distribution; the seven numeric metrics -> Sum or Mean;
+      Overall Rank -> Mean Rank; Percentage and Count pass through. Two answer shapes
+      need a coarser word than their primary metric supplies and are named explicitly:
+      a Ranking question reads Mean Rank (what a report says about it) even though its
+      platform target is Weighted Score on graphs and Overall Rank on tables, and a
+      choice list with three or more options reads Distribution rather than Percentage,
+      because no single percentage represents it. An empty metric list -> Not
+      Applicable. Stage 4, taggers/question/calculation_type.py. Never LLM-refined.
+      V8 fixed three things here. The platform's own calculationType hint no longer
+      normalizes "weighted" to Mean — the author configured a weighted calculation and
+      we were discarding it, while the platform's own default for that question is
+      Weighted Score. CSAT and CES stop resolving to Mean, since the platform has
+      dedicated metrics for both and defaults to them. And "Top Box %" was dropped: no
+      branch ever emitted it and no platform metric implements it — Percent Favorable
+      is the real concept it was reaching for.
     allowed_values:
-      - Mean
-      - Percentage
-      - Count
-      - Sum
-      - NPS Score
-      - "Top Box %"
-      - Distribution
-      - "Mean Rank"
+      - Mean                 # RMX 15
+      - Percentage           # RMX 09
+      - Count                # RMX 08
+      - Sum                  # RMX 20 — gated on Phase 0 (Numeric-Open) or an author hint
+      - NPS Score            # RMX 01
+      - Distribution         # RMX 11 (Group Percentage) / 12 (Group Count)
+      - "Mean Rank"          # RMX 22 on tables, 06 on graphs — see platform_metric
+      - "Weighted Score"     # RMX 06 — the platform default for grids and rating scales
+      - "Percent Favorable"  # RMX 07 — needs favorable_options on non-rs_type questions
+      - "Net Intent"         # RMX 05
       - "Not Applicable"
+
+  platform_metric:
+    description: "Ordered list of platform metric codes valid for this question, primary first. Maps one-to-one onto the widget payload's metricDetails[] array, where position becomes orderId. Deterministic from response_format + rs_type + option weights."
+    purpose: "The metricType a widget insert requires, and the order its rows render in."
+    feeds: [S3]
+    strategy: deterministic
+    explanation: >-
+      Which of the platform's twenty metrics this question can actually carry, ordered
+      with the primary first. `metricType` is required on every widget insert and
+      nothing in the taxonomy could produce one before V8. Position is meaningful: it
+      becomes `orderId` in the payload's metricDetails[] array, so a table on an NPS
+      question emits NPS then Group Percentage and gets both rows, exactly as the manual
+      UI does, while a chart takes the head of the list. `calculation_type` says the
+      same thing one level coarser, for consumers that should not know vendor codes.
+    derivation: >-
+      A port of the platform's compute_metric_types / get_default_metrics_for_question,
+      keyed on response_format. The author's own calculationType setting leads when
+      present; then the rs_type-specific metric and its band split (NPS/CES/CSAT/Custom
+      Metric, each followed by Group Percentage and Group Count); then the four advanced
+      metrics for any weighted shape outside the exclusion set (Weighted Score, Weighted
+      Score as Percentage, Percent Favorable, Net Intent); then Percentage and Count for
+      everything. Date questions get Count and nothing else. Ranking gets Weighted Score
+      on graphs plus Percentage, Count and Overall Rank on tables. Numeric-Open gets the
+      seven numeric metrics, Sum first. Prose, identifiers and attachments get an empty
+      list — a real finding, not a skip. Stage 4,
+      taggers/question/platform_metric.py over taggers/_platform_metrics.py.
+      Deterministic, never LLM-refined.
+      Caveat worth knowing before a payload is posted: this is a port of the platform
+      behaviour as DESCRIBED in docs/taxonomy-v8-migration.md, not a transcription of
+      the Angular source, and eight of the twenty numeric codes are filled in by
+      position rather than quoted. The metric NAMES are the tag values and are safe; the
+      codes in _platform_metrics.py should be confirmed against the source.
+    multi_label: true
+    allowed_values:
+      - NPS                          # 01
+      - CSAT                         # 02
+      - CES                          # 03
+      - Custom Metric                # 04
+      - Net Intent                   # 05
+      - Weighted Score               # 06 — the platform default for grids and ratings
+      - Percent Favorable            # 07
+      - Count                        # 08
+      - Percentage                   # 09
+      - Weighted Score as Percentage # 10
+      - Group Percentage             # 11
+      - Group Count                  # 12
+      - Mean                         # 15
+      - Mode                         # 16
+      - Median                       # 17
+      - Min                          # 18
+      - Max                          # 19
+      - Sum                          # 20
+      - Std Dev                      # 21
+      - Overall Rank                 # 22
+
+  favorable_options:
+    description: "Which answer option ids count as favorable, unfavorable and neutral. Fills metricDetails[].positiveAnswerOptionIds and its negative/neutral siblings. Shape {positive: [], negative: [], neutral: []}; status=skipped when the question has no options or no direction."
+    purpose: "Makes Percent Favorable and Net Intent buildable on questions the platform does not score."
+    feeds: [S3]
+    strategy: hybrid
+    explanation: >-
+      Which of a question's answer options count as favorable, which as unfavorable and
+      which as neither. Without it, Percent Favorable and Net Intent are unbuildable on
+      every question that is not rs_type 2, 3 or 4 — which is most of the weighted
+      scales in a real survey. This is the first dimension in the taxonomy to say
+      anything about ANSWER OPTIONS; everything else stops at the question.
+    derivation: >-
+      Three tiers. An NPS item (rs_type 2) uses the fixed bands — 9-10 promoters, 7-8
+      passives, 0-6 detractors — which are part of the metric's definition rather than a
+      reading of this survey. A weighted scale splits at the midpoint of its weight
+      range: above is positive, below negative, exactly the midpoint neutral, and an
+      unweighted option inside a weighted scale ("Not applicable") is treated as
+      neutral rather than counted either way. An UNWEIGHTED scale goes to LLM Call 2,
+      which reads the option text — the one case a rule genuinely cannot decide, since
+      an unweighted list carries no direction at all. Checkbox lists, routing questions
+      and plain category sets are skipped: their options are alternatives, not points on
+      a good-to-bad scale. Stage 3, taggers/question/favorable_options.py.
+      Known limitation, recorded rather than guessed at: a reverse-coded weighted scale
+      (a CES where 1 means "very easy") comes out inverted, because the weights say
+      which end is HIGH and nothing in the payload says which end is GOOD. The weight
+      tier is held at 0.90 for that reason and the weight range is in the evidence, so a
+      reviewer can spot them.
+    allowed_values: []
+    user_defined: true
 
   is_filterable:
     description: "Whether this question can serve as a filter/facet in reporting UI"
@@ -822,6 +969,15 @@ question_level:
       capability — control_role, which restated it, was removed. Note free text is
       No here and still searchable: text search reads response_format ==
       "Open-Text". Never LLM-refined.
+      V8 re-verified this against the three response formats the Phase 1 split added
+      and moved no rule. All three read No, and all three are right to: a Date gets a
+      RANGE control rather than a facet (read response_format == "Date", which
+      derived_controls now routes to date_filter), a Numeric-Open answer is a real scale
+      but an unbounded one with no discrete answer set to facet on, and a File-Upload
+      has no answer at all. The Numeric-Open call was made explicitly rather than
+      inherited from a fall-through — see the invariant note in
+      taggers/_metric_utils.py, which binds this dimension and crosstab_axis_role
+      together so they cannot state opposite things about one question.
     allowed_values:
       - "Yes"
       - "No"
@@ -849,6 +1005,13 @@ question_level:
       Segment-Control was removed rather than kept in sync, because being derived at
       Stage 3 it could not read role_intent and so disagreed with this dimension
       wherever role_intent decides. Never LLM-refined.
+      V8 re-verified this against the three response formats the Phase 1 split added
+      and moved no rule: Date, Numeric-Open and File-Upload are all `T` questions, which
+      is not a bucketing type and cannot carry an rs_type, so all three read No. Nothing
+      to group other answers by — a date is continuous, a number is unbounded, an
+      attachment is not an answer. Since V8 this dimension also gates
+      preferred_segments, which asks the reciprocal question ("which segmenting question
+      is worth cutting THIS metric by?"); that is a one-way cascade, not a restatement.
     allowed_values:
       - "Yes"
       - "No"
@@ -886,12 +1049,48 @@ question_level:
       Benchmarkable role -> Yes; open-ended -> No; segmentation, demographic or
       screener roles -> No; a driver on a metric scale -> Yes; otherwise No. Stage 4,
       taggers/question/trend_trackable.py. Never LLM-refined.
+      Since V8 this is the eligibility GATE that trend_granularity reads — whether, to
+      its how often. A one-way cascade: this dimension never reads back.
     allowed_values:
       - "Yes"
       - "No"
 
+  trend_granularity:
+    description: "How often to bucket a trend widget for this question, feeding TrendSetting.FrequencyType. Gated on trend_trackable; Not Trendable when the gate says No or the survey ran once."
+    purpose: "How often the trend is read — the other half of what a trend widget needs."
+    feeds: [S3]
+    strategy: hybrid
+    explanation: >-
+      How often to bucket a trend widget for this question. `trend_trackable` answers
+      whether the question belongs on a trend at all; this answers how often to read it,
+      and the widget payload needs both. The frequency is really a property of the
+      project — its cadence and the span its responses cover — so every trendable
+      question in a survey gets the same answer; it is tagged per question because that
+      is where a widget is built from.
+    derivation: >-
+      Gated on trend_trackable == "Yes"; anything else is Not Trendable, which is a real
+      value rather than a skip so a composer reading this dimension alone still gets a
+      usable answer. A One-time survey is Not Trendable whatever its questions support —
+      one wave has nothing to compare against. Otherwise the survey's own cadence picks
+      a starting frequency (Always-on -> Weekly, Recurring and Ad-hoc -> Monthly) and
+      the response span corrects it in both directions: coarser while the period count
+      would breach the platform's hard 100-period cap, which validate_trend_frequency
+      rejects outright, so a project spanning three years cannot be Weekly; finer while
+      it would plot fewer than three points, which is a trend line in name only. With no
+      response span at all the cadence preference stands alone at 0.55 and is NOT
+      checked against the cap, which the evidence says out loud. Stage 4,
+      taggers/question/trend_trackable.py (same module as the gate, so the registry runs
+      them in order).
+    allowed_values:
+      - Daily
+      - Weekly
+      - Monthly
+      - Quarterly
+      - Yearly
+      - "Not Trendable"
+
   segment_dimensions:
-    description: "Specific dimensions this question can segment data by"
+    description: "Specific dimensions this question can segment data by. Each entry is {label, question_id} — the label a human reads and the id a widget payload needs."
     purpose: "WHICH respondent attributes it slices by, comparably across surveys."
     feeds: [S3, S5]
     strategy: hybrid
@@ -909,6 +1108,13 @@ question_level:
       segmentable but nothing matched -> an empty list at lower confidence.
       Multi-label and user_defined, so labels are not enum-checked. Stage 4,
       taggers/question/segment_dimensions.py.
+      V8 changed the SHAPE, not the labels. Entries used to be bare strings ("Region",
+      "Department"), so a dashboard composer had to resolve the label back to a question
+      id for every widget it segmented. Each entry now carries both —
+      {"label": "Region", "question_id": 4471} — and the round-trip disappears. No new
+      dimension was added for the id: that would restate what this one already says and
+      leave two fields to keep in agreement, which is exactly why control_role was
+      removed in V7.3.
     multi_label: true
     allowed_values: []
     user_defined: true
@@ -964,22 +1170,29 @@ question_level:
       widget_compatibility holds the full set of charts that would be valid; this is
       the one to use absent a better reason.
     derivation: >-
-      Rule table over metric_type, role_intent and option count: open-ended -> Word
-      Cloud; a primary standard metric -> Score Card; a driver in a matrix -> Heat
-      Map; categorical -> Pie Chart for two options else Bar Chart; other metrics ->
-      Bar Chart; fallback Table. Stage 5, taggers/question/visualization_type.py —
-      LLM Call 2 refines the low-confidence defaults, and is the only source of
-      Gauge, Line Chart, Trend Line and Scatter Plot.
+      Rule table over response_format, metric_type, role_intent and option count:
+      Date -> Line Chart; Numeric-Open -> Number; File-Upload and Contact -> Table;
+      Open-Text -> Word Cloud; a primary standard metric -> Number; a matrix row ->
+      Horizontal Stacked Bar; categorical -> Pie Chart for two options else Horizontal
+      Bar; other metrics -> Horizontal Bar; fallback Table. Stage 5,
+      taggers/question/visualization_type.py — LLM Call 2 refines the low-confidence
+      defaults, and is the only source of Gauge and Scatter Plot.
+      V8 applied the same renames and deletions as widget_compatibility, so the two
+      speak one chart language and a composer never translates between them — but added
+      nothing new. A default should stay conservative; the exotic charts belong in the
+      allow-list, where the dashboard service can reach for one deliberately. The rule
+      table also branches on response_format FIRST now: it used to key off metric_type,
+      where every text question reads Open-ended, so a date picker, a numeric field and
+      a file upload all defaulted to a word cloud.
     allowed_values:
-      - Score Card
+      - Number                    # was "Score Card"
       - Gauge
-      - Bar Chart
+      - Horizontal Bar            # the platform default orientation
+      - Vertical Bar
+      - Horizontal Stacked Bar    # the only legal default for a matrix row
       - Line Chart
-      - Trend Line
       - Pie Chart
       - Table
-      - Heat Map
-      - Distribution Chart
       - Word Cloud
       - Scatter Plot
 
@@ -1017,6 +1230,9 @@ question_level:
       Supporting Metric; a verbatim -> Detail View; a diagnostic -> Drill-down; a
       trend-trackable question -> Trend Indicator; fallback Detail View. Stage 5,
       taggers/question/display_role.py — LLM Call 2 refines the weak defaults.
+      V8 left every value alone. It gained a consumer instead: widget_footprint reads
+      this to decide how much grid space the widget takes, so if a footprint looks
+      wrong, the thing to fix is the role.
     allowed_values:
       - Primary KPI
       - Supporting Metric
@@ -1025,6 +1241,90 @@ question_level:
       - Comparison Metric
       - Trend Indicator
 
+  widget_footprint:
+    description: "How much dashboard grid space the widget should occupy, feeding cols and rows on the widget payload. The grid is 24 columns wide. Deterministic from display_role + block_id."
+    purpose: "The widget's size, so a composer can batch the geometry correction."
+    feeds: [S3]
+    strategy: deterministic
+    explanation: >-
+      How much of the dashboard grid this question's widget should take. Every widget
+      ships 12x6 today, so any other size costs a second API round-trip per widget —
+      the fixed-geometry limitation recorded in
+      docs/custom-dashboard-end-to-end-flow.md section 11. Stating the intended
+      footprint in the tag is what lets a composer batch that correction, or skip it
+      where 12x6 is already right.
+    derivation: >-
+      A matrix block wins first: a question carrying a block_id is rendered as part of
+      one widget covering every row, and a stacked bar with that many sentence-length
+      labels needs the full width. Otherwise mapped from display_role — Primary KPI ->
+      Quarter, so four score tiles sit in one row across the top of the dashboard, which
+      is how a KPI band is meant to read; everything else -> Half, which puts two side
+      by side and is also the size the platform already ships, so those widgets cost no
+      correction at all. No display_role -> Half at 0.60, for the same reason: it is the
+      one choice that is never wrong enough to need a second API call. Stage 5,
+      taggers/question/widget_footprint.py. Deterministic, no LLM cost.
+      "Tall (12x12)" is declared and deliberately never emitted. Nothing in the taxonomy
+      says a widget needs vertical room rather than horizontal — that follows from how
+      many rows the DATA has, which the dashboard service learns when it checks
+      viability and this tagger never sees. A composer that has counted the rows may
+      still choose it.
+    allowed_values:
+      - "Quarter (6x6)"
+      - "Half (12x6)"
+      - "Full-Width (24x6)"
+      - "Tall (12x12)"
+
+  preferred_segments:
+    description: "For a metric question, the 1-3 segmenting question_ids worth cutting THIS metric by, most relevant first. Feeds segmentType and segmentationQuestion on the widget payload. status=skipped for non-metric questions."
+    purpose: "Which cut of this metric is worth showing — the missing half of segmentation."
+    feeds: [S3, S5]
+    strategy: llm-refined
+    explanation: >-
+      For a metric question, which one to three segmenting questions are worth cutting
+      it by. Segmentation was one-sided before V8: is_segmentable and segment_dimensions
+      say a question CAN segment, and nothing said which cut was worth making for a
+      given metric. This is the same reciprocal-pointer pattern as driver_link and
+      verbatim_link, applied to the one pairing that was left out.
+    derivation: >-
+      The tagger contributes the eligibility gate and the candidate list; the ranking is
+      LLM Call 2's. Non-metric questions are skipped — segmenting one grouping by
+      another is a cross-tab, which is the other side of this pairing. A metric with no
+      segmentable question anywhere in the survey returns an empty list at 1.0, and that
+      empty list is the finding: the survey collects a number and nothing to explain it
+      with. Otherwise the candidates are every question the survey tagged
+      is_segmentable == "Yes", and the tag is left pending_llm. That split is
+      deliberate rather than an economy — which candidates EXIST is a structural fact,
+      and "NPS by region" versus "NPS by plan tier" is a question about the business,
+      not about the schema, so no rule here guesses at it. Stage 5,
+      taggers/question/preferred_segments.py.
+    multi_label: true
+    allowed_values: []
+    user_defined: true
+
+  display_label:
+    description: "A 2-6 word chart title for any chart-eligible question, feeding `title` on the widget payload. Length-capped free text; status=skipped when widget_compatibility is empty."
+    purpose: "What the chart is called, when no metric name covers it."
+    feeds: [Reporting, S3]
+    strategy: llm-refined
+    explanation: >-
+      A short chart title for any question a widget can render. metric_name covers only
+      measured questions and sub_stage_name only journey-eligible metrics, so a plain
+      segmentation question's widget currently gets the raw question text — often a full
+      sentence — as its title.
+    derivation: >-
+      Skipped when widget_compatibility is empty: no chart, no title. When metric_name
+      exists it IS the label, written ABOVE the LLM override threshold on purpose — not
+      as an economy, but because the two would otherwise be free to disagree, and a
+      dashboard showing "Overall Satisfaction" in the tag and "How happy were you?" on
+      the chart is worse than either alone. Only when no metric name exists does LLM
+      Call 2 write a 2-6 word Title Case phrase from the question text, seeded by a
+      cleaned truncation of the title (numbering and the interrogative opening stripped)
+      held at 0.45 so the model always wins — and left in place as an honest fallback
+      when the call does not land. user_defined, so the value is never enum-checked,
+      only trimmed and length-capped. Stage 5, taggers/question/display_label.py.
+    allowed_values: []
+    user_defined: true
+
   # --- V7 Additions (question-level): Dashboard Capability Layer ---
   # Intrinsic, per-question facts consumed by the downstream (LLM-driven)
   # dashboard-composition service. This layer states what each question is
@@ -1032,8 +1332,10 @@ question_level:
   # segment, how it can be cross-tabbed). It does NOT decide the dashboard —
   # the dashboard service confirms data VIABILITY (response volume, null rate,
   # distinct-value count) and does the contextual selection/pairing/layout.
-  # All six derive deterministically from rs_type + question_type + answer
-  # option weights (Stage 3, no LLM cost).
+  # All five derive deterministically from rs_type + question_type +
+  # question_sub_type + answer option weights (Stage 3, no LLM cost).
+  # V8 added question_sub_type to that input list, which is what split
+  # response_format's Open-Text into four distinct shapes.
 
   response_format:
     description: "Canonical answer shape of the question. The anchor field the rest of the capability layer derives from. Deterministic from rs_type + question_type + option weights."
@@ -1047,11 +1349,18 @@ question_level:
     derivation: >-
       The platform's metric flag wins over the question type, because the same widget
       is used for scored and unscored questions: rs_type 2 -> NPS-Scale, 3 ->
-      Effort-Scale, 4 -> Rating-Scale. Otherwise the question type maps to its shape —
-      T -> Open-Text, CS -> Contact, RK -> Ranking, RS/RT/RW -> Rating-Scale,
-      grid types -> Matrix-Row, HR -> Hidden-Select, select types -> Multi-Select or
-      Single-Select by the is_multi flag. Stage 3,
-      taggers/question/dashboard_capability.py. Never LLM-refined.
+      Effort-Scale, 4 -> Rating-Scale. For a text question the SUB-type then wins over
+      the bare T: sub-type 1 -> Date, 31 -> Contact (an email field has a contact
+      block's capability exactly), 71 -> File-Upload, the statistical sub-type ->
+      Numeric-Open, anything else -> Open-Text. Otherwise the question type maps to its
+      shape — CS -> Contact, RK -> Ranking, RS/RT/RW -> Rating-Scale, grid types ->
+      Matrix-Row, HR -> Hidden-Select, select types -> Multi-Select or Single-Select by
+      the is_multi flag. Stage 3, taggers/question/dashboard_capability.py, with the
+      sub-type codes named once in taggers/_sub_types.py so this and role_intent and
+      data_sensitivity cannot drift. Never LLM-refined.
+      V8 NOTE — Numeric-Open is declared but currently unreachable: our
+      numeric/statistical sub-type code has not been enumerated from live payloads and
+      is not guessed at. See the Phase 0 note in this file's header.
     allowed_values:
       - NPS-Scale           # rs_type=2
       - Rating-Scale        # rs_type=4 (CSAT); weighted RS/RT/RW
@@ -1061,8 +1370,11 @@ question_level:
       - Multi-Select        # C / ML
       - Hidden-Select       # HR (routing question)
       - Matrix-Row          # GR / GC / RG / GQ
-      - Open-Text           # T
-      - Contact             # CS (contact / signature)
+      - Open-Text           # T, genuine free prose only
+      - Contact             # CS (contact / signature), and T sub-type 31 (email)
+      - Date                # T, date sub-type — Count metric only; drives the date filter
+      - Numeric-Open        # T, statistical sub-type — the only true Ratio scale (Phase 0)
+      - File-Upload         # T sub-type 71 — no analyzable answer at all
       - Not Applicable
 
   scale_of_measurement:
@@ -1075,16 +1387,21 @@ question_level:
       counted, ordinal ones ranked, interval ones averaged — this is what decides
       which statistics a widget may show.
     derivation: >-
-      Read off response_format: NPS-Scale -> Interval; Rating-Scale, Effort-Scale and
-      Ranking -> Ordinal; the select formats -> Nominal; Matrix-Row -> Ordinal when
-      its options carry weights, else Nominal; Open-Text -> Unstructured; anything
-      else -> N/A. Stage 3, taggers/question/dashboard_capability.py. Never
-      LLM-refined.
+      Read off response_format: NPS-Scale and Date -> Interval; Rating-Scale,
+      Effort-Scale and Ranking -> Ordinal; the select formats -> Nominal; Matrix-Row ->
+      Ordinal when its options carry weights, else Nominal; Numeric-Open -> Ratio;
+      Open-Text -> Unstructured; Contact and File-Upload -> N/A. Stage 3,
+      taggers/question/dashboard_capability.py. Never LLM-refined.
+      V8 changed no value here, only the routing. Date joins NPS on Interval — ordered
+      with meaningful intervals, no true zero — and Numeric-Open becomes Ratio's first
+      and only source. Ratio was emitted by nothing in taggers/ before the Phase 1
+      split and was a candidate for deletion; it stays because it now has a rule, and
+      the eval run that confirms the rule fires is what makes that final.
     allowed_values:
       - Nominal
       - Ordinal
-      - Interval
-      - Ratio
+      - Interval            # NPS-Scale, Date
+      - Ratio               # Numeric-Open only (gated on Phase 0)
       - Unstructured        # free text
       - N/A
 
@@ -1097,10 +1414,14 @@ question_level:
       How large the value space is. The practical question it answers is whether a
       chart stays readable — a pie chart of 40 slices is valid and useless.
     derivation: >-
-      From response_format first: scales and matrix rows roll up to a score, so ->
-      Continuous; Open-Text -> Free-Text; Contact and unrecognized -> N/A. Otherwise
+      From response_format first: scales, matrix rows and the two new numeric shapes
+      (Date, Numeric-Open) roll up to a score or a measurement, so -> Continuous;
+      Open-Text -> Free-Text; Contact, File-Upload and unrecognized -> N/A. Otherwise
       banded on option_count: 2 -> Binary, 3-7 -> Low, 8 or more -> High. Stage 3,
       taggers/question/dashboard_capability.py. Never LLM-refined.
+      All six values keep their meaning in V8; only the routing changed. Worth
+      exporting option_count alongside this — the dashboard service currently re-fetches
+      /QuestionDetail to learn what we already knew.
     allowed_values:
       - Binary              # 2 options
       - Low                 # 3-7 options
@@ -1119,29 +1440,80 @@ question_level:
       The dashboard-composition service picks from this shortlist; visualization_type
       is the single pick made in advance.
     derivation: >-
-      Lookup table keyed by response_format — for example NPS-Scale -> Score Card,
-      Gauge, Trend Line, Distribution Chart, Bar Chart; Open-Text -> Word Cloud,
-      Sentiment, Table; Matrix-Row -> Heat Map, Stacked Bar Chart, Bar Chart, Table.
-      Structural validity only: the dashboard service still confirms response volume
-      and distinct-value count before using one. Stage 3,
+      Lookup table keyed by response_format — for example NPS-Scale -> Number, Gauge,
+      Horizontal/Vertical Bar, Line Chart, Area, Pie Chart, Donut, Table; Matrix-Row ->
+      Horizontal Stacked Bar, Vertical Stacked Bar, Table and NOTHING else; Open-Text ->
+      Table alone. Structural validity only: the dashboard service still confirms
+      response volume and distinct-value count before using one. Stage 3,
       taggers/question/dashboard_capability.py. Never LLM-refined.
+      V8 rebuilt this vocabulary against the platform's own chart codes. Orientation is
+      not cosmetic — horizontal and vertical are separate codes — so Bar Chart and
+      Stacked Bar Chart each split in two and the composer stops guessing. Score Card
+      took the platform's name for the same code, Number. Six real codes we could never
+      recommend were added (Donut, Area, Radar, Bubble, and the two clustered bars).
+      Four values were dropped for having no code behind them at all (Heat Map,
+      Distribution Chart, Sentiment, Map) and two for being something else wearing a
+      chart's name — Trend Line is dataDisplayMode=4 plus Line or Area, and its
+      information moved to trend_granularity; Ranking Bar is a Horizontal Bar carrying
+      a Weighted Score metric, which platform_metric now expresses.
+      Three rule-table contradictions were fixed at the same time: a grid may use only
+      the two stacked variants, a checkbox question EXCLUDES stacked/pie/donut because
+      its answers do not sum to a whole, and an open-text question gets a table alone.
     multi_label: true
+    # Which charts need which metric family. The platform's allowed set genuinely
+    # flips on the metric — a count/percentage metric unlocks the division charts,
+    # a scored metric collapses the set to bars plus gauge and number — so stating
+    # the allow-list as if it were metric-independent could not be honest.
+    # `widget_compatibility` is the UNION over the question's valid metrics; read it
+    # together with `platform_metric` and this block to narrow it for one widget.
+    # Documentation only, the same device `crosstab_axis_role` uses for
+    # `derived_controls`: no tagger reads it and nothing validates against it.
+    metric_constraints:
+      count_or_percentage: >-
+        Pie Chart, Donut, Horizontal/Vertical Stacked Bar, Bubble and Radar require a
+        Count, Percentage, Group Count or Group Percentage metric — they divide a whole,
+        and only a count-family metric has a whole to divide.
+      scored: >-
+        Gauge and Number require a scored metric (NPS, CSAT, CES, Custom Metric,
+        Weighted Score, Net Intent, Percent Favorable, or one of the seven numeric
+        metrics). There is one number to show.
+      any: >-
+        Horizontal Bar, Vertical Bar, Line Chart, Area and Table carry any metric.
+      needs_a_comparison_axis: >-
+        Radar, Bubble and both clustered bars need several attributes or a segment to
+        compare, not just several answer options — a radar with one spoke is not a chart
+        of anything. They are offered on the select and ranking shapes and withheld from
+        a single scored scale question, whose answer is one series.
+      trend_only: >-
+        Line Chart and Area are the only two charts permitted in trend display mode
+        (dataDisplayMode=4). A trend widget must pick one of them.
+      checkbox_excluded: >-
+        A Multi-Select question excludes Pie Chart, Donut and both stacked bars whatever
+        its metric: the responses do not sum to a whole.
+      grid_only: >-
+        A Matrix-Row question permits only Horizontal Stacked Bar, Vertical Stacked Bar
+        and Table. No metric widens that.
     allowed_values:
-      - Score Card
-      - Gauge
-      - Bar Chart
-      - Stacked Bar Chart
-      - Line Chart
-      - Trend Line
-      - Pie Chart
-      - Distribution Chart
-      - Heat Map
-      - Word Cloud
-      - Sentiment
-      - Table
-      - Ranking Bar
-      - Scatter Plot
-      - Map
+      - Number                    # 14 — was "Score Card"; the platform's own name
+      - Gauge                     # 12
+      - Horizontal Bar            # 01
+      - Vertical Bar              # 02
+      - Horizontal Stacked Bar    # 03
+      - Vertical Stacked Bar      # 13
+      - Clustered Horizontal Bar  # 16
+      - Clustered Vertical Bar    # 17
+      - Line Chart                # 09
+      - Area                      # 08
+      - Pie Chart                 # 04
+      - Donut                     # 07
+      - Radar                     # 06
+      - Bubble                    # 05
+      - Scatter Plot              # 11 — reachable only via LLM refinement
+      - Word Cloud                # 10 — BLOCKED: needs open-ended widget type 20,
+                                  #      which has no creator. Never emitted by the
+                                  #      rule table; kept so the block is describable.
+      - Table                     # widget type 02, not a chart — the fallback that
+                                  #      always works
 
   # `control_role` was removed in V7.3. It restated is_filterable, is_segmentable
   # and "is this Open-Text" as one multi-label field, so three dimensions had to be
@@ -1169,13 +1541,26 @@ question_level:
       stays Column-Eligible — it is still what gets compared — so an unflagged
       rating scale or a grid row reads Column-Eligible while an NPS item reads
       Both. Stage 3, taggers/question/dashboard_capability.py. Never LLM-refined.
+      V8 changed nothing here, and the three new response formats all read None. The one
+      worth stating out loud is Numeric-Open: it genuinely measures something, and
+      Column-Eligible is tempting — but Phase 1 decided explicitly that an unbounded
+      numeric answer is not a bounded scale, so is_filterable reads No for it. The
+      invariant in taggers/_metric_utils.py is that this dimension and is_filterable
+      must not state opposite things about whether an answer lands on a scale, so
+      Numeric-Open reads None on both sides rather than measuring on one and not the
+      other. Flip both together, or neither. Worth noting that cross-tab widget type 40
+      has no creator on the platform today, so nothing here is buildable either way.
     # How a dashboard composer picks its controls now that `control_role` is gone.
     # These are read off dimensions already in the output — no field restates them.
     derived_controls:
       filter_dropdown: 'is_filterable == "Yes"'
       segment_picker:  'is_segmentable == "Yes"'
       text_search:     'response_format == "Open-Text"'
-      date_filter:     "not derivable — there is no date response format"
+      # V8: derivable for the first time. The Phase 1 split gave date questions
+      # their own response format, so a date filter no longer has to be guessed
+      # at from the question type. Note this is a RANGE control, which is why
+      # is_filterable still reads No for a Date — it builds no facet.
+      date_filter:     'response_format == "Date"'
     allowed_values:
       - Row-Eligible
       - Column-Eligible

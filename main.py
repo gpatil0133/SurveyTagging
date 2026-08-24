@@ -34,6 +34,7 @@ try:
 except ImportError:
     pass
 
+import tls_trust
 from settings import Settings
 
 
@@ -96,6 +97,10 @@ def profile_fetch(
     if log_level:
         settings.log_level = log_level
     setup_logging(settings.log_level, settings.log_format)
+    # The CLI builds Settings directly instead of going through
+    # bootstrap.build_context, so it has to install the OS trust store itself
+    # or it hits CERTIFICATE_VERIFY_FAILED wherever the service used to.
+    tls_trust.install(settings)
 
     from tenant_profile.batch import (
         TenantSpec, DEFAULT_AGENTS, run_batch, render_summary,
@@ -138,6 +143,10 @@ def profile_fetch_all(
     if log_level:
         settings.log_level = log_level
     setup_logging(settings.log_level, settings.log_format)
+    # The CLI builds Settings directly instead of going through
+    # bootstrap.build_context, so it has to install the OS trust store itself
+    # or it hits CERTIFICATE_VERIFY_FAILED wherever the service used to.
+    tls_trust.install(settings)
 
     inputs_path = Path(inputs) if inputs else (
         Path(__file__).parent / "config" / "tenant_websites.yaml"

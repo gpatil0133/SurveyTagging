@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import sharefs
+import tls_trust
 from config_loaders.industry_stages import IndustryStagesRegistry
 from models.taxonomy import TaxonomyRegistry
 from settings import Settings
@@ -80,6 +81,11 @@ def build_llm_client(settings: Settings, *, skip_llm: bool | None = None):
 def build_context(settings: Settings | None = None, *, skip_llm: bool | None = None) -> AppContext:
     """Load taxonomy + taggers + industry stages + LLM client once."""
     settings = settings or Settings()
+
+    # Before any outbound TLS. The SoGo certs chain to a corporate root that
+    # lives in the OS trust store and not in certifi, so without this every
+    # apismx/apipmx call fails with CERTIFICATE_VERIFY_FAILED. See tls_trust.
+    tls_trust.install(settings)
 
     # Record share credentials before anything can touch the share. This is
     # pure local state — it opens no socket, so it cannot fail or hang.

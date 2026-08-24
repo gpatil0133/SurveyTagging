@@ -5,15 +5,27 @@ to research a tenant, we read the profile the Research API already generated.
 It runs the same three agents we do — profileType 1/2/3 map to our org/cx/ex —
 so the artifacts written to the share are the same either way.
 
-Two things about the wire format that the swagger does not tell you:
+Three things about the wire format that the swagger does not tell you:
 
   1. Responses are **encrypted**. The body is `{"payload": "<base64>"}`; the
      plaintext is recovered by POSTing it to apipmx `/dcdata`. Both base URLs
      therefore have to track the same host, which is why they are derived
      together from `sogo_host` (see settings._derive_sogo_urls_from_host).
-  2. The decrypted keys are **PascalCase** (`Data`, `Items`, `CorporateNo`)
+  2. Request bodies are **encrypted too** — the direction we missed for a
+     while. Every write endpoint on the platform (`/Generate` here, the
+     apicx `insertupdate` family elsewhere) Base-64 decodes its body
+     server-side before parsing it, so a plain JSON body is answered with
+     HTTP 500 "input is not a valid Base-64 string". The body goes through
+     apipmx `/ecdata` first and is posted as the RAW ciphertext with
+     `Content-Type: text/plain` — not JSON-wrapped, not JSON-quoted; both of
+     those reproduce the same 500. See `_encrypt` and `_request`.
+  3. The decrypted keys are **PascalCase** (`Data`, `Items`, `CorporateNo`)
      while the swagger advertises camelCase. Every lookup here goes through
      `_ci` so neither spelling can break us.
+
+GET routes (`/List`, `/Details`, `/PackageTypes`) carry their arguments in the
+query string, and the platform does not encrypt query strings — only bodies.
+So encryption here keys off "does this call have a body", not off the method.
 
 Every route needs a Bearer JWT from the same issuer as our own `auth.py`, so a
 request-scoped caller can forward its token; `settings.smx_token` is the
@@ -50,7 +62,15 @@ PROFILE_TYPE_TO_AGENT: dict[int, str] = {1: "org", 2: "cx", 3: "ex"}
 
 
 class SmxClientError(Exception):
-    """Transport, auth, decrypt, or envelope failure talking to apismx."""
+    """Transport, auth, encrypt, decrypt, or envelope failure talking to apismx."""
+
+
+# `/ecdata` answers with the ciphertext as a bare JSON-quoted string on every
+# deploy we have seen. A couple of platform services wrap it in an object
+# instead, and which key they use is not consistent, so probe the known ones
+# before giving up. Order matters: `encrypted` is the most specific and wins
+# over a deploy that also mirrors the ciphertext into a generic `data`.
+_ENCRYPT_RESPONSE_KEYS = ("encrypted", "payload", "data", "result")
 
 
 @dataclass(frozen=True)
@@ -120,6 +140,28 @@ def _ms_since(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
 
 
+def _read_ciphertext(resp: httpx.Response) -> str:
+    """Pull the ciphertext out of an `/ecdata` reply. Empty string if there isn't one.
+
+    The normal case is a bare JSON-quoted string, which `resp.json()` unquotes
+    for us. The rest of this handles deploys that answer with a wrapper object,
+    or with the raw ciphertext as unparseable text/plain.
+    """
+    try:
+        parsed: Any = resp.json()
+    except ValueError:
+        # Not JSON at all — the body IS the ciphertext.
+        return resp.text.strip()
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if isinstance(parsed, dict):
+        for key in _ENCRYPT_RESPONSE_KEYS:
+            value = _ci(parsed, key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
 def _row_summary(row: "ProfileRow") -> dict[str, Any]:
     """What a `/Details` row is, without its (already-persisted) contents."""
     return {
@@ -171,6 +213,7 @@ class SmxClient:
         timeout: float = 60.0,
         verify: bool | str = True,
         trace: SmxTrace | None = None,
+        encrypt_requests: bool = True,
     ) -> None:
         if not token:
             raise SmxClientError(
@@ -180,6 +223,9 @@ class SmxClient:
         self._base = base_url.rstrip("/")
         self._pmx = pmx_base_url.rstrip("/")
         self._trace = trace or DISABLED
+        # Off only as an escape hatch for a deploy that has not turned request
+        # encryption on yet; see settings.smx_encrypt_requests.
+        self._encrypt_requests = bool(encrypt_requests)
         self._client = httpx.Client(
             timeout=timeout,
             verify=verify,
@@ -199,6 +245,74 @@ class SmxClient:
         self._client.close()
 
     # ---------- transport ----------
+
+    def _encrypt(self, payload: Any, exchange: str = "") -> str:
+        """Turn a request body into the ciphertext apismx expects, via `/ecdata`.
+
+        The mirror of `_decrypt`, and traced the same way for the same reason: a
+        `/Generate` that 500s because the body never got encrypted looks exactly
+        like a `/Generate` that 500s server-side, and only the separate
+        `smx_encrypt_*` records tell them apart.
+
+        Two details are load-bearing and were learned the hard way on the
+        platform's other services:
+
+          * The plaintext must be **compact** JSON (`separators=(",", ":")`).
+            The endpoint is whitespace-sensitive in places, so a pretty-printed
+            body can round-trip into something the target route rejects.
+          * The reply is the ciphertext as a bare JSON-quoted string, e.g.
+            `"L5apItJtPULTQoy3rBF24tlUoFqUidiAMcPEkWtoh5I="`. The outer quotes
+            are JSON, not part of the ciphertext, and forwarding them is one of
+            the two ways to earn a Base-64 decode error downstream.
+        """
+        # ensure_ascii left at its default on purpose: the plaintext goes out as
+        # pure ASCII with \uXXXX escapes, which survives the Base-64 round trip
+        # and the .NET side's decoding no matter what a tenant name contains.
+        plaintext = (payload if isinstance(payload, str)
+                     else json.dumps(payload, separators=(",", ":")))
+        url = f"{self._pmx}/ecdata"
+        started = time.perf_counter()
+        self._trace.record("smx_encrypt_request", exchange=exchange, url=url,
+                           plaintext=plaintext)
+        try:
+            resp = self._client.post(
+                url,
+                json={"ecValue": plaintext},
+                # `Accept: text/plain` is what the platform's other services send
+                # here, and it matches what comes back — a bare quoted string
+                # rather than a JSON document. Overrides the client-wide
+                # `Accept: application/json` for this call only.
+                headers={"Content-Type": "application/json", "Accept": "text/plain"},
+            )
+        except httpx.HTTPError as e:
+            self._trace.record("smx_encrypt_transport_error", level=logging.ERROR,
+                               exchange=exchange, url=url, error=str(e),
+                               duration_ms=_ms_since(started))
+            raise SmxClientError(f"/ecdata request failed: {e}") from e
+        duration_ms = _ms_since(started)
+        if resp.status_code != 200:
+            self._trace.record("smx_encrypt_http_error", level=logging.ERROR,
+                               exchange=exchange, url=url,
+                               status_code=resp.status_code, duration_ms=duration_ms,
+                               response_body=resp.text)
+            raise SmxClientError(
+                f"/ecdata returned HTTP {resp.status_code}: {resp.text[:_ERROR_EXCERPT]}"
+            )
+
+        ciphertext = _read_ciphertext(resp)
+        if not ciphertext:
+            self._trace.record("smx_encrypt_unreadable", level=logging.ERROR,
+                               exchange=exchange, url=url, duration_ms=duration_ms,
+                               response_body=resp.text)
+            raise SmxClientError(
+                f"/ecdata returned no usable ciphertext: {resp.text[:_ERROR_EXCERPT]}"
+            )
+        # Length only. The ciphertext is opaque and the plaintext is already on
+        # the `smx_encrypt_request` line, so recording it again is pure noise.
+        self._trace.record("smx_encrypted", exchange=exchange, duration_ms=duration_ms,
+                           plaintext_chars=len(plaintext),
+                           ciphertext_chars=len(ciphertext))
+        return ciphertext
 
     def _decrypt(self, blob: str, exchange: str = "") -> Any:
         """Round-trip an encrypted payload through apipmx `/dcdata`.
@@ -250,10 +364,26 @@ class SmxClient:
         url = f"{self._base}{path}"
         exchange = self._trace.new_exchange()
         params = kwargs.get("params")
-        request_body = kwargs.get("json")
-        started = time.perf_counter()
+        # Taken out of kwargs: an encrypted call sends `content`, not `json`, and
+        # httpx rejects being handed both.
+        request_body = kwargs.pop("json", None)
+        encrypt = request_body is not None and self._encrypt_requests
         self._trace.record("smx_request", exchange=exchange, method=method, url=url,
-                           params=params, request_body=request_body)
+                           params=params, request_body=request_body,
+                           encrypted_request=encrypt)
+        if encrypt:
+            # Raw ciphertext as text/plain. Wrapping it in `{"payload": ...}` or
+            # leaving the JSON quotes on both come back as HTTP 500 "input is
+            # not a valid Base-64 string" — the controller Base-64 decodes the
+            # body before it parses anything.
+            kwargs["content"] = self._encrypt(request_body, exchange)
+            kwargs["headers"] = {**(kwargs.get("headers") or {}),
+                                 "Content-Type": "text/plain"}
+        elif request_body is not None:
+            kwargs["json"] = request_body
+        # Started after the encrypt round-trip so this duration is the apismx
+        # call alone; `/ecdata`'s own timing is on `smx_encrypted`.
+        started = time.perf_counter()
         try:
             resp = self._client.request(method, url, **kwargs)
         except httpx.HTTPError as e:
@@ -446,7 +576,12 @@ class SmxClient:
         return rows
 
     def generate(self, corp_nos: list[int]) -> dict[str, Any]:
-        """Trigger generation. Write operation — callers gate this on user intent."""
+        """Trigger generation. Write operation — callers gate this on user intent.
+
+        The only route here with a request body, and therefore the only one
+        `_request` encrypts. Pass the body as a plain dict: encryption is
+        `_request`'s job, so nothing above this line has to know about `/ecdata`.
+        """
         if not corp_nos:
             raise SmxClientError("generate() needs at least one corp_no")
         body = {"corpNos": [int(c) for c in corp_nos]}

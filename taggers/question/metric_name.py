@@ -12,6 +12,7 @@ from models import evidence as ev
 from models.context import UnifiedContext
 from models.survey import QuestionContext
 from models.tags import TagAccumulator, TagResult
+from taggers import _sub_types
 from taggers.base import QuestionTagger
 
 
@@ -131,8 +132,12 @@ class MetricNameTagger(QuestionTagger):
                     ),
                 )
 
-        # Open-ended
-        if q.question_type == "T":
+        # Open-ended — GENUINE free text only. V8: a `T` question narrowed by its
+        # sub-type is a date picker, an email field or a file upload, and calling
+        # any of those "Text Feedback" put a verbatim label on a widget with no
+        # verbatims in it. Those fall through to the not-a-metric skip below,
+        # which is the honest answer for all three.
+        if q.question_type == "T" and _sub_types.is_plain_text(q.question_sub_type):
             return TagResult(
                 value="Text Feedback", source="deterministic", confidence=0.95,
                 evidence=ev.rule(
@@ -141,7 +146,8 @@ class MetricNameTagger(QuestionTagger):
                     "open-end is grouped under one label so verbatims can be found "
                     "together.",
                     stage=3,
-                    inputs={"question_type": "T"},
+                    inputs={"question_type": "T",
+                            "question_sub_type": q.question_sub_type},
                 ),
             )
 
@@ -202,10 +208,13 @@ class MetricNameTagger(QuestionTagger):
             evidence=ev.rule(
                 "question.metric_name.not_a_metric",
                 f"Type {q.question_type} measures nothing — it is a categorical pick, "
-                "a contact block or an unrecognized type — so there is no metric to "
-                "name. Skipped rather than given a placeholder name.",
+                "a contact block, a date, a file upload or an unrecognized type — so "
+                "there is no metric to name. Skipped rather than given a placeholder "
+                "name.",
                 stage=3,
-                inputs={"question_type": q.question_type, "rs_type": q.rs_type,
+                inputs={"question_type": q.question_type,
+                        "question_sub_type": q.question_sub_type,
+                        "rs_type": q.rs_type,
                         "is_custom_metric": q.is_custom_metric},
             ),
         )

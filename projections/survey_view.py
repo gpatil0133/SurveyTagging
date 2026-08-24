@@ -25,7 +25,12 @@ from projections._tag_utils import get_tag_value
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "5.0"
+# Kept deliberately in step with `models.tags.TaggedSurvey.schema_version`: this
+# projection is a reshaping of that artifact, so a consumer reading "8.0" here
+# and "5.0" there would have no way to tell which one it should believe. Same
+# counter, same meaning — the taxonomy generation whose SHAPE the payload has.
+# See the note on that field for what 8.0 changed and why there is no 6.0 or 7.0.
+SCHEMA_VERSION = "8.0"
 
 _JOURNEY_TYPES = {"CX", "EX"}
 

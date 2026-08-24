@@ -1,6 +1,22 @@
-"""trend_trackable tagger — whether the question should be tracked over time.
+"""Trend taggers — whether a question is worth plotting over time, and how
+often to bucket it when it is.
 
-Stage 4, deterministic. Depends on metric_type + role_intent.
+Two Stage-4 taggers, deliberately in one module:
+
+    trend_trackable ..... deterministic. The eligibility gate. Depends on
+                          metric_type + role_intent (both Stage 3).
+    trend_granularity ... hybrid, added in V8. How often to bucket the trend
+                          widget, feeding `TrendSetting.FrequencyType` on the
+                          payload. Gated on trend_trackable.
+
+They share a module because they share a stage and one depends on the other.
+The registry preserves the order `create_tagger()` returns, so the gate always
+runs first; splitting them into two files would have sorted `trend_granularity`
+ahead of `trend_trackable` alphabetically and read the gate before it was set.
+
+The relationship is a one-way cascade, not a restatement: `trend_trackable`
+answers *whether*, `trend_granularity` answers *how often*, and the widget
+payload needs both.
 """
 
 from __future__ import annotations
@@ -125,5 +141,195 @@ class TrendTrackableTagger(QuestionTagger):
         )
 
 
-def create_tagger() -> TrendTrackableTagger:
-    return TrendTrackableTagger()
+# Frequency -> the length of one period in days, finest first. The order is the
+# search order: start at the cadence's preferred frequency and step coarser
+# until the period count is legal.
+_FREQUENCIES: tuple[tuple[str, int], ...] = (
+    ("Daily", 1),
+    ("Weekly", 7),
+    ("Monthly", 30),
+    ("Quarterly", 91),
+    ("Yearly", 365),
+)
+
+# The platform's own hard cap: `validate_trend_frequency` rejects any frequency
+# that would produce more than 100 periods, so a project spanning three years
+# cannot be Weekly however often it actually ships.
+_MAX_PERIODS = 100
+
+# Below this many periods a trend line is a couple of dots, so the search steps
+# FINER instead — a two-week always-on survey bucketed monthly plots nothing.
+_MIN_PERIODS = 3
+
+# project survey_cadence -> where the search starts. How often the survey ships
+# is the best available prior for how often it is worth reading.
+_CADENCE_PREFERENCE: dict[str, str] = {
+    "Always-on": "Weekly",
+    "Recurring": "Monthly",
+    "Ad-hoc": "Monthly",
+}
+
+_DEFAULT_FREQUENCY = "Monthly"
+
+
+def _resolve_frequency(cadence: str | None, span_days: int) -> tuple[str, int, int]:
+    """(frequency, period_count, start_index) for a span of responses.
+
+    Starts from the cadence's preferred frequency, then walks coarser while the
+    period count would breach the platform cap and finer while it would be too
+    sparse to read. Returns the start index too, so the evidence can say whether
+    the answer was the preference or a correction to it.
+    """
+    names = [f for f, _ in _FREQUENCIES]
+    start = names.index(_CADENCE_PREFERENCE.get(cadence or "", _DEFAULT_FREQUENCY))
+    index = start
+
+    span = max(int(span_days), 0)
+    if span <= 0:
+        return names[index], 0, start
+
+    def periods(i: int) -> int:
+        return max(1, round(span / _FREQUENCIES[i][1]))
+
+    while index < len(_FREQUENCIES) - 1 and periods(index) > _MAX_PERIODS:
+        index += 1
+    while index > 0 and periods(index) < _MIN_PERIODS:
+        index -= 1
+
+    return names[index], periods(index), start
+
+
+class TrendGranularityTagger(QuestionTagger):
+    """How often to bucket this question's trend widget.
+
+    `trend_trackable` says whether the question belongs on a trend at all; this
+    says how often to read it, and the payload's `TrendSetting.FrequencyType`
+    needs the second answer as much as the first.
+
+    The frequency is a property of the PROJECT — its cadence and the span its
+    responses actually cover — rather than of the question, so every trendable
+    question in a survey gets the same answer. It is tagged per question anyway
+    because that is where a widget is built from, and because the gate above it
+    is per question.
+    """
+
+    name = "question.trend_granularity"
+    tag_dimension = "trend_granularity"
+    stage = 4
+    source_type = "hybrid"
+
+    @property
+    def depends_on(self) -> list[str]:
+        return ["question.trend_trackable"]
+
+    def tag_question(
+        self,
+        context: UnifiedContext,
+        question: QuestionContext,
+        accumulator: TagAccumulator,
+    ) -> TagResult:
+        q = question
+
+        if q.is_content_message:
+            return TagResult(value=None, source="deterministic", status="skipped",
+                             evidence=ev.content_message("trend_granularity", stage=4))
+
+        trend = accumulator.get_question_tag_value(q.question_id, "trend_trackable")
+        if trend != "Yes":
+            return TagResult(
+                value="Not Trendable", source="deterministic", confidence=1.0,
+                evidence=ev.rule(
+                    "question.trend_granularity.not_trendable",
+                    f"trend_trackable is {trend or 'unset'}, so there is no trend to set "
+                    "a frequency for. Not Trendable is a real value rather than a skip: "
+                    "a composer reading this dimension alone still gets a usable answer.",
+                    stage=4,
+                    inputs={"trend_trackable": trend or "(unset)"},
+                ),
+            )
+
+        cadence = accumulator.get_project_tag_value("survey_cadence")
+
+        # A one-time survey has one wave. Nothing the question supports can make
+        # it trendable, so the project verdict outranks the question's own.
+        if cadence == "One-time":
+            return TagResult(
+                value="Not Trendable", source="deterministic", confidence=1.0,
+                evidence=ev.rule(
+                    "question.trend_granularity.one_time_survey",
+                    "The question is trend-trackable, but the survey ran once — there is "
+                    "no second wave to compare it against. A one-time survey is Not "
+                    "Trendable whatever its questions support.",
+                    stage=4,
+                    inputs={"survey_cadence": "One-time",
+                            "trend_trackable": "Yes"},
+                ),
+            )
+
+        stats = context.response_stats
+        span_days = int(stats.span_days) if stats is not None else 0
+
+        if span_days <= 0:
+            frequency = _CADENCE_PREFERENCE.get(cadence or "", _DEFAULT_FREQUENCY)
+            return TagResult(
+                value=frequency, source="hybrid", confidence=0.55,
+                evidence=ev.fallback(
+                    "question.trend_granularity.cadence_only",
+                    f"No response span is available, so the frequency comes from the "
+                    f"survey's cadence alone ({cadence or 'unknown'} -> {frequency}). "
+                    "That is a prior about how often the survey ships, not a "
+                    "measurement of how long it has been collecting — hence 0.55. It "
+                    "has NOT been checked against the platform's 100-period cap, "
+                    "because there is no span to check.",
+                    stage=4,
+                    inputs={"survey_cadence": cadence or "(unset)",
+                            "span_days": 0},
+                ),
+            )
+
+        frequency, period_count, start_index = _resolve_frequency(cadence, span_days)
+        preferred = [f for f, _ in _FREQUENCIES][start_index]
+
+        if frequency == preferred:
+            detail = (
+                f"The survey's cadence is {cadence or 'unknown'}, which reads best "
+                f"{frequency.lower()}, and {span_days} days of responses gives "
+                f"{period_count} period(s) — comfortably inside the platform's "
+                f"{_MAX_PERIODS}-period cap."
+            )
+        else:
+            direction = ("coarser" if [f for f, _ in _FREQUENCIES].index(frequency)
+                         > start_index else "finer")
+            reason = (f"{preferred} over {span_days} days would breach the platform's "
+                      f"{_MAX_PERIODS}-period cap, which `validate_trend_frequency` "
+                      "rejects outright"
+                      if direction == "coarser" else
+                      f"{preferred} over only {span_days} days would plot fewer than "
+                      f"{_MIN_PERIODS} points, which is a trend line in name only")
+            detail = (
+                f"The survey's cadence is {cadence or 'unknown'}, which would prefer "
+                f"{preferred} — but {reason}. Stepped {direction} to {frequency}, "
+                f"giving {period_count} period(s)."
+            )
+
+        return TagResult(
+            value=frequency, source="hybrid", confidence=0.85,
+            evidence=ev.statistic(
+                "question.trend_granularity.span_and_cadence",
+                detail,
+                measure="trend_periods",
+                observed=period_count,
+                threshold=_MAX_PERIODS,
+                stage=4,
+                inputs={"survey_cadence": cadence or "(unset)",
+                        "span_days": span_days,
+                        "preferred_frequency": preferred,
+                        "frequency": frequency},
+            ),
+        )
+
+
+def create_tagger() -> list[QuestionTagger]:
+    # Order matters and is preserved by the registry: the gate runs first, and
+    # `trend_granularity` reads its verdict out of the accumulator.
+    return [TrendTrackableTagger(), TrendGranularityTagger()]

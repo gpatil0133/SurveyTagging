@@ -22,6 +22,24 @@ Keep `bounded_scale_kind` in step with
 `taggers/question/dashboard_capability.py::_response_format`: the two must not
 disagree about whether a question's answer lands on a scale, or `is_filterable`
 and `crosstab_axis_role` will state opposite things about the same question.
+
+V8 classified the three formats the Phase 1 split added. All three are `T`
+questions narrowed by `question_sub_type`, so none of them reaches a branch
+below and all three return None — but two of them deserve the reasoning written
+down rather than inherited from a fall-through:
+
+* **Numeric-Open** is a real scale — a Ratio one, the only one we emit — and it
+  is still NOT a bounded scale. An unbounded numeric answer has no discrete
+  answer set, so it builds no facet: `is_filterable` is No, `is_segmentable` is
+  No, and `crosstab_axis_role` reads None rather than Column-Eligible. That last
+  one is the point of the invariant: measuring on one side and not the other is
+  exactly the disagreement this note exists to prevent. Flip all of them
+  together or none of them.
+* **Date** is ordered and Interval-scaled, and it is not a bounded scale either:
+  the platform allows only a Count on it, and a date filter is a range control
+  rather than a facet built from discrete answers. `derived_controls` routes it
+  to `date_filter`, not to `filter_dropdown`.
+* **File-Upload** has no answer to scale at all.
 """
 
 from __future__ import annotations
