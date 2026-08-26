@@ -86,6 +86,7 @@ def _entry(label: str, question_id: int) -> dict[str, object]:
 class SegmentDimensionsTagger(QuestionTagger):
     name = "question.segment_dimensions"
     tag_dimension = "segment_dimensions"
+    skip_value = []  # multi-label: an empty list, never None
     stage = 4
     source_type = "deterministic"
 
@@ -93,17 +94,13 @@ class SegmentDimensionsTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.is_segmentable"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=[], source="deterministic", status="skipped",
-                             evidence=ev.content_message("segment_dimensions", stage=4))
 
         segmentable = accumulator.get_question_tag_value(q.question_id, "is_segmentable")
         if segmentable != "Yes":

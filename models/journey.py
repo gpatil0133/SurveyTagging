@@ -1,9 +1,9 @@
 """Profile-derived journey model — the source for `journey_stage` / `sub_stage_name`.
 
-This replaces the tenant-canon layer (parked, see `llm/tenant_canon.py`) as the
-runtime grounding for the two journey dimensions. Stages are read straight off
-`tenant_profile/`, which is where the canon's own inputs came from — one fewer
-derived artifact to build, persist on the share, and keep in sync.
+This replaced the tenant-canon layer (since deleted) as the runtime grounding
+for the two journey dimensions. Stages are read straight off `tenant_profile/`,
+which is where the canon's own inputs came from — one fewer derived artifact to
+build, persist on the share, and keep in sync.
 
 The important difference from the canon is **shape**. The canon flattened the
 agent's two levels into one list, so `journey_stage` held a leaf name and
@@ -17,9 +17,15 @@ already two-level for CX, so we keep it:
     EX   lifecycle_analysis.stages[]        -> journey_stage      (Attraction, Recruiting, Onboarding, ...)
                                             -> sub_stage_name     (none — the source has no second level)
 
-A `JourneyLeaf` is one scored unit: the pair the embedding ranks and the LLM
-picks. Both tag values are resolved at build time onto the leaf, so nothing
-downstream has to branch on CX-vs-EX or on how deep the source happened to be.
+A `JourneyLeaf` is one selectable unit: the pair the LLM picks from. Both tag
+values are resolved at build time onto the leaf, so nothing downstream has to
+branch on CX-vs-EX or on how deep the source happened to be.
+
+V9: the whole leaf set is inlined into the question prompt and the model selects
+from it directly. There is no retrieval step — the embedding index that used to
+cut this list to a top-4 per question was removed, because at real journey sizes
+it cost more prompt tokens than it saved (the cut list was repeated per question;
+the full list is sent once) and it could exclude the correct leaf outright.
 """
 
 from __future__ import annotations
@@ -77,22 +83,24 @@ class JourneyLeaf(BaseModel):
             return f"{self.stage_value} > {self.sub_stage_value}"
         return self.stage_value
 
-    @property
-    def embed_text(self) -> str:
-        """The text scored against a question signature.
+    def as_prompt_entry(self) -> dict:
+        """The leaf as the model sees it in the inlined journey catalog.
 
-        Carries both levels plus whatever prose the agent gave us. There are no
-        LLM-generated synonyms here (the canon's canonicalization pass produced
-        those and is parked), so the agent's `description` and goal do the
-        semantic work — which is why both are included verbatim rather than
-        summarized.
+        `description` and `goal` carry the agent's own prose verbatim: they are
+        what lets the model tell two similarly-named moments apart, and there
+        are no LLM-generated synonyms to lean on (the canon's canonicalization
+        pass produced those and is parked). Empty strings are dropped rather
+        than sent as `""` — an absent key reads as "not stated", which is true,
+        and it keeps the catalog small.
         """
-        parts = [f"{self.label}."]
+        entry = {"leaf_id": self.leaf_id, "stage_name": self.stage_value}
+        if self.sub_stage_value:
+            entry["sub_stage_name"] = self.sub_stage_value
         if self.description:
-            parts.append(self.description.strip())
+            entry["description"] = self.description.strip()
         if self.goal:
-            parts.append(f"Goal: {self.goal.strip()}.")
-        return " ".join(parts)
+            entry["goal"] = self.goal.strip()
+        return entry
 
 
 class ProfileJourney(BaseModel):
@@ -124,6 +132,46 @@ class ProfileJourney(BaseModel):
         for candidate in self.leaves:
             if candidate.leaf_id == leaf_id:
                 return candidate
+        return None
+
+    def catalog(self) -> list[dict]:
+        """Every leaf, in source order, as the prompt's selection list.
+
+        Source order rather than any ranking: the model is shown the tenant's
+        journey as the tenant wrote it, and a synthetic order would read as a
+        recommendation the pipeline is in no position to make.
+        """
+        return [leaf.as_prompt_entry() for leaf in self.leaves]
+
+    def match_by_name(self, stage: str | None, sub_stage: str | None) -> JourneyLeaf | None:
+        """Find a leaf by its literal names — the second chance for a model that
+        wrote the moment out instead of copying its `leaf_id`.
+
+        Matches the (stage, sub_stage) pair when both were given, else whichever
+        single name was. Case-insensitive and punctuation-insensitive via
+        `normalize_name`, but never fuzzy: a near miss returns None and is
+        reported as unresolved rather than filed under a guess.
+        """
+        stage_key = normalize_name(stage) if isinstance(stage, str) else ""
+        sub_key = normalize_name(sub_stage) if isinstance(sub_stage, str) else ""
+        if not stage_key and not sub_key:
+            return None
+
+        for leaf in self.leaves:
+            leaf_stage = normalize_name(leaf.stage_value)
+            leaf_sub = normalize_name(leaf.sub_stage_value or "")
+            if stage_key and sub_key:
+                if leaf_stage == stage_key and leaf_sub == sub_key:
+                    return leaf
+            elif stage_key:
+                # Only safe when it identifies ONE leaf: a two-level journey
+                # legitimately has several moments under the same stage, and
+                # picking the first would silently invent a sub-stage.
+                hits = [c for c in self.leaves
+                        if normalize_name(c.stage_value) == stage_key]
+                return hits[0] if len(hits) == 1 else None
+            elif sub_key and leaf_sub == sub_key:
+                return leaf
         return None
 
 

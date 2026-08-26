@@ -33,7 +33,6 @@ def process_single_survey(
     *,
     llm_client=None,
     response_parser=None,
-    industry_stages=None,
     settings=None,
 ) -> TaggedSurvey:
     """Run all taggers on a single survey context.
@@ -45,7 +44,6 @@ def process_single_survey(
         llm_client: Optional LLMClient. When provided (and not skip_llm), the
             Stage 4–5 LLM enhancement runs; otherwise tagging is deterministic.
         response_parser: ResponseParser required for LLM enhancement.
-        industry_stages: IndustryStagesRegistry required for the question LLM call.
         settings: Settings (for skip_llm + embedding config). Optional.
 
     Returns:
@@ -106,8 +104,7 @@ def process_single_survey(
         llm_calls = run_llm_enhancement(
             context, accumulator,
             llm_client=llm_client, taxonomy=taxonomy,
-            industry_stages=industry_stages, response_parser=response_parser,
-            settings=settings,
+            response_parser=response_parser, settings=settings,
         )
         logger.debug("llm_enhancement_done",
                      extra={"survey": context.survey_meta.survey_no, "llm_calls_made": llm_calls})

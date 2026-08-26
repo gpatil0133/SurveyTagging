@@ -69,8 +69,11 @@ class DataSensitivityTagger(QuestionTagger):
     tag_dimension = "data_sensitivity"
     stage = 3
     source_type = "deterministic"
+    # This tagger TAGS content messages rather than skipping them, so the
+    # base class must not short-circuit them away before it is called.
+    skips_content_messages = False
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,

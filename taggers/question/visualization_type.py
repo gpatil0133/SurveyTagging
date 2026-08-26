@@ -59,17 +59,13 @@ class VisualizationTypeTagger(QuestionTagger):
         return ["question.response_format", "question.metric_type",
                 "question.role_intent", "question.trend_trackable"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("visualization_type", stage=5))
 
         fmt = accumulator.get_question_tag_value(q.question_id, "response_format")
         metric_type = accumulator.get_question_tag_value(q.question_id, "metric_type")

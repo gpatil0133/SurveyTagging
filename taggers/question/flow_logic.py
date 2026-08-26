@@ -23,19 +23,16 @@ from taggers.base import QuestionTagger
 class FlowLogicTagger(QuestionTagger):
     name = "question.flow_logic"
     tag_dimension = "flow_logic_role"
+    skip_value = []  # multi-label: an empty list, never None
     stage = 3
     source_type = "deterministic"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
-        if question.is_content_message:
-            return TagResult(value=[], source="deterministic", status="skipped",
-                             evidence=ev.content_message("flow_logic_role", stage=3))
-
         roles: list[str] = []
         # Multi-label: record which signal put each role on the list, since one
         # sentence about the whole list would explain none of the entries.

@@ -49,17 +49,13 @@ class MetricNameTagger(QuestionTagger):
     stage = 3
     source_type = "hybrid"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("metric_name", stage=3))
 
         # NPS vs eNPS — depends on project project_type (Stage 1, already populated)
         if q.rs_type == 2:
@@ -192,9 +188,9 @@ class MetricNameTagger(QuestionTagger):
                     value=derived + " Rating", source="hybrid", confidence=0.55,
                     evidence=ev.fallback(
                         "question.metric_name.derived_from_title",
-                        f"A rating-scale question with no platform metric flag and no "
-                        f"recognized scale fingerprint. The name is manufactured from "
-                        f"the question's own wording — informative but not "
+                        "A rating-scale question with no platform metric flag and no "
+                        "recognized scale fingerprint. The name is manufactured from "
+                        "the question's own wording — informative but not "
                         "authoritative, which is what the 0.55 says.",
                         stage=3,
                         inputs={"question_type": q.question_type,

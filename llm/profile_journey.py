@@ -1,29 +1,22 @@
-"""Build + score the profile-derived journey.
+"""Build the profile-derived journey.
 
-Two jobs, both cheap enough to run per tenant per tagging run:
+One job: `build_profile_journey` reads `tenant_profile/` into a
+`ProfileJourney`. No LLM call, no disk write, no share round trip beyond the
+profile read the pipeline already does.
 
-  `build_profile_journey`  reads `tenant_profile/` into a `ProfileJourney`.
-      No LLM call, no disk write, no share round trip beyond the profile read
-      the pipeline already does.
-
-  `build_journey_index` / `score_questions`  embed the leaves once and rank
-      them against per-question signatures. ~13 leaves is a few hundred ms on
-      CPU, so the index lives in memory for the tenant's run rather than being
-      persisted as an `.npz` the way the canon's was.
-
-Scoring is deliberately self-contained rather than routed through
-`llm.embeddings.score_signatures`, which is typed to `CanonEmbeddingIndex` and
-belongs to the parked canon path. The shared piece — the model singleton — is
-still `EmbeddingModel`, so both paths load the weights once.
+V9 removed the second job. `build_journey_index` / `score_questions` used to
+embed the leaves and rank them per question so the prompt could carry a top-4
+instead of the whole journey. That went away with the `sentence-transformers`
+dependency: the cut list was repeated for every question in the batched prompt
+while the full list is sent once, so retrieval was costing input tokens rather
+than saving them, and a correct leaf ranked below the cut could not be recovered
+by the model. Selection is now the LLM's alone, over the complete catalog —
+see `ProfileJourney.catalog`.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Sequence
-
-import numpy as np
 
 from models.journey import (
     JourneyLeaf,
@@ -177,61 +170,3 @@ def _journey_name(profile: TenantProfile, journey_type: JourneyType) -> str:
         return _EX_JOURNEY_NAME
     industry = (profile.industry_taxonomy_vertical or profile.industry_vertical or "").strip()
     return f"{industry} Customer Journey".strip() if industry else "Customer Journey"
-
-
-# ---------- Embedding index ----------
-
-
-@dataclass
-class JourneyIndex:
-    """Leaf vectors kept beside the journey that produced them."""
-
-    journey: ProfileJourney
-    vectors: np.ndarray  # (N, dim), L2-normalized
-    model_name: str = ""
-    leaf_ids: list[str] = field(default_factory=list)
-
-    @property
-    def is_empty(self) -> bool:
-        return self.vectors.size == 0 or not self.journey.leaves
-
-
-def build_journey_index(journey: ProfileJourney, embedder) -> JourneyIndex:
-    """Embed every leaf. In-memory only — nothing is written to the share."""
-    if not journey.leaves:
-        return JourneyIndex(journey=journey, vectors=np.zeros((0, 0), dtype=np.float32),
-                            model_name=getattr(embedder, "model_name", ""))
-    vectors = embedder.encode([leaf.embed_text for leaf in journey.leaves])
-    return JourneyIndex(
-        journey=journey,
-        vectors=vectors,
-        model_name=getattr(embedder, "model_name", ""),
-        leaf_ids=[leaf.leaf_id for leaf in journey.leaves],
-    )
-
-
-def score_questions(
-    signatures: Sequence[str],
-    index: JourneyIndex,
-    embedder,
-    top_k: int = 4,
-) -> list[list[tuple[JourneyLeaf, float]]]:
-    """Rank leaves for each signature. One `encode()` call for the whole batch.
-
-    Returns one ranked list per input signature, aligned by position. Vectors
-    are L2-normalized at encode time, so cosine is a plain dot product.
-    """
-    if not signatures or index.is_empty:
-        return [[] for _ in signatures]
-
-    query = embedder.encode(list(signatures))
-    if query.size == 0:
-        return [[] for _ in signatures]
-
-    scores = query @ index.vectors.T  # (Q, N)
-    k = min(top_k, len(index.journey.leaves))
-    out: list[list[tuple[JourneyLeaf, float]]] = []
-    for row in scores:
-        top_idx = np.argsort(row)[::-1][:k]
-        out.append([(index.journey.leaves[i], float(row[i])) for i in top_idx])
-    return out

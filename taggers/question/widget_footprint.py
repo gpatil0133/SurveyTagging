@@ -61,17 +61,13 @@ class WidgetFootprintTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.display_role", "question.block_id"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("widget_footprint", stage=5))
 
         block = accumulator.get_question_tag_value(q.question_id, "block_id")
         role = accumulator.get_question_tag_value(q.question_id, "display_role")

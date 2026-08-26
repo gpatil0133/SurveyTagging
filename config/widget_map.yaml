@@ -1,0 +1,231 @@
+# Widget vocabulary bridge: our labels -> the consumer's typed enums.
+#
+# WHY THIS FILE EXISTS
+#
+# `widget_compatibility` and `visualization_type` speak prose ("Score Card",
+# "Trend Line", "Heat Map"). The dashboard consumer speaks
+# `WidgetType x ChartType x MetricType` (widget-type.enum.ts, chart-type.enum.ts).
+# Nothing bridged the two, so every consumer wrote its own mapping and they drifted.
+# One map, served at GET /api/widget-map next to GET /api/taxonomy, is the bridge.
+#
+# It is CONFIG, not code: no tagger reads it and changing it cannot change a tag.
+# It only tells a consumer what our label means in its own vocabulary.
+#
+# STATUS OF THE ENTRIES
+#
+# `confirmed: false` means the platform tokens have NOT been verified against the
+# frontend's enum files — those live in the consumer repo, which is not checked out
+# alongside this service, so filling them in is a five-minute job for whoever has
+# it. The label, the shape and the notes are right; the tokens are the gap.
+#
+# Writing this out already surfaced three real mismatches, which is what it was for:
+#
+#   Trend Line   is not a chart type at all. It is RATING_WIDGET with
+#                RatingWidgetDisplayMode.TREND_GRAPH — a display mode on a widget,
+#                which is why `display_mode` exists as a third field here.
+#   Ranking Bar  has no ChartType. Ranking is rendered by its own widget.
+#   Heat Map     has no ChartType either.
+#
+# A label whose row has no `chart_type` is therefore not an oversight; it is the
+# finding. Consumers must key off `widget_type` first and treat `chart_type` as
+# optional.
+
+version: "1.0"
+
+# ---------------------------------------------------------------------------
+# widget_compatibility / visualization_type labels
+# ---------------------------------------------------------------------------
+widgets:
+
+  Score Card:
+    widget_type: null            # likely METRIC/SCORE card
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: >-
+      Single headline number for a metric question. Pairs with calculation_type to
+      decide WHICH number (mean, NPS score, top-box %).
+
+  Gauge:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: One score against a scale range; same data as Score Card, dial rendering.
+
+  Bar Chart:
+    widget_type: null
+    chart_type: BAR
+    display_mode: null
+    confirmed: false
+    note: Category counts or per-option means.
+
+  Stacked Bar Chart:
+    widget_type: null
+    chart_type: STACKED_BAR
+    display_mode: null
+    confirmed: false
+    note: Multi-select or matrix rows, one bar per row, segments per option.
+
+  Line Chart:
+    widget_type: null
+    chart_type: LINE
+    display_mode: null
+    confirmed: false
+
+  Trend Line:
+    widget_type: RATING_WIDGET
+    chart_type: null
+    display_mode: RatingWidgetDisplayMode.TREND_GRAPH
+    confirmed: true
+    note: >-
+      NOT a chart type — a display mode on the rating widget. This is the mismatch
+      that motivated the file: a consumer mapping "Trend Line" onto ChartType finds
+      nothing and silently drops the widget.
+
+  Pie Chart:
+    widget_type: null
+    chart_type: PIE
+    display_mode: null
+    confirmed: false
+    note: Single-select only, and only when cardinality_class is Low.
+
+  Distribution Chart:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: >-
+      Shape across all scale points or options. Likely the same widget as Bar Chart
+      with a distribution display mode rather than a distinct ChartType — confirm
+      before mapping.
+
+  Heat Map:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: true
+    note: >-
+      No ChartType exists for this. Matrix questions render through their own
+      widget; a consumer must not look for a heat-map chart type.
+
+  Word Cloud:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: Open-text baseline. Needs no NLP enrichment — raw answers are enough.
+
+  Sentiment:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: >-
+      Positive/neutral/negative split. Requires verbatim_enrichment to include
+      "Sentiment"; the tagger only emits this widget when it does.
+
+  Sentiment Trend:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: >-
+      Sentiment over time. Requires "Sentiment Score" in verbatim_enrichment — the
+      numeric score is what makes a trend plottable, the label alone is not.
+
+  Theme Cloud:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: Requires "Themes" in verbatim_enrichment.
+
+  Theme Bar:
+    widget_type: null
+    chart_type: BAR
+    display_mode: null
+    confirmed: false
+    note: >-
+      Theme frequency, optionally split by theme sentiment (the platform's Themes
+      payload carries a per-theme Sentiment). Requires "Themes".
+
+  Emotion Breakdown:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: Requires "Emotions" in verbatim_enrichment.
+
+  Topic Distribution:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: >-
+      Requires "Topics". The platform's Topics payload carries TopicId as well as
+      TopicName, so a consumer can join to its own topic catalog rather than
+      matching on the label.
+
+  Action Plan List:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: >-
+      A list, not a chart. Requires "Action Plans" in verbatim_enrichment, which is
+      sparser than the rest — roughly a third of analyzed verbatims on the surveys
+      inspected.
+
+  Table:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: The universal fallback; valid for every response_format except Not Applicable.
+
+  Ranking Bar:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: true
+    note: >-
+      No ChartType exists for this either. Ranking questions render through their own
+      widget, keyed off calculation_type "Mean Rank".
+
+  Scatter Plot:
+    widget_type: null
+    chart_type: SCATTER
+    display_mode: null
+    confirmed: false
+    note: Not currently emitted by any tagger; listed so the vocabulary is complete.
+
+  Map:
+    widget_type: null
+    chart_type: null
+    display_mode: null
+    confirmed: false
+    note: Not currently emitted by any tagger; needs a geo attribute to plot against.
+
+# ---------------------------------------------------------------------------
+# Where the OTHER half of a widget definition comes from
+# ---------------------------------------------------------------------------
+# A consumer needs more than a widget type to build a panel. These are the
+# dimensions it should read alongside this map, and none of them belongs in it:
+#
+#   what to aggregate .... calculation_type   (Mean / NPS Score / Top Box % / ...)
+#   what to call it ...... metric_name
+#   which axis ........... crosstab_axis_role
+#   what to slice by ..... respondent_segments (project) + segment_dimensions (question)
+#   whether NLP exists ... verbatim_enrichment
+#
+# Layout, palette, goals and thresholds are deliberately absent from this service
+# altogether — see the taxonomy header. This service states capability; the
+# dashboard composer decides viability and arrangement.
+reads_alongside:
+  aggregation: calculation_type
+  title: metric_name
+  axis: crosstab_axis_role
+  project_segments: respondent_segments
+  question_segments: segment_dimensions
+  text_analytics: verbatim_enrichment

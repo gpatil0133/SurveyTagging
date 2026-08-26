@@ -27,16 +27,13 @@ class DriverLinkTagger(QuestionTagger):
     stage = 3
     source_type = "deterministic"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("driver_link", stage=3))
         if not q.is_key_driver:
             return TagResult(
                 value=None, source="deterministic", status="skipped",
@@ -81,16 +78,13 @@ class VerbatimLinkTagger(QuestionTagger):
     stage = 3
     source_type = "deterministic"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("verbatim_link", stage=3))
         if q.metric_question_id:
             return TagResult(
                 value=str(q.metric_question_id), source="deterministic", confidence=1.0,
@@ -121,16 +115,13 @@ class BlockIdTagger(QuestionTagger):
     stage = 3
     source_type = "deterministic"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("block_id", stage=3))
         if q.matrix_group_size and q.matrix_group_size > 1 and q.matrix_group_title:
             return TagResult(
                 value=q.matrix_group_title, source="deterministic", confidence=1.0,

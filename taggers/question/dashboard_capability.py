@@ -478,19 +478,21 @@ class _CapabilityTagger(QuestionTagger):
     _multi = False
 
     @property
+    def skip_value(self):
+        # Mirrors `_multi`: the list-valued dimensions skip to [], the scalar ones
+        # to None. Same split the subclasses already declare.
+        return [] if self._multi else None
+
+    @property
     def name(self) -> str:
         return f"question.{self.tag_dimension}"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
-        if question.is_content_message:
-            empty = [] if self._multi else None
-            return TagResult(value=empty, source="deterministic", status="skipped",
-                             evidence=ev.content_message(self.tag_dimension, stage=3))
         value = derive_capability(question)[self.tag_dimension]
         return TagResult(
             value=value, source="deterministic", confidence=1.0,

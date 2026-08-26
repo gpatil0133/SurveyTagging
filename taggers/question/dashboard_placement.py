@@ -18,6 +18,7 @@ from taggers.base import QuestionTagger
 class DashboardPlacementTagger(QuestionTagger):
     name = "question.dashboard_placement"
     tag_dimension = "dashboard_placement"
+    skip_value = []  # multi-label: an empty list, never None
     stage = 5
     source_type = "hybrid"
 
@@ -25,17 +26,13 @@ class DashboardPlacementTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.metric_type", "question.role_intent", "project.dashboard_routing"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=[], source="deterministic", status="skipped",
-                             evidence=ev.content_message("dashboard_placement", stage=5))
 
         metric_type = accumulator.get_question_tag_value(q.question_id, "metric_type")
         role = accumulator.get_question_tag_value(q.question_id, "role_intent")

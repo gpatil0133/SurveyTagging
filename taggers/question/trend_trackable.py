@@ -38,17 +38,13 @@ class TrendTrackableTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.metric_type", "question.role_intent"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("trend_trackable", stage=4))
 
         metric_type = accumulator.get_question_tag_value(q.question_id, "metric_type")
         role = accumulator.get_question_tag_value(q.question_id, "role_intent")
@@ -222,17 +218,13 @@ class TrendGranularityTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.trend_trackable"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("trend_granularity", stage=4))
 
         trend = accumulator.get_question_tag_value(q.question_id, "trend_trackable")
         if trend != "Yes":

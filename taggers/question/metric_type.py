@@ -18,17 +18,13 @@ class MetricTypeTagger(QuestionTagger):
     stage = 3
     source_type = "deterministic"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("metric_type", stage=3))
 
         # Standard metrics by rs_type
         _STANDARD = {2: ("NPS", "Net Promoter Score"),

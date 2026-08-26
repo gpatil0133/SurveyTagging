@@ -90,10 +90,44 @@ class ChangeDetector:
             except (json.JSONDecodeError, IOError):
                 self._hashes = {}
 
-    def _save(self) -> None:
+    def _save(self, dropped: set[str] | None = None) -> bool:
+        """Write the hash map, merging anything on disk we have not seen.
+
+        One `ChangeDetector` per process is the contract (see
+        `bootstrap.AppContext`), so within a process the lock is enough. The merge
+        covers what a lock cannot: a second process on the same `cache_dir` — a
+        CLI run, an overlapping deploy, a stray `python run.py` — whose entries
+        would otherwise be erased by our next full-file write. Ours win on
+        conflict; we know our own inputs are current.
+
+        `dropped` names keys that must NOT come back. Without it the merge undoes
+        every `forget()`: the caller pops the key from memory, and this method
+        promptly reads the same key off disk and merges it back in, so the survey
+        keeps skipping while its output is gone — exactly the state `forget()`
+        exists to clear. Returns whether any dropped key was present on disk, so
+        the caller can report a deletion it did not know about (another process's
+        entry).
+
+        Callers hold `self._lock`.
+        """
         self.hash_file.parent.mkdir(parents=True, exist_ok=True)
+        merged = dict(self._hashes)
+        found_on_disk = False
+        if self.hash_file.exists():
+            try:
+                with open(self.hash_file, "r", encoding="utf-8") as f:
+                    on_disk = json.load(f)
+                if isinstance(on_disk, dict) and on_disk:
+                    merged = {**on_disk, **self._hashes}
+                    found_on_disk = any(k in on_disk for k in (dropped or ()))
+            except (json.JSONDecodeError, OSError):
+                pass  # unreadable — our copy is the better of the two
+        for key in dropped or ():
+            merged.pop(key, None)
         with open(self.hash_file, "w", encoding="utf-8") as f:
-            json.dump(self._hashes, f, indent=2)
+            json.dump(merged, f, indent=2)
+        self._hashes = merged
+        return found_on_disk
 
     @staticmethod
     def _survey_key(tenant_id: int, survey_no: int) -> str:
@@ -223,8 +257,9 @@ class ChangeDetector:
         key = self._survey_key(tenant_id, survey_no)
         with self._lock:
             existed = self._hashes.pop(key, None) is not None
-            if existed:
-                self._save()
+            # Saved unconditionally: the entry may live only on disk, written by
+            # another process, and it has to go either way.
+            existed |= self._save(dropped={key})
         return existed
 
     # ---------- tenant-level change API (tenant_tags.json) ----------
@@ -242,8 +277,7 @@ class ChangeDetector:
         key = self._tenant_key(tenant_id)
         with self._lock:
             existed = self._hashes.pop(key, None) is not None
-            if existed:
-                self._save()
+            existed |= self._save(dropped={key})
         return existed
 
     def tenant_mark_processed(self, tenant_id: int, tenant_dir: Path, output_dir: Path) -> None:

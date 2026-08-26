@@ -6,10 +6,11 @@ this exists for hosts where Application Request Routing cannot be installed,
 which is the one situation that rule cannot be made to work.
 
 What you give up by using it: the app is started and stopped by the IIS worker
-process, so the embedding warm-up in run.py's lifespan is paid again after every
-idle-timeout recycle, and the auto-retag scheduler only runs while some request
-happens to be keeping the process alive. Neither is a correctness problem; both
-are why ARR is preferred.
+process, so the auto-retag scheduler only runs while some request happens to be
+keeping the process alive. Not a correctness problem, but it is why ARR is
+preferred. (The other cost used to be the embedding warm-up in run.py's
+lifespan, re-paid after every idle-timeout recycle; V9 removed the model, so a
+recycle is now cheap.)
 
 Dependency, declared as an extra because it is only needed on this path:
 

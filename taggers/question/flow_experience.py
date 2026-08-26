@@ -13,8 +13,11 @@ class FlowExperienceTagger(QuestionTagger):
     stage = 5
     depends_on = ["question.flow_placement"]
     source_type = "llm"
+    # This tagger TAGS content messages rather than skipping them, so the
+    # base class must not short-circuit them away before it is called.
+    skips_content_messages = False
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,

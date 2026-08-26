@@ -30,14 +30,34 @@ from settings import Settings
 
 logger = logging.getLogger("survey_tagging.auth")
 
-_settings = Settings()
+# Adopted from the composition root (`bootstrap.build_context`) rather than
+# constructed here. A second `Settings()` re-parses .env and, worse, can never be
+# overridden by the context that owns configuration — a test or a CLI that builds
+# a Settings with `auth_enabled=True` would still be answered by this module's own
+# copy. Left lazy so importing `auth` without bootstrap (the CLI, a unit test)
+# still works.
+_settings: Settings | None = None
 _public_key_cache: str | None = None
+
+
+def configure(settings: Settings) -> None:
+    """Point this module at the process's one Settings. Called by bootstrap."""
+    global _settings, _public_key_cache
+    _settings = settings
+    _public_key_cache = None      # a new settings object may name another key
+
+
+def _cfg() -> Settings:
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings
 
 
 def _public_key() -> str:
     global _public_key_cache
     if _public_key_cache is None:
-        _public_key_cache = _settings.jwt_public_key_path.read_text(encoding="utf-8")
+        _public_key_cache = _cfg().jwt_public_key_path.read_text(encoding="utf-8")
     return _public_key_cache
 
 
@@ -104,12 +124,12 @@ def _decode_verified(token: str) -> tuple[dict | None, bool]:
     verified = False
     try:
         claims = jwt.decode(
-            token, _public_key(), algorithms=[_settings.jwt_algorithm],
+            token, _public_key(), algorithms=[_cfg().jwt_algorithm],
             options={"verify_exp": False, "verify_iat": False},
         )
         verified = True
     except Exception as e:  # noqa: BLE001
-        if _settings.auth_enabled:
+        if _cfg().auth_enabled:
             return None, False
         logger.debug("jwt_unverified_read", extra={"error": str(e)})
         try:
@@ -198,12 +218,12 @@ async def require_auth(authorization: str | None = Header(default=None)) -> dict
     Pass-through when `auth_enabled` is False. With `dev_auth_bypass` the Bearer
     value is a literal corp_no. Otherwise a RS256 JWT is verified.
     """
-    if not _settings.auth_enabled:
+    if not _cfg().auth_enabled:
         return None
 
     token = _bearer_token(authorization)
 
-    if _settings.dev_auth_bypass:
+    if _cfg().dev_auth_bypass:
         if not token.isdigit():
             raise HTTPException(401, "dev_auth_bypass: Bearer value must be a numeric corp_no")
         return {"corp_no": int(token), "source": "dev_bypass"}

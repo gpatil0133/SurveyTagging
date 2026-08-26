@@ -33,29 +33,17 @@ class JourneyStageTagger(QuestionTagger):
     stage = 5
     source_type = "llm"
 
-    def __init__(self, registry=None) -> None:
-        # `registry` accepted for back-compat with existing test fixtures and
-        # callers that previously passed an `IndustryStagesRegistry`. V5
-        # journey_stage assignment is canon-driven through the LLM merge
-        # step; the registry is no longer used here.
-        super().__init__()
-        del registry  # explicitly unused
-
     @property
     def depends_on(self) -> list[str]:
         return ["question.role_intent", "question.metric_name", "question.metric_type"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("journey_stage", stage=5))
 
         # The eligibility check returns its own typed evidence — the "why was
         # this question skipped" answer people actually ask for.

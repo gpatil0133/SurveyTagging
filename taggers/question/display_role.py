@@ -26,17 +26,13 @@ class DisplayRoleTagger(QuestionTagger):
         return ["question.metric_type", "question.role_intent", "question.trend_trackable",
                 "question.dashboard_placement"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("display_role", stage=5))
 
         metric_type = accumulator.get_question_tag_value(q.question_id, "metric_type")
         role = accumulator.get_question_tag_value(q.question_id, "role_intent")

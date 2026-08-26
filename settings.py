@@ -47,17 +47,13 @@ class Settings(BaseSettings):
     # industry stage lists). Saves ~90% input token cost on cache hits.
     llm_use_prompt_caching: bool = True
 
-    # Canon embeddings (V5: tenant-canon + semantic stage scoring)
-    # Local sentence-transformers model used to score per-question signatures
-    # against the tenant canon. Lazy-loaded; cost paid once per process.
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
-    embedding_top_k: int = 4
-    # Question signatures whose top-1 candidate scores below this are bypassed
-    # to a low_confidence_assigned status without an LLM call.
-    embedding_min_score: float = 0.35
-    # When the LLM agrees with a top candidate above this score AND the gap
-    # to top-2 is comfortable, the assignment trends to high confidence.
-    embedding_strong_score: float = 0.55
+    # V9 removed `embedding_model` / `embedding_top_k` / `embedding_min_score` /
+    # `embedding_strong_score` along with the sentence-transformers dependency
+    # they configured. The tenant's journey moments are inlined into the
+    # question prompt whole and the LLM selects among them, so there is no
+    # encoder to name, no shortlist to size and no similarity floor to tune.
+    # `SURVEY_TAGGER_EMBEDDING_*` in a stale .env is ignored (extra env vars are
+    # not an error here), and HF_HUB_OFFLINE no longer affects tagging.
 
     # Pipeline
     #
@@ -66,7 +62,7 @@ class Settings(BaseSettings):
     #     {share_root}/{corp_no}/SurveyData/{survey_no}/survey_structure.json   (in)
     #     {share_root}/{corp_no}/SurveyData/{survey_no}/tagged_output.json      (out)
     #     {share_root}/{corp_no}/tenant_profile/*.json                          (in)
-    #     {share_root}/{corp_no}/tenant_tags.json, tenant_canon_*.json          (out)
+    #     {share_root}/{corp_no}/tenant_tags.json                                 (out)
     # When set it overrides both `data_dir` and `output_dir` so the two can
     # never drift onto different anchors (see _derive_roots_from_share).
     #
@@ -100,6 +96,11 @@ class Settings(BaseSettings):
     # Stays LOCAL even when share_root is set — the LLM response cache and
     # survey_hashes.json are probed constantly and must not cost a network hop.
     cache_dir: Path = Field(default=Path("./.cache"))
+    # Age cutoff for cached LLM responses, swept once per process at startup. A
+    # cached response is only reusable while its survey inputs AND its prompt
+    # version are unchanged, so an old entry is dead weight rather than a saving.
+    # 0 disables the sweep.
+    llm_cache_retention_days: int = 30
     max_concurrent_surveys: int = 5
     skip_llm: bool = False
     # Threads used to probe survey dirs when listing a tenant. Unrelated to
@@ -466,7 +467,7 @@ class Settings(BaseSettings):
         same path), which is why the two were interchangeable for so long. They
         diverge locally, and reading profiles from `output_dir` there made
         `TenantProfile.load` return None: every tenant tag fell to its no-profile
-        branch and canon derivation silently dropped to `industry_template`.
+        branch and every survey lost its journey dimensions.
         """
         return Path(self.data_dir)
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,36 @@ class LLMCache:
             logger.debug("disk_cache_write", extra={"path": str(path)})
         except IOError as e:
             logger.warning("cache_write_error", extra={"path": str(path), "error": str(e)})
+
+    @staticmethod
+    def prune(cache_dir: Path, days: int) -> int:
+        """Delete cached responses older than `days`. Returns how many went.
+
+        Called once per process from `bootstrap`, not per write: the cache is read
+        on every LLM call and a stat-walk per call would cost more than the entries
+        save. `days <= 0` disables it — nothing is deleted rather than everything,
+        which is the safe reading of "unset".
+
+        Never raises: a locked or vanished file (routine on Windows) skips and the
+        next boot retries.
+        """
+        if days <= 0 or not cache_dir.exists():
+            return 0
+        cutoff = time.time() - days * 86400
+        deleted = 0
+        for path in cache_dir.glob("*.json"):
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                deleted += 1
+            except OSError:
+                continue
+        if deleted:
+            logger.info("llm_cache_pruned",
+                        extra={"deleted": deleted, "older_than_days": days,
+                               "cache_dir": str(cache_dir)})
+        return deleted
 
     def invalidate(self, survey_hash: str) -> None:
         """Remove all cached responses for a survey hash (all prompt versions)."""

@@ -65,17 +65,13 @@ class IsSegmentableTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.role_intent"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("is_segmentable", stage=4))
 
         role = accumulator.get_question_tag_value(q.question_id, "role_intent")
 

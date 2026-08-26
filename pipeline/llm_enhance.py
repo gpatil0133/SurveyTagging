@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 # LLM confidence string → numeric for accumulator merge ranking.
 _CONF_NUMERIC = {"high": 0.85, "medium": 0.75, "low": 0.55, "none": 0.40}
 
+# Confidence stamped on an LLM-assigned tag. Project-level reads the whole survey
+# and lands slightly higher than a per-question judgement; both sit below the
+# deterministic floor so a later rule-based pass would still win.
+_PROJECT_CONFIDENCE = 0.85
+_QUESTION_CONFIDENCE = 0.80
+
 
 def _rationale(why: dict, field: str, summary: str | None) -> str | None:
     """The explanation stamped on ONE dimension's tag.
@@ -103,7 +109,6 @@ def run_llm_enhancement(
     *,
     llm_client,
     taxonomy,
-    industry_stages,
     response_parser,
     settings,
 ) -> int:
@@ -123,9 +128,13 @@ def run_llm_enhancement(
     project_key = _cache_key(survey_identity)
     logger.debug("llm_cache_key_computed", extra={"project_key": project_key})
 
+    # One loop for the whole survey, closed in `finally`. It cannot be one loop
+    # per call: `LLMClient._semaphore` binds to the first loop that awaits it and
+    # raises on any other, which is also why parallel workers each hold their own
+    # client. Closed unconditionally — a raise anywhere below used to leak the
+    # loop and its selector, once per failed survey, for the life of the process.
+    loop = asyncio.new_event_loop()
     try:
-        loop = asyncio.new_event_loop()
-
         # LLM Call 1: Project-level
         logger.debug("llm_project_call_start", extra={"cache_key": project_key})
         rp = build_project_prompt(context, accumulator, taxonomy)
@@ -151,37 +160,24 @@ def run_llm_enhancement(
                          extra={"cache_key": project_key,
                                 "has_result": result is not None})
 
-        # LLM Call 2: Question-level.
-        # No longer gated on `industry_stages`: that registry only ever fed the
-        # journey fallback, which is gone, and the call assigns seven other
-        # dimensions that have nothing to do with journeys. Gating on it meant a
-        # deployment without journey_stages.yaml silently lost topic_theme,
-        # visualization_type and the rest.
+        # LLM Call 2: Question-level. Deliberately not gated on any journey
+        # source: this call also assigns seven dimensions that have nothing to do
+        # with journeys, and a tenant with no profile must not lose topic_theme,
+        # visualization_type and the rest along with its journey stages.
         if context.non_cm_questions:
             industry = accumulator.get_project_tag_value("industry_vertical")
             project_type = accumulator.get_project_tag_value("project_type")
             # Select CX vs EX journey by project_type (EX surveys ground against
             # the employee lifecycle). Resolved before the call because the
             # journey is a cache-key input, not just a prompt input.
-            journey, _journey_index = context.journey_for(project_type)
-            top_k = settings.embedding_top_k
-            min_score = float(getattr(settings, "embedding_min_score", 0.0) or 0.0)
+            journey = context.journey_for(project_type)
 
-            # The question response is only valid for the journey that produced
-            # its candidate lists and the knobs that shaped them — a refreshed
-            # tenant profile must invalidate it.
-            base_key = {**survey_identity, **_journey_fingerprint(journey),
-                        "top_k": top_k, "min_score": min_score}
-
-            # Score the whole survey once, then render one prompt per batch from
-            # that single ranking. Scoring per batch would reinstate the repeated
-            # embedding pass, and a question's candidates must not depend on
-            # which batch it landed in.
-            _rp, candidates_by_qid = build_question_prompt(
-                context, accumulator, taxonomy, industry_stages,
-                top_k=top_k, embedding_model=settings.embedding_model,
-                min_score=min_score,
-            )
+            # The question response is only valid for the journey that was
+            # inlined into its prompt — a refreshed tenant profile must
+            # invalidate it. V9 dropped `top_k` / `min_score` from the key with
+            # the ranker they configured; the journey fingerprint already covers
+            # every leaf the model was shown.
+            base_key = {**survey_identity, **_journey_fingerprint(journey)}
 
             batches = _batch(context.non_cm_questions,
                              int(getattr(settings, "question_batch_size", 20) or 20))
@@ -197,11 +193,8 @@ def run_llm_enhancement(
                     {**base_key, "batch": index,
                      "batch_qids": [q.question_id for q in batch]}
                 )
-                rp, _ = build_question_prompt(
-                    context, accumulator, taxonomy, industry_stages,
-                    top_k=top_k, embedding_model=settings.embedding_model,
-                    min_score=min_score,
-                    questions=batch, candidates_by_qid=candidates_by_qid,
+                rp = build_question_prompt(
+                    context, accumulator, taxonomy, questions=batch,
                 )
                 try:
                     result = loop.run_until_complete(
@@ -227,7 +220,7 @@ def run_llm_enhancement(
 
                 parsed_all.extend(response_parser.parse_question_response(
                     result, industry=industry, project_type=project_type,
-                    candidates_by_qid=candidates_by_qid,
+                    journey=journey,
                 ))
                 calls_made += 1
 
@@ -236,17 +229,12 @@ def run_llm_enhancement(
             # Runs once over the whole survey, after every batch has landed: a
             # question is only genuinely unplaced when no batch placed it.
             if calls_made:
-                _close_unplaced_journeys(
-                    context, accumulator, journey, _journey_index,
-                    candidates_by_qid, min_score,
-                )
+                _close_unplaced_journeys(context, accumulator, journey)
                 _close_unfilled_widget_fields(context, accumulator)
             logger.debug("llm_question_call_applied",
                          extra={"batches": len(batches),
                                 "parsed_questions": len(parsed_all),
-                                "candidates_qids": len(candidates_by_qid)})
-
-        loop.close()
+                                "journey_leaves": len(journey.leaves) if journey else 0})
     except Exception as e:
         logger.error(
             "llm_enhancement_failed type=%s: %s",
@@ -254,28 +242,107 @@ def run_llm_enhancement(
             extra={"error": str(e)},
             exc_info=True,
         )
+    finally:
+        loop.close()
 
     return calls_made
 
 
-# Dimensions whose non-LLM tiers are authoritative even though the tagger
-# reports `hybrid` rather than `deterministic`.
+# ---------------------------------------------------------------------------
+# Override policy: ONE place that answers "may the model replace this tag?"
+#
+# This was previously four different inline thresholds (0.80 for project scalars,
+# 0.80 for question scalars, 0.80 for dashboard_placement, 0.70 for role_intent)
+# plus a `status == "skipped"` check repeated in six places. Same decision, four
+# spellings, no single place to read it — so the policy could not be audited and
+# drifted every time a dimension was added.
+# ---------------------------------------------------------------------------
+
+# Default floor: a prior tag at or above this confidence keeps its value.
+_DEFAULT_FLOOR = 0.80
+
+# Per-dimension floors that differ from the default, each with its reason.
+_FLOORS = {
+    # role_intent's deterministic tiers are strong; only its weakest guesses
+    # (< 0.70) are worth a model's second opinion.
+    "role_intent": 0.70,
+}
+
+# Dimensions whose non-LLM tiers are authoritative even though the tagger reports
+# `hybrid` rather than `deterministic`.
 #
 # `industry_vertical` is free text sourced from tenant research: when the org
-# agent supplied a label the tagger stores it verbatim above 0.80, and a model
-# reading one survey does not get to rewrite what a researcher read off the
-# tenant's own site. Every weaker tier of that tagger sits below 0.80, so the
+# agent supplied a label the tagger stores it verbatim above the floor, and a
+# model reading one survey does not get to rewrite what a researcher read off the
+# tenant's own site. Every weaker tier of that tagger sits below the floor, so the
 # threshold alone decides — no tier plumbing leaks in here.
 _HYBRID_AUTHORITATIVE = frozenset({"industry_vertical"})
 
 
-def _blocks_llm_override(existing, dimension: str) -> bool:
-    """True when the prior tag outranks whatever the model returned."""
-    if existing is None or existing.confidence < 0.80:
+def _blocks_llm_override(existing, dimension: str, *, any_source: bool) -> bool:
+    """True when the prior tag outranks whatever the model returned.
+
+    Rules, in order:
+      * a `skipped` tag is a decision, not a gap — the dimension does not apply
+        here and the model does not get to apply it anyway;
+      * below the dimension's floor, the model wins;
+      * at or above it, `any_source` decides which sources are protected.
+
+    `any_source` is the one place the two levels genuinely differ, and the
+    difference is deliberate rather than drift:
+
+      question level (`any_source=True`) — a question tagger that reached 0.80 read
+        something structural about THAT question: a platform flag, its position, its
+        grid size. `flow_experience` is the case that makes this matter: it reports
+        `hybrid` at 0.80-0.85 for a welcome message or a section header, facts the
+        model cannot see from the wording it is given.
+
+      project level (`any_source=False`) — the free-text and refinement dimensions
+        (project_intent, audience_type, survey_sub_type, ...) are seeded by rules
+        from the title alone and the LLM, which reads every question, is the
+        intended arbiter. Only deterministic tiers — and the hybrids named in
+        `_HYBRID_AUTHORITATIVE` — outrank it.
+    """
+    if existing is None:
         return False
-    if existing.source == "deterministic":
+    if existing.status == "skipped":
+        return True
+    if existing.confidence < _FLOORS.get(dimension, _DEFAULT_FLOOR):
+        return False
+    if any_source or existing.source == "deterministic":
         return True
     return dimension in _HYBRID_AUTHORITATIVE and existing.source == "hybrid"
+
+
+def _merge_multi_label(
+    getter, setter, dimension: str, values, *, why: dict, why_key: str,
+    summary: str | None, confidence: float, any_source: bool,
+) -> None:
+    """Union an LLM list onto an existing list tag, newest names appended.
+
+    Union rather than replace: the deterministic pass and the model each see
+    routing/placement signals the other cannot, and dropping either side loses
+    information. A tag the policy protects is left alone entirely.
+
+    Both list dimensions this serves (`dashboard_routing`, `dashboard_placement`)
+    are emitted by their taggers at 0.60-0.70, i.e. always below the floor, so the
+    policy check here never fires today. It is applied anyway so that raising a
+    tagger's confidence cannot silently start overwriting it.
+    """
+    if not values or not isinstance(values, list):
+        return
+    existing = getter(dimension)
+    if _blocks_llm_override(existing, dimension, any_source=any_source):
+        return
+    merged = list(existing.value) if existing and isinstance(existing.value, list) else []
+    for name in values:
+        if name not in merged:
+            merged.append(name)
+    setter(dimension, TagResult(
+        value=merged, source="llm", confidence=confidence,
+        reasoning=_rationale(why, why_key, summary),
+        superseded=_superseded(existing),
+    ))
 
 
 def _apply_project_llm_results(parsed: dict, accumulator) -> None:
@@ -297,47 +364,30 @@ def _apply_project_llm_results(parsed: dict, accumulator) -> None:
 
     why = parsed.get("why") or {}
     summary = parsed.get("reasoning") or None
+    get, set_ = accumulator.get_project_tag, accumulator.set_project_tag
 
     for field, dimension in scalar_map.items():
+        # `field` is the model's key, `dimension` ours; the `why` line is filed
+        # under the model's spelling.
         value = parsed.get(field)
         if not value:
             continue
-
-        existing = accumulator.get_project_tag(dimension)
-        if _blocks_llm_override(existing, dimension):
+        existing = get(dimension)
+        if _blocks_llm_override(existing, dimension, any_source=False):
             continue
-
-        accumulator.set_project_tag(dimension, TagResult(
-            value=value,
-            source="llm",
-            confidence=0.85,
+        set_(dimension, TagResult(
+            value=value, source="llm", confidence=_PROJECT_CONFIDENCE,
             reasoning=_rationale(why, field, summary),
             superseded=_superseded(existing),
         ))
 
     # Multi-label: dashboard_names → dashboard_routing
-    dashboard_names = parsed.get("dashboard_names")
-    if dashboard_names and isinstance(dashboard_names, list):
-        existing = accumulator.get_project_tag("dashboard_routing")
-        if existing and isinstance(existing.value, list):
-            merged = list(existing.value)
-            for n in dashboard_names:
-                if n not in merged:
-                    merged.append(n)
-            value = merged
-        else:
-            value = dashboard_names
-        accumulator.set_project_tag("dashboard_routing", TagResult(
-            value=value, source="llm", confidence=0.85,
-            reasoning=_rationale(why, "dashboard_names", summary),
-            superseded=_superseded(existing),
-        ))
+    _merge_multi_label(get, set_, "dashboard_routing", parsed.get("dashboard_names"),
+                       why=why, why_key="dashboard_names", summary=summary,
+                       confidence=_PROJECT_CONFIDENCE, any_source=False)
 
 
-def _close_unplaced_journeys(
-    context, accumulator, journey, journey_index, candidates_by_qid: dict,
-    min_score: float,
-) -> None:
+def _close_unplaced_journeys(context, accumulator, journey) -> None:
     """Turn leftover `pending_llm` journey tags into skips that say why.
 
     `journey_stage` is a pending_llm-only tagger: the deterministic pass
@@ -346,13 +396,12 @@ def _close_unplaced_journeys(
     never landed" — which, once the call has landed and declined, is a lie the
     output tells about itself.
 
-    Four distinct reasons, each written to the tag so a reader does not have to
-    guess which one applies — and, more to the point, so they are sent to the
-    right system to fix it:
+    V9 collapsed four reasons to two. `scoring_unavailable` (the embedding model
+    would not load) and `below_similarity_floor` (nothing cleared `min_score`)
+    both described the ranker, and the ranker is gone: every question with a
+    journey now sees every moment in it. What is left is the honest pair —
       * no journey source for the tenant at all -> fetch the profile;
-      * a source exists but could not be scored -> the embedding model;
-      * scored, but nothing cleared the similarity floor -> the journey or the floor;
-      * candidates were offered and the model declined -> nothing to fix.
+      * the whole journey was offered and the model declined -> nothing to fix.
     """
     from taggers._metric_utils import is_journey_eligible_metric
 
@@ -377,34 +426,14 @@ def _close_unplaced_journeys(
                     stage=5,
                     inputs={"tenant_id": context.tenant_id},
                 )
-            elif journey_index is None:
-                detail = ev.fallback(
-                    f"question.{dimension}.scoring_unavailable",
-                    f"'{journey.journey_name}' was read from the tenant profile, but its "
-                    "moments could not be embedded, so no candidates could be ranked for "
-                    "this question. The journey source is fine — check the embedding "
-                    "model.",
-                    stage=5,
-                    inputs={"leaves": len(journey.leaves)},
-                )
-            elif q.question_id not in candidates_by_qid:
-                detail = ev.statistic(
-                    f"question.{dimension}.below_similarity_floor",
-                    f"Scored against all {len(journey.leaves)} moments in "
-                    f"'{journey.journey_name}' and none reached the floor, so the metric "
-                    "was left unplaced rather than filed under its nearest miss.",
-                    measure="max_cosine_similarity",
-                    observed="below_floor",
-                    threshold=min_score,
-                    stage=5,
-                )
             else:
                 detail = ev.rule(
                     f"question.{dimension}.llm_declined",
-                    "Candidate moments were offered and the model judged that none of "
-                    "them is what this question measures.",
+                    f"All {len(journey.leaves)} moments in '{journey.journey_name}' were "
+                    "offered and the model judged that none of them is what this "
+                    "question measures.",
                     stage=5,
-                    inputs={"candidates": len(candidates_by_qid[q.question_id])},
+                    inputs={"leaves_offered": len(journey.leaves)},
                 )
 
             accumulator.set_question_tag(q.question_id, dimension, TagResult(
@@ -652,16 +681,23 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
         why = q_data.get("why") or {}
         q_reasoning = q_data.get("reasoning") or None
 
+        # Both helpers below take (dimension, ...) — bind the question id once.
+        def get(dim, _q=q_id):
+            return accumulator.get_question_tag(_q, dim)
+
+        def set_(dim, tag, _q=q_id):
+            accumulator.set_question_tag(_q, dim, tag)
+
         # -------- Standard scalar fields --------
         for field, dimension in scalar_map.items():
             value = q_data.get(field)
             if not value:
                 continue
-            existing = accumulator.get_question_tag(q_id, dimension)
-            if existing and (existing.status == "skipped" or existing.confidence >= 0.80):
+            existing = get(dimension)
+            if _blocks_llm_override(existing, dimension, any_source=True):
                 continue
-            accumulator.set_question_tag(q_id, dimension, TagResult(
-                value=value, source="llm", confidence=0.80,
+            set_(dimension, TagResult(
+                value=value, source="llm", confidence=_QUESTION_CONFIDENCE,
                 reasoning=_rationale(why, field, q_reasoning),
                 superseded=_superseded(existing),
             ))
@@ -672,7 +708,6 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
         j_status = q_data.get("journey_status") or "assigned"
         j_confidence = q_data.get("journey_confidence") or "medium"
         j_evidence = q_data.get("journey_evidence")
-        j_candidates = q_data.get("journey_candidates")
 
         if stage_value or sub_value:
             if question is not None:
@@ -683,11 +718,16 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
             conf_numeric = _CONF_NUMERIC.get(j_confidence, 0.75)
             tag_status = "low_confidence_assigned" if j_status == "low_confidence_assigned" else "assigned"
 
+            # V9: `candidates` is gone. It held this question's ranked top-4,
+            # and there is no longer a per-question shortlist — the model chose
+            # from the tenant's whole journey, which is recorded by name and
+            # size instead of copied into every question's tag.
             coverage = {
                 "confidence": j_confidence,
                 "evidence": j_evidence,
                 "leaf_id": q_data.get("journey_leaf_id"),
-                "candidates": j_candidates or [],
+                "journey_name": q_data.get("journey_name"),
+                "leaves_offered": q_data.get("journey_leaves_offered"),
             }
 
             # The journey block carries its own per-assignment sentence
@@ -730,22 +770,10 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
                     ))
 
         # Multi-label: dashboard_names → dashboard_placement
-        dashboard_names = q_data.get("dashboard_names")
-        if dashboard_names and isinstance(dashboard_names, list):
-            existing = accumulator.get_question_tag(q_id, "dashboard_placement")
-            if existing and isinstance(existing.value, list) and existing.confidence < 0.80:
-                merged = list(existing.value)
-                for n in dashboard_names:
-                    if n not in merged:
-                        merged.append(n)
-                value = merged
-            else:
-                value = dashboard_names
-            accumulator.set_question_tag(q_id, "dashboard_placement", TagResult(
-                value=value, source="llm", confidence=0.80,
-                reasoning=_rationale(why, "dashboard_names", q_reasoning),
-                superseded=_superseded(existing),
-            ))
+        _merge_multi_label(get, set_, "dashboard_placement",
+                           q_data.get("dashboard_names"),
+                           why=why, why_key="dashboard_names", summary=q_reasoning,
+                           confidence=_QUESTION_CONFIDENCE, any_source=True)
 
         # Multi-label: flow_logic_inferred → flow_logic_role (union, never removal)
         _apply_flow_logic_inference(q_data, accumulator, q_id, why, q_reasoning)
@@ -753,15 +781,16 @@ def _apply_question_llm_results(parsed_list: list[dict], accumulator, context=No
         # V8 widget fields, with their id namespaces enforced.
         _apply_widget_fields(q_data, accumulator, q_id, question, why, q_reasoning)
 
-        # Role intent refinement
+        # Role intent refinement. `_FLOORS` holds role_intent's 0.70 floor, and
+        # the `why` line arrives under the model's own key.
         refined_role = q_data.get("role_intent_refined")
         if refined_role:
-            existing_role = accumulator.get_question_tag(q_id, "role_intent")
-            if existing_role and existing_role.confidence < 0.70:
-                accumulator.set_question_tag(q_id, "role_intent", TagResult(
+            existing_role = get("role_intent")
+            if not _blocks_llm_override(existing_role, "role_intent", any_source=True):
+                set_("role_intent", TagResult(
                     value=refined_role,
                     source="llm",
-                    confidence=0.80,
+                    confidence=_QUESTION_CONFIDENCE,
                     reasoning=_rationale(why, "role_intent_refined", q_reasoning),
                     superseded=_superseded(existing_role),
                 ))

@@ -93,17 +93,13 @@ class DisplayLabelTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.metric_name", "question.widget_compatibility"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("display_label", stage=5))
 
         widgets = accumulator.get_question_tag_value(q.question_id, "widget_compatibility")
         if not widgets:

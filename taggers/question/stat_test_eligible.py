@@ -22,17 +22,13 @@ class StatTestEligibleTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.metric_type"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("stat_test_eligible", stage=4))
 
         metric_type = accumulator.get_question_tag_value(q.question_id, "metric_type")
         has_weights = any(o.weight is not None for o in q.answer_options)

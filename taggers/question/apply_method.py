@@ -12,8 +12,11 @@ class ApplyMethodTagger(QuestionTagger):
     tag_dimension = "apply_method"
     stage = 3
     source_type = "deterministic"
+    # Applies to every row the pipeline writes, content messages included:
+    # "who assigned this tag" has the same answer for a CM as for a question.
+    skips_content_messages = False
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,

@@ -45,17 +45,12 @@ class SurveySubTypeTagger(ProjectTagger):
 
     def tag(self, context: UnifiedContext, accumulator: TagAccumulator) -> TagResult:
         project_type = accumulator.get_project_tag_value("project_type")
-        audience = accumulator.get_project_tag_value("audience_type") or ""
         cadence = accumulator.get_project_tag_value("survey_cadence") or ""
         n_questions = len(context.non_cm_questions)
 
         title_lower = context.survey_meta.title.lower()
         desc_lower = (context.survey_meta.description or "").lower()
         combined = f"{title_lower} {desc_lower}"
-
-        has_grid = any(q.question_type in ("GR", "GC", "RG", "GQ") or q.matrix_group_title
-                       for q in context.questions)
-        has_multiple_primary = sum(1 for q in context.questions if q.is_custom_metric or q.rs_type in (2, 3, 4)) >= 3
 
         title = context.survey_meta.title
 

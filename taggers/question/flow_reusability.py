@@ -29,16 +29,12 @@ class FlowReusabilityTagger(QuestionTagger):
     depends_on = ["question.role_intent"]
     source_type = "hybrid"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
-        if question.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("flow_reusability", stage=5))
-
         # Check scale fingerprint against known benchmarks
         if question.scale_fingerprint:
             for fp_pattern, scale_name in _BENCHMARK_FINGERPRINTS.items():

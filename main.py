@@ -12,7 +12,6 @@ fetcher, which is an onboarding/ops task run out-of-band from tagging.
 from __future__ import annotations
 
 import json
-import logging
 import sys
 from pathlib import Path
 
@@ -56,19 +55,12 @@ def profile() -> None:
 _AGENT_CHOICES = click.Choice(["org", "cx", "ex"], case_sensitive=False)
 
 
-def _build_parallel_client(settings: Settings) -> "ParallelClient":  # noqa: F821
-    from tenant_profile.parallel_client import ParallelClient, ParallelClientError
-    if not settings.parallel_api_key:
-        raise click.ClickException(
-            "PARALLEL_API_KEY not set. Add SURVEY_TAGGER_PARALLEL_API_KEY=... to .env."
-        )
+def _build_parallel_client(settings: Settings):
+    """The shared factory, with its error translated into a CLI message."""
+    from tenant_profile.parallel_client import ParallelClientError, build_parallel_client
+
     try:
-        return ParallelClient(
-            api_key=settings.parallel_api_key,
-            processor=settings.parallel_processor,
-            api_timeout=settings.parallel_api_timeout,
-            max_retries=settings.parallel_max_retries,
-        )
+        return build_parallel_client(settings)
     except ParallelClientError as e:
         raise click.ClickException(str(e))
 

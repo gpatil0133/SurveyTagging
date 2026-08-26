@@ -440,6 +440,27 @@ project_level:
     allowed_values: []
     user_defined: true
 
+  respondent_segments:
+    description: "Respondent attributes from the linked directory that this survey's results can be broken out by, with their distinct values."
+    purpose: "The segment picker: WHO answered, in the vocabulary a report can group by."
+    feeds: [Reporting, S3, S5]
+    strategy: deterministic
+    explanation: >-
+      The respondent attributes a report can cut this survey's results by — department,
+      location, membership status, gender — each with the values it actually takes.
+      Where segment_dimensions says which QUESTION can slice others, this says which
+      properties of the PERSON are available to slice by.
+    derivation: >-
+      Read from the tenant's Directory/ parquet files, narrowed to the directories
+      this survey's responses are joined to via directory_linking.parquet. A column
+      qualifies when it has 2-15 distinct values and is not an identifier, name,
+      email, phone, address or date of birth — those are excluded by rule and their
+      values are never emitted. Skipped with evidence when the survey has no
+      directory link, since an attribute that cannot reach a response cannot group
+      one. Stage 2, taggers/project/respondent_segments.py. Never LLM-refined.
+    multi_label: true
+    allowed_values: []
+    user_defined: true
   owner_team:
     description: "Department, team, or individual accountable for the project"
     purpose: "Who answers for the results. The address on a routed action."
@@ -1132,14 +1153,16 @@ question_level:
     derivation: >-
       The tagger contributes only the eligibility gate (rs_type 2/3/4 or the
       is_custom_metric flag) and writes pending_llm. The value comes from LLM Call 2,
-      choosing from the per-tenant journey canon — itself built from the tenant
-      profile's journeys, blended with the industry template as needed — with the top
-      four candidate stages ranked by sentence-embedding similarity to the question's
-      signature. An answer outside the canon is snapped to the top embedding
-      candidate and marked low_confidence_assigned rather than dropped. Stage 5,
-      taggers/question/journey_stage.py with llm/tenant_canon.py and
-      llm/embeddings.py. With SKIP_LLM or an LLM failure, eligible questions stay
-      pending_llm.
+      choosing from the tenant's profile-derived journey (CX journeys, or the EX
+      lifecycle for EX surveys), which is inlined into the prompt in full — every
+      moment the tenant has, in profile source order, unranked. The model returns a
+      leaf_id and both journey_stage and sub_stage_name are resolved from it, so no
+      value is ever model-authored text. An answer outside the journey is dropped
+      and the dimension closed as a decline; V9 removed the old snap-to-nearest,
+      which only made sense while an embedding ranker supplied an independent
+      "belongs somewhere" signal. Stage 5, taggers/question/journey_stage.py with
+      llm/profile_journey.py. With SKIP_LLM, no tenant profile, or an LLM failure,
+      the dimension is skipped with evidence naming which of the three applied.
     allowed_values: []
     user_defined: true
 
@@ -1429,6 +1452,34 @@ question_level:
       - Continuous          # numeric / scale
       - Free-Text
       - N/A
+
+  verbatim_enrichment:
+    description: "Text-analytics outputs that exist for this open-text question's answers (sentiment, themes, emotions, topics, action plans)."
+    purpose: "Which NLP widgets have something to render for this question."
+    feeds: [Reporting, S3]
+    strategy: deterministic
+    explanation: >-
+      What the platform's text analytics already produced for this question's
+      verbatims. An open-text question with scored sentiment and extracted themes can
+      support a theme or sentiment widget; one whose answers were never analyzed
+      cannot, however identical the two look in the survey structure.
+    derivation: >-
+      Read per question from survey_response_data.parquet, keyed by
+      FeedbackQuestionId: presence of Sentiment, SentimentScore, Themes, Emotions,
+      Topics and ActionPlan across the question's verbatim rows. Counts and the most
+      frequent label names go on the evidence; the answers themselves are never read
+      into the artifact. Confidence drops to 0.70 when under 25% of the question's
+      rows are enriched. Skipped for questions that collect no free text, and for
+      open-text questions whose verbatims have not been analyzed. Stage 3,
+      taggers/question/verbatim_enrichment.py. Never LLM-refined.
+    multi_label: true
+    allowed_values:
+      - Sentiment
+      - Sentiment Score
+      - Themes
+      - Emotions
+      - Topics
+      - Action Plans
 
   widget_compatibility:
     description: "The SET of chart/widget types that can validly render this question. `visualization_type` remains the single DEFAULT pick; this is the full allow-list the dashboard service chooses from. Derived by rule table over response_format + scale_of_measurement + cardinality_class."

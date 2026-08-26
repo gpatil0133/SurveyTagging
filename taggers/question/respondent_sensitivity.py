@@ -14,17 +14,12 @@ class RespondentSensitivityTagger(QuestionTagger):
     depends_on = ["question.role_intent"]
     source_type = "llm"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
-        if question.is_content_message:
-            return TagResult(
-                value=None, source="deterministic", status="skipped",
-                evidence=ev.content_message("respondent_sensitivity", stage=5))
-
         role = accumulator.get_question_tag_value(question.question_id, "role_intent")
 
         # High Analytical Weight: primary metrics and key drivers

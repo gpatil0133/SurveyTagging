@@ -34,9 +34,15 @@ SCHEMA_VERSION = "8.0"
 
 _JOURNEY_TYPES = {"CX", "EX"}
 
-# Dimensions that carry `coverage_metadata` (the per-question canon candidates
-# scored by embeddings + LLM confidence). We strip these by default for payload
+# Dimensions that carry `coverage_metadata` (which journey moment was picked,
+# with the LLM's confidence and evidence). We strip these by default for payload
 # size; surface them when `include_journey_candidates=True`.
+#
+# V9 note: `coverage_metadata.candidates` is no longer written. It held the
+# question's embedding-ranked top-4, and there is no per-question shortlist any
+# more — the model chooses from the tenant's whole journey, recorded as
+# `journey_name` + `leaves_offered`. The decorating code below is kept because
+# artifacts tagged before V9 still carry the old key and stay readable.
 _COVERAGE_DIMS = ("journey_stage", "sub_stage_name")
 
 
@@ -51,9 +57,10 @@ def build_survey_view(
         tagged: raw `tagged_output.json` dict.
         include_journey_candidates: when True, the `journey_stage` and
             `sub_stage_name` tag entries carry their `coverage_metadata`
-            block (the ranked canon candidates with embedding scores,
-            the LLM's confidence label, and the evidence sentence) plus
-            a derived `selected: true|false` marker per candidate.
+            block — the picked `leaf_id`, the journey it came from, how
+            many moments were offered, the LLM's confidence label and the
+            evidence sentence. Pre-V9 artifacts also carry a `candidates`
+            list, and those rows are decorated with `selected: true|false`.
             When False (default), `coverage_metadata` is stripped to keep
             the payload small.
 

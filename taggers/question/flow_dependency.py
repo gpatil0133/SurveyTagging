@@ -13,16 +13,12 @@ class FlowDependencyTagger(QuestionTagger):
     stage = 3
     source_type = "deterministic"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
-        if question.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("flow_dependency", stage=3))
-
         # Conditionally Shown: follow-up question
         if question.is_followup_question:
             return TagResult(

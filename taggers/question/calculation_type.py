@@ -56,17 +56,13 @@ class CalculationTypeTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.response_format", "question.metric_name"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("calculation_type", stage=4))
 
         fmt = accumulator.get_question_tag_value(q.question_id, "response_format")
         if not fmt:

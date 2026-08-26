@@ -5,7 +5,12 @@
 # rendered per survey with the questions payload and is NEVER cached. Bump
 # `version` whenever the cached_preamble shape changes.
 
-version: "9.0"
+# 10.0 (V9): journey selection reads one inlined tenant-wide catalog instead of
+#            a per-question embedding-ranked shortlist. The `candidates` key is
+#            gone from the question payload and questions carry `section`
+#            directly (it used to reach the model only inside the ranker's
+#            `signature` string).
+version: "10.0"
 description: "Question-level classification — topic_theme, sensitivity, flow, inferred routing roles, journey {stage,sub_stage}, visualization, dashboard, display_role, plus the V8 widget fields: favorable_options, preferred_segments, display_label."
 
 cached_preamble: |
@@ -26,17 +31,18 @@ cached_preamble: |
   - A short chart title, when the question has no metric name of its own
 
   Rules for the `journey` block (metric questions ONLY — `is_journey_metric=true`):
-  - The question's input includes a ranked list of `candidates`. These are the tenant's OWN journey moments, read from their profile — each has a `leaf_id`, a `stage_name`, a `sub_stage_name` (may be null), a description and a goal.
-  - You SELECT a candidate; you do not write stage text. Return its `leaf_id` verbatim. Both `journey_stage` and `sub_stage_name` are resolved from that id, so a moment can never be recorded under a name the tenant does not use.
-  - Use the SURVEY title and SECTION header to disambiguate when the question text is generic (e.g. "Please rate your level of agreement..."). Survey-level context wins over individual question wording when they conflict.
-  - The candidates are ranked by embedding similarity, NOT by correctness. The top-ranked candidate is a suggestion — read all of them and pick the moment the question actually measures.
+  - The prompt carries ONE `Tenant journey` block listing every moment this tenant has, read from their own profile. Each moment has a `leaf_id`, a `stage_name`, an optional `sub_stage_name`, and usually a description and a goal. That list is the complete set of choices for every question — there is no per-question shortlist.
+  - You SELECT a moment; you do not write stage text. Return its `leaf_id` verbatim. Both `journey_stage` and `sub_stage_name` are resolved from that id, so a moment can never be recorded under a name the tenant does not use.
+  - The list is in the tenant's own source order. It is NOT ranked, scored or filtered for relevance, and position carries no signal — read the whole list before choosing.
+  - Read `description` and `goal`, not just the names. Two moments often have similar names and are told apart only by what the tenant says happens in them.
+  - Use the SURVEY title and the question's `section` to disambiguate when the question text is generic (e.g. "Please rate your level of agreement..."). Survey-level context wins over individual question wording when they conflict.
   - `confidence` is your assessment of the assignment quality:
-      "high"   — survey title + question text + candidate align unambiguously
-      "medium" — multiple candidates plausible; you picked the strongest
-      "low"    — uncertain; question text is generic or candidate scores were close
-      "none"   — none of the candidates fits the moment being measured
-  - If `confidence` would be "none", set the entire `journey` to null instead of forcing a pick. An unplaced metric is a correct answer; a metric filed under the wrong moment corrupts the tenant's journey rollup.
-  - If a journey-eligible question has NO `candidates` list, set its `journey` to null. It means nothing in this tenant's journey scored close enough to that question.
+      "high"   — survey title + question text + moment align unambiguously
+      "medium" — several moments plausible; you picked the strongest
+      "low"    — uncertain; the question text is generic or two moments fit equally well
+      "none"   — no moment in the journey is what this question measures
+  - If `confidence` would be "none", set the entire `journey` to null instead of forcing a pick. This matters more than it used to: you are shown every moment the tenant has, so "none of these" is a real and final answer about the journey rather than a gap in a shortlist. An unplaced metric is a correct answer; a metric filed under the wrong moment corrupts the tenant's journey rollup.
+  - If there is no `Tenant journey` block at all, set every `journey` to null. The tenant has no journey to place questions against.
   - For non-metric questions (`is_journey_metric=false`), set the entire `journey` to null.
   - Dashboard names MUST be chosen from the project-level dashboard routing list provided. Only add a custom dashboard name if NO provided dashboard is suitable.
 
@@ -102,7 +108,7 @@ cached_preamble: |
     "flow_respondent_experience": "{{ flow_exp | join(' | ') }}",
     "flow_reusability": "{{ flow_reuse | join(' | ') }}",
     "journey": null OR {
-      "leaf_id":    "<EXACT leaf_id copied from this question's `candidates` list>",
+      "leaf_id":    "<EXACT leaf_id copied from the Tenant journey block>",
       "confidence": "high|medium|low",
       "evidence":   "<one short sentence justifying the choice>"
     },
@@ -127,9 +133,9 @@ user_prompt: |
 
   {{ tenant_profile_block }}
   {%- endif %}
-  {%- if journey_note %}
+  {%- if journey_block %}
 
-  {{ journey_note }}
+  {{ journey_block }}
   {%- else %}
 
   No journey source is available for this tenant — set `journey` to null on EVERY question.

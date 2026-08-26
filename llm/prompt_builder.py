@@ -11,7 +11,7 @@ V6 changes:
 
 Public API:
 - build_project_prompt(...)  -> RenderedPrompt
-- build_question_prompt(...) -> (RenderedPrompt, candidates_by_qid)
+- build_question_prompt(...) -> RenderedPrompt
 
 `RenderedPrompt.cached_preamble` is marked with cache_control=ephemeral by the
 LLMClient for Anthropic prompt caching (90%+ input cost reduction on hits).
@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import logging
 
-from config_loaders.industry_stages import IndustryStagesRegistry
 from llm.prompt_registry import RenderedPrompt, get_registry
 from models.context import UnifiedContext
 from models.tags import TagAccumulator
@@ -283,7 +282,7 @@ def _needed_fields(
     accumulator: TagAccumulator,
     q_id: int,
     *,
-    has_candidates: bool,
+    wants_journey: bool,
     available_inputs: set[str] | None = None,
 ) -> list[str]:
     """The output fields still worth asking the model for on this question.
@@ -321,7 +320,7 @@ def _needed_fields(
     # The prompt tells the model to OMIT the key unless it actually infers a
     # role, and on measured surveys that is ~99% of questions.
     needed.append("flow_logic_inferred")
-    if has_candidates:
+    if wants_journey:
         needed.append("journey")
     return needed
 
@@ -350,138 +349,30 @@ def _is_settled(existing, threshold: float) -> bool:
     return existing.status == "skipped" or existing.confidence >= threshold
 
 
-def build_question_signature(context: UnifiedContext, q) -> str:
-    """Compose the per-question text we score against canon stage embeddings.
-
-    Concatenates survey-level context (title, description, section header)
-    with question-level fields (matrix group, title, custom metric label,
-    answer options when those add signal). The same text is also surfaced
-    to the LLM as the question's `signature` so it can read what was scored.
-
-    NPS/CSAT/CES option labels are suppressed because the 0-10 / Likert
-    scale words ("Promoter", "Strongly agree") are stage-agnostic noise.
-    """
-    parts: list[str] = [f"Survey: {context.survey_meta.title}"]
-    if getattr(context.survey_meta, "description", None):
-        desc = str(context.survey_meta.description)[:200]
-        if desc:
-            parts.append(f"Description: {desc}")
-    sec = context.section_header_for(q)
-    if sec:
-        parts.append(f"Section: {sec}")
-    if getattr(q, "matrix_group_title", None):
-        parts.append(f"Matrix group: {q.matrix_group_title}")
-    parts.append(f"Question: {q.title}")
-    if getattr(q, "is_custom_metric", False) and getattr(q, "custom_metric_title", None):
-        parts.append(f"Custom metric: {q.custom_metric_title}")
-    rs_type = getattr(q, "rs_type", 0)
-    options = getattr(q, "answer_options", None) or []
-    if rs_type not in (2, 3, 4) and options and len(options) <= 8:
-        opts = ", ".join(o.answer_text for o in options[:6] if getattr(o, "answer_text", ""))
-        if opts:
-            parts.append(f"Options: {opts}")
-    return " | ".join(parts)
-
-
-def build_question_candidates(
-    context: UnifiedContext,
-    journey_index,
-    *,
-    top_k: int,
-    embedding_model: str,
-    min_score: float = 0.0,
-) -> dict[int, list[dict]]:
-    """Score every journey-eligible question against the journey in ONE encode pass.
-
-    Returns `{question_id: [candidate, ...]}` where each candidate carries the
-    fields the LLM prompt shows *and* the `leaf_id` the response parser resolves
-    the model's pick through — one shape, one computation, two consumers.
-
-    This is deliberately survey-wide rather than per-question: `score_questions`
-    batches the transformer forward pass, and the previous per-question call ran
-    it once per question, twice per survey (prompt build + parser gather).
-
-    `journey_index` is the journey-type-selected index (CX or EX) for this
-    survey; the caller resolves it via `context.journey_for(project_type)`.
-
-    A question whose best leaf scores below `min_score` is **omitted entirely**.
-    That is the honest outcome for a metric the tenant's journey has no home for
-    — the alternative is forcing it into the nearest stage and reporting a match
-    that isn't one. The caller distinguishes "below floor" from "no journey at
-    all" and records the difference in the tag's evidence.
-    """
-    if journey_index is None:
-        return {}
-    try:
-        from llm.profile_journey import score_questions
-        from llm.embeddings import EmbeddingModel
-        from taggers._metric_utils import is_journey_eligible_metric
-
-        eligible = [
-            q for q in context.questions
-            if not q.is_content_message and is_journey_eligible_metric(q)[0]
-        ]
-        if not eligible:
-            return {}
-
-        embedder = EmbeddingModel.get(embedding_model)
-        signatures = [build_question_signature(context, q) for q in eligible]
-        ranked = score_questions(signatures, journey_index, embedder, top_k=top_k)
-
-        out: dict[int, list[dict]] = {}
-        for q, r in zip(eligible, ranked):
-            if not r or r[0][1] < min_score:
-                continue
-            out[q.question_id] = [
-                {
-                    "leaf_id": leaf.leaf_id,
-                    "stage_name": leaf.stage_value,
-                    "sub_stage_name": leaf.sub_stage_value,
-                    "description": leaf.description,
-                    "goal": leaf.goal,
-                    "score": round(score, 3),
-                }
-                for (leaf, score) in r
-            ]
-        return out
-    except Exception as e:  # noqa: BLE001 — scoring is an enhancement, never fatal
-        logger.warning("question_candidate_scoring_failed", extra={"error": str(e)})
-        return {}
-
-
 def build_question_prompt(
     context: UnifiedContext,
     accumulator: TagAccumulator,
     taxonomy: TaxonomyRegistry,
-    industry_stages: IndustryStagesRegistry = None,
-    top_k: int = 4,
-    embedding_model: str = "BAAI/bge-small-en-v1.5",
-    min_score: float = 0.0,
     questions: list | None = None,
-    candidates_by_qid: dict[int, list[dict]] | None = None,
-) -> tuple[RenderedPrompt, dict[int, list[dict]]]:
+) -> RenderedPrompt:
     """Build question-level prompt for LLM Call 2.
 
-    Returns `(rendered_prompt, candidates_by_qid)`. The candidate map is
-    returned rather than recomputed downstream because the response parser
-    resolves the model's pick through the identical ranking — deriving it twice
-    cost a second full embedding pass and let the two copies disagree whenever
-    `top_k` differed between the call sites.
+    `questions` renders a subset (one batch) instead of the whole survey.
 
-    `questions` renders a subset (one batch) instead of the whole survey, and
-    `candidates_by_qid` supplies a ranking already computed for the full survey.
-    Batched callers must pass both: scoring is survey-wide and batching it would
-    reinstate the per-call embedding pass this signature exists to avoid.
+    V9: the tenant's journey is inlined **whole**, once per prompt, as a
+    `journey.moments` catalog the model selects a `leaf_id` from — replacing the
+    per-question top-4 an embedding index used to rank. Two reasons, both
+    against the old shape: the catalog is sent once where the ranked lists were
+    repeated per question (so this is fewer input tokens, not more, on any
+    survey with more journey-eligible questions than the old `top_k` of 4), and
+    a leaf the ranker put below the cut was unrecoverable — the model never saw
+    it. Selection quality is now bounded by the model rather than by a 384-dim
+    encoder scoring against a synthesized question signature.
 
-    `top_k`, `embedding_model` and `min_score` are passed in (rather than read
-    from a freshly-constructed `Settings()`) so a single survey does not
-    re-parse `.env` from disk once per question.
-
-    V8: journey candidates come from the tenant profile (`context.journey_for`).
-    There is no industry-template fallback — a tenant with no profile gets no
-    journey candidates, and the questions are marked skipped with evidence
-    rather than assigned a generic stage. `industry_stages` is retained in the
-    signature for callers built against the parked canon path; it is unused.
+    V8: the journey comes from the tenant profile (`context.journey_for`). There
+    is no industry-template fallback — a tenant with no profile gets no journey
+    catalog, and the questions are marked skipped with evidence rather than
+    assigned a generic stage.
     """
     industry = accumulator.get_project_tag_value("industry_vertical")
     project_type = accumulator.get_project_tag_value("project_type")
@@ -491,7 +382,7 @@ def build_question_prompt(
 
     # Select CX vs EX journey by project_type (EX surveys ground against the
     # employee lifecycle).
-    journey, journey_index = context.journey_for(project_type)
+    journey = context.journey_for(project_type)
 
     project_context = {
         "industry":     industry,
@@ -501,15 +392,6 @@ def build_question_prompt(
         "sub_type":     accumulator.get_project_tag_value("survey_sub_type"),
         "project_type": project_type,
     }
-
-    # One embedding pass for the whole survey; reused by the prompt below and
-    # returned to the caller for the parser. A batched caller scores once and
-    # passes the map back in, so this runs a single time per survey.
-    if candidates_by_qid is None:
-        candidates_by_qid = build_question_candidates(
-            context, journey_index, top_k=top_k, embedding_model=embedding_model,
-            min_score=min_score,
-        )
 
     questions_data = []
     for q in (questions if questions is not None else context.questions):
@@ -525,6 +407,12 @@ def build_question_prompt(
             "title": q.title,
             "type": q.question_type,
             "matrix_group": q.matrix_group_title or None,
+            # The nearest preceding section header. It used to reach the model
+            # only inside the embedding `signature`, which went away with the
+            # ranker — but the journey rules lean on it explicitly to place a
+            # generically-worded metric ("Please rate your level of agreement"),
+            # so it is a first-class field now rather than a casualty.
+            "section": context.section_header_for(q) or None,
             "options": [o.answer_text for o in q.answer_options[:6] if o.answer_text],
             "current_role": accumulator.get_question_tag_value(q.question_id, "role_intent"),
             # Flow context for `flow_logic_inferred`. The payload carries no
@@ -542,16 +430,15 @@ def build_question_prompt(
             "metric_title": metric_title,
         }
 
-        ranked = candidates_by_qid.get(q.question_id) if (
-            is_journey_metric and journey is not None
-        ) else None
-        if ranked:
-            q_entry["signature"] = build_question_signature(context, q)
-            q_entry["candidates"] = ranked
+        # Whether to ask this question for a journey placement at all. The
+        # catalog is survey-wide, so this is the only per-question gate left:
+        # a non-metric question has no moment to be measuring, and a tenant with
+        # no journey has nothing to offer.
+        wants_journey = is_journey_metric and journey is not None
 
         # V8 inputs, attached only when the matching tag is still open. Both are
         # id lists the model picks FROM rather than writes, the same shape as
-        # the journey candidates — nothing the model types becomes a tag value,
+        # the journey catalog — nothing the model types becomes a tag value,
         # so it cannot invent an option or a question that does not exist.
         available_inputs: set[str] = set()
 
@@ -580,45 +467,46 @@ def build_question_prompt(
 
         # Ask only for what the merge rules will actually keep.
         q_entry["needed"] = _needed_fields(
-            accumulator, q.question_id, has_candidates=bool(ranked),
+            accumulator, q.question_id, wants_journey=wants_journey,
             available_inputs=available_inputs,
         )
 
         questions_data.append(q_entry)
 
-    journey_note = ""
+    # The journey catalog: every moment the tenant has, once, for the whole
+    # batch. Rendered as its own block rather than per question — that is the
+    # entire token argument for dropping the ranker, and duplicating it per
+    # question would give the cost back.
+    journey_block = ""
     if journey is not None:
         sub_stage_rule = (
-            "Each candidate carries both levels: `stage_name` is the journey the "
-            "moment belongs to and `sub_stage_name` is the specific moment within "
-            "it. Return the candidate's `leaf_id` — both tag values are resolved "
-            "from it, so you never type a stage name."
+            "Each moment carries both levels: `stage_name` is the journey it "
+            "belongs to and `sub_stage_name` is the specific moment within it. "
+            "Several moments share a `stage_name` — that is why you return "
+            "`leaf_id` and never type a stage name."
             if journey.has_sub_stages else
-            "This journey has one level only: candidates carry `stage_name` with a "
-            "null `sub_stage_name`, and no sub-stage will be recorded. Return the "
-            "candidate's `leaf_id`."
+            "This journey has one level only: moments carry `stage_name` with no "
+            "`sub_stage_name`, and no sub-stage will be recorded."
         )
-        journey_note = (
-            f'Tenant journey: "{journey.journey_name}" '
-            f'({len(journey.leaves)} moments across {len(journey.stage_values)} '
-            f'stages, read from the tenant profile). {sub_stage_rule} '
-            f'A question with no `candidates` list has no home in this journey — '
-            f'set its `journey` to null rather than guessing.'
+        journey_block = (
+            f'Tenant journey: "{journey.journey_name}" — '
+            f'{len(journey.leaves)} moments across {len(journey.stage_values)} '
+            f'stages, read from the tenant profile. {sub_stage_rule}\n'
+            f'{json.dumps(journey.catalog(), indent=2)}'
         )
 
     user_context = {
         "survey_title":         context.survey_meta.title,
         "project_context_json": json.dumps(project_context),
         "tenant_profile_block": _build_tenant_profile_block(context.tenant_profile),
-        "journey_note":         journey_note,
+        "journey_block":        journey_block,
         "project_dashboards":   project_dashboards,
         "questions_count":      len(questions_data),
         "questions_json":       json.dumps(questions_data, indent=2),
     }
 
-    rendered = get_registry().render(
+    return get_registry().render(
         "question_tagging",
         cached_context=_question_cached_context(taxonomy),
         user_context=user_context,
     )
-    return rendered, candidates_by_qid

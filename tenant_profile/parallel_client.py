@@ -152,6 +152,27 @@ def _dump_raw_for_debug(raw: str) -> str:
     return path
 
 
+def build_parallel_client(settings) -> "ParallelClient":
+    """Construct a ParallelClient from Settings, or raise ParallelClientError.
+
+    Lives here rather than in each entry point: the API router and the ops CLI
+    both need the same four settings and the same missing-key check, and had
+    line-for-line copies of it that could drift apart. Each caller translates the
+    error into its own currency (HTTP 400 / ClickException) — that part genuinely
+    differs and stays with the caller.
+    """
+    if not settings.parallel_api_key:
+        raise ParallelClientError(
+            "PARALLEL_API_KEY not set. Add SURVEY_TAGGER_PARALLEL_API_KEY=... to .env."
+        )
+    return ParallelClient(
+        api_key=settings.parallel_api_key,
+        processor=settings.parallel_processor,
+        api_timeout=settings.parallel_api_timeout,
+        max_retries=settings.parallel_max_retries,
+    )
+
+
 class ParallelClient:
     """Thin wrapper around `parallel.Parallel`."""
 

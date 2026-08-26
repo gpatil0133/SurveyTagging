@@ -13,16 +13,12 @@ class FlowPlacementTagger(QuestionTagger):
     stage = 3
     source_type = "deterministic"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
-        if question.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("flow_placement", stage=3))
-
         total_non_cm = len(context.non_cm_questions)
 
         if total_non_cm == 0:

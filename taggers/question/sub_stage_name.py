@@ -37,17 +37,13 @@ class SubStageNameTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.journey_stage", "question.metric_name"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("sub_stage_name", stage=5))
 
         # The eligibility check returns its own typed evidence — the "why was
         # this question skipped" answer people actually ask for.

@@ -26,6 +26,8 @@ source before any automation posts these codes to `/Widget/insertupdate`.
 
 from __future__ import annotations
 
+import logging
+
 from models.survey import QuestionContext
 
 # The platform's twenty metrics, verbatim. These strings ARE the tag values of
@@ -122,6 +124,9 @@ _NO_METRIC_FORMATS = frozenset({
 # The V8 fix lives here: the previous normalization mapped anything containing
 # "weighted" onto Mean, discarding an explicit author choice and contradicting
 # RMX, whose own default for that question is Weighted Score.
+logger = logging.getLogger(__name__)
+
+
 _HINT_MATCHES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("weighted score as percentage", "weighted percentage"), WEIGHTED_SCORE_PCT),
     (("weighted",), WEIGHTED_SCORE),
@@ -129,6 +134,11 @@ _HINT_MATCHES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("net intent",), NET_INTENT),
     (("percent favorable", "percent favourable", "favorable", "favourable"),
      PERCENT_FAVORABLE),
+    # "Top Box %" is the author asking for the favorable band, and the platform
+    # has a metric for exactly that. Without this row the trailing "%" drops it
+    # onto generic Percentage further down — better than the pre-V8 behaviour (it
+    # fell all the way through to Mean) but still not what was configured.
+    (("top box", "topbox"), PERCENT_FAVORABLE),
     (("group percentage",), GROUP_PERCENTAGE),
     (("group count",), GROUP_COUNT),
     (("overall rank", "rank"), OVERALL_RANK),
@@ -159,6 +169,11 @@ def metric_from_platform_hint(raw: str | None) -> str | None:
     for needles, metric in _HINT_MATCHES:
         if any(n in text for n in needles):
             return metric
+    # The author set something this table does not know. Falling through to the
+    # shape rules is right — guessing at their meaning would be worse — but doing
+    # it silently is how "Top Box %" spent eleven surveys reported as Mean.
+    logger.warning("calculation_type_hint_unrecognized",
+                   extra={"platform_calculation_type": raw})
     return None
 
 

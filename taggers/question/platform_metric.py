@@ -41,6 +41,7 @@ from taggers.base import QuestionTagger
 class PlatformMetricTagger(QuestionTagger):
     name = "question.platform_metric"
     tag_dimension = "platform_metric"
+    skip_value = []  # multi-label: an empty list, never None
     stage = 4
     source_type = "deterministic"
 
@@ -48,17 +49,13 @@ class PlatformMetricTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.response_format"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=[], source="deterministic", status="skipped",
-                             evidence=ev.content_message("platform_metric", stage=4))
 
         fmt = accumulator.get_question_tag_value(q.question_id, "response_format")
         if not fmt:

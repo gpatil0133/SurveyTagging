@@ -111,17 +111,13 @@ class FavorableOptionsTagger(QuestionTagger):
     stage = 3
     source_type = "hybrid"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("favorable_options", stage=3))
 
         if not q.answer_options:
             return TagResult(

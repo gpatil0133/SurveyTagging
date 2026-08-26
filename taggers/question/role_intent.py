@@ -38,16 +38,12 @@ class RoleIntentTagger(QuestionTagger):
     stage = 3
     source_type = "hybrid"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
-        if question.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("role_intent", stage=3))
-
         q = question
 
         # Primary Metric: NPS / CSAT (CES is checked further down, after the

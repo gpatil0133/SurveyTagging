@@ -52,14 +52,12 @@ def delete_tagged(ctx: AppContext, tenant_id: int, survey_no: int | None = None)
     the hash behind makes the next tag call skip a survey whose output no longer
     exists (200 "skipped", then 404 on the read).
     """
-    from pipeline.change_detector import ChangeDetector
-
     root = Path(ctx.settings.output_dir) / str(tenant_id)
     removed: list[str] = []
     if not sharefs.exists(root):
         return {"tenant_id": tenant_id, "survey_no": survey_no, "tagged_removed": []}
 
-    detector = ChangeDetector(Path(ctx.settings.cache_dir))
+    detector = ctx.change_detector
     if survey_no is None:
         for path in sharefs.glob(root, f"SurveyData/*/{discovery.TAGGED_OUTPUT_FILE}"):
             sharefs.unlink(path, missing_ok=True)
@@ -258,14 +256,13 @@ def read_tenant_tags(ctx: AppContext, tenant_id: int) -> dict | None:
 
 
 def delete_tenant_tags(ctx: AppContext, tenant_id: int) -> dict:
-    from pipeline.change_detector import ChangeDetector
     from projections.tenant_tags_io import tenant_tags_path
     path = tenant_tags_path(tenant_id, Path(ctx.settings.output_dir))
     existed = sharefs.exists(path)
     if existed:
         sharefs.unlink(path)
     # Same pairing as delete_tagged: the artifact and its hash go together.
-    ChangeDetector(Path(ctx.settings.cache_dir)).tenant_forget(tenant_id)
+    ctx.change_detector.tenant_forget(tenant_id)
     return {"tenant_id": tenant_id, "removed": existed}
 
 

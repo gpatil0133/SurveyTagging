@@ -9,7 +9,6 @@ from pathlib import Path
 import sharefs
 import discovery
 import usage_log
-from config_loaders.industry_stages import IndustryStagesRegistry
 from fs_utils import write_json_atomic
 from llm.client import LLMClient
 from llm.response_parser import ResponseParser
@@ -36,18 +35,16 @@ class PipelineOrchestrator:
         settings: Settings,
         registry: TaggerRegistry,
         taxonomy: TaxonomyRegistry,
+        change_detector: ChangeDetector,
         llm_client: LLMClient | None = None,
-        industry_stages: IndustryStagesRegistry | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
         self.taxonomy = taxonomy
         self.llm_client = llm_client
-        self.industry_stages = industry_stages
-        self.change_detector = ChangeDetector(settings.cache_dir)
-        self.response_parser = (
-            ResponseParser(taxonomy, industry_stages) if taxonomy else None
-        )
+        # Passed in, never constructed here: see AppContext.change_detector.
+        self.change_detector = change_detector
+        self.response_parser = ResponseParser(taxonomy) if taxonomy else None
         # Per-thread LLM clients for bounded-parallel tenant tagging.
         self._tls = threading.local()
 
@@ -156,9 +153,9 @@ class PipelineOrchestrator:
             # tenant profile. No LLM call and no artifact — the right one is
             # selected per survey by project_type (EX surveys use the employee
             # lifecycle, everything else CX) inside the LLM enhancement step.
-            profile_journey, journey_index = self._load_profile_journey(
+            profile_journey = self._load_profile_journey(
                 tenant_id, tenant_profile, "CX")
-            profile_journey_ex, journey_index_ex = self._load_profile_journey(
+            profile_journey_ex = self._load_profile_journey(
                 tenant_id, tenant_profile, "EX")
             usage_log.annotate(
                 has_journey_cx=profile_journey is not None,
@@ -209,8 +206,8 @@ class PipelineOrchestrator:
         records = self._tag_surveys(
             surveys, survey_dir_base, tenant_dir, tenant_id,
             dir_signals, config_dir,
-            tenant_profile, profile_journey, journey_index, force,
-            profile_journey_ex, journey_index_ex,
+            tenant_profile, profile_journey, force,
+            profile_journey_ex,
             tenant_hash=tenant_hash,
         )
 
@@ -229,8 +226,8 @@ class PipelineOrchestrator:
     def _tag_surveys(
         self, surveys, survey_dir_base, tenant_dir, tenant_id,
         dir_signals, config_dir,
-        tenant_profile, profile_journey, journey_index, force,
-        profile_journey_ex=None, journey_index_ex=None,
+        tenant_profile, profile_journey, force,
+        profile_journey_ex=None,
         tenant_hash=None,
     ) -> list[dict]:
         """Dispatch survey tagging sequentially or in a bounded thread pool."""
@@ -246,8 +243,8 @@ class PipelineOrchestrator:
             return self._tag_one_survey(
                 survey_no, survey_dir_base, tenant_dir, tenant_id,
                 dir_signals, config_dir,
-                tenant_profile, profile_journey, journey_index, force,
-                profile_journey_ex, journey_index_ex,
+                tenant_profile, profile_journey, force,
+                profile_journey_ex,
                 tenant_hash=tenant_hash,
             )
 
@@ -255,19 +252,11 @@ class PipelineOrchestrator:
         if max_workers == 1 or len(surveys) <= 1:
             return [work(s) for s in surveys]
 
-        # Pre-warm the embedding model on this (single) thread before fanning
-        # out. The lazy load is now lock-guarded, but loading it once up front
-        # keeps the torch meta-tensor materialization off the worker threads
-        # entirely and avoids N-1 workers blocking on the first load.
-        #
-        # Under the API the lifespan already warmed it on a background thread,
-        # so this is a no-op returning immediately. It still matters for the
-        # headless paths (scheduler, tests, any direct orchestrator use) that
-        # never run a lifespan.
-        if journey_index is not None and not self.settings.skip_llm:
-            from llm.embeddings import EmbeddingModel
-            EmbeddingModel.warm(self.settings.embedding_model)
-
+        # V9: no pre-warm step here any more. This used to load the embedding
+        # model on this single thread before fanning out, so N-1 workers would
+        # not block on the first lazy load and torch's meta-tensor
+        # materialization stayed off the pool. With the model gone the workers
+        # have nothing to serialize on and the pool starts immediately.
         from concurrent.futures import ThreadPoolExecutor
         logger.info("tenant_parallel_tagging",
                     extra={"tenant_id": tenant_id, "surveys": len(surveys),
@@ -278,8 +267,8 @@ class PipelineOrchestrator:
     def _tag_one_survey(
         self, survey_no, survey_dir_base, tenant_dir, tenant_id,
         dir_signals, config_dir,
-        tenant_profile, profile_journey, journey_index, force,
-        profile_journey_ex=None, journey_index_ex=None,
+        tenant_profile, profile_journey, force,
+        profile_journey_ex=None,
         tenant_hash=None,
     ) -> dict:
         """Tag one survey: change-check, process, write, mark. Returns a record.
@@ -319,9 +308,7 @@ class PipelineOrchestrator:
                 result = self._process_survey(
                     tenant_dir, tenant_id, survey_no, dir_signals, config_dir,
                     tenant_profile, profile_journey=profile_journey,
-                    journey_index=journey_index,
                     profile_journey_ex=profile_journey_ex,
-                    journey_index_ex=journey_index_ex,
                     llm_client=self._worker_llm_client(),
                 )
                 output_path = self._write_output(tenant_id, survey_no, result)
@@ -355,7 +342,6 @@ class PipelineOrchestrator:
         bound to that thread's event loop."""
         if self.llm_client is None:
             return None
-        import threading
         max_workers = max(1, int(self.settings.max_concurrent_surveys))
         if max_workers == 1:
             return self.llm_client
@@ -425,23 +411,30 @@ class PipelineOrchestrator:
         tenant_profile: TenantProfile | None,
         journey_type: str,
     ):
-        """Build the journey source + embedding index for one journey type.
+        """Build the journey source for one journey type.
 
-        `journey_type` is "CX" or "EX". Returns
-        (ProfileJourney | None, JourneyIndex | None).
+        `journey_type` is "CX" or "EX". Returns `ProfileJourney | None`.
 
         Reads `tenant_profile/` directly — no LLM call, no canon artifact, no
-        share write. Both are None when the tenant has no profile for this
-        journey type, which leaves `journey_stage` / `sub_stage_name`
-        unassigned for the tenant's surveys. That is the intended behaviour:
-        the previous industry-template fallback produced generic stage names
-        that read as tenant-grounded and were not.
+        share write. None when the tenant has no profile for this journey type,
+        which leaves `journey_stage` / `sub_stage_name` unassigned for the
+        tenant's surveys. That is the intended behaviour: the previous
+        industry-template fallback produced generic stage names that read as
+        tenant-grounded and were not.
 
-        Best-effort — any failure logs and returns (None, None) rather than
-        failing the tenant run, since every other dimension is unaffected.
+        V9: no embedding index and so no second failure mode. This used to
+        return a `(journey, index)` pair where the index could be None on its
+        own — the journey read fine but the model would not load — and that
+        distinction had to be carried all the way into the tag evidence so an
+        operator was not sent to fix the profile when the problem was torch.
+        With the leaves inlined straight into the prompt there is one input and
+        one way for it to be missing.
+
+        Best-effort — any failure logs and returns None rather than failing the
+        tenant run, since every other dimension is unaffected.
         """
         try:
-            from llm.profile_journey import build_journey_index, build_profile_journey
+            from llm.profile_journey import build_profile_journey
 
             journey = build_profile_journey(tenant_id, tenant_profile, journey_type)
             if journey is None:
@@ -450,32 +443,12 @@ class PipelineOrchestrator:
                     extra={"tenant_id": tenant_id, "journey_type": journey_type,
                            "has_profile": tenant_profile is not None},
                 )
-                return None, None
-
-            if self.settings.skip_llm:
-                # The index only exists to rank candidates for the question LLM
-                # call. Without that call, embedding the leaves is pure cost.
-                return journey, None
-
-            # Embedding failure is scoped separately on purpose: the journey is
-            # still real, and reporting "this tenant has no journey" when the
-            # truth is "the embedding model would not load" sends whoever reads
-            # the evidence to the wrong system.
-            try:
-                from llm.embeddings import EmbeddingModel
-
-                embedder = EmbeddingModel.get(self.settings.embedding_model)
-                return journey, build_journey_index(journey, embedder)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("journey_index_build_failed",
-                               extra={"tenant_id": tenant_id, "journey_type": journey_type,
-                                      "leaves": len(journey.leaves), "error": str(e)})
-                return journey, None
+            return journey
         except Exception as e:  # noqa: BLE001
             logger.warning("profile_journey_build_failed",
                            extra={"tenant_id": tenant_id, "journey_type": journey_type,
                                   "error": str(e)})
-            return None, None
+            return None
 
     def _discover_surveys(self, survey_dir_base: Path, survey_nos: list[int] | None) -> list[int]:
         """Find survey directories."""
@@ -500,9 +473,7 @@ class PipelineOrchestrator:
         config_dir: Path,
         tenant_profile: TenantProfile | None = None,
         profile_journey=None,
-        journey_index=None,
         profile_journey_ex=None,
-        journey_index_ex=None,
         llm_client=None,
     ) -> TaggedSurvey:
         """Process a single survey through all pipeline stages.
@@ -519,9 +490,7 @@ class PipelineOrchestrator:
             tenant_dir, survey_no, tenant_id, dir_signals, config_dir,
             tenant_profile=tenant_profile,
             profile_journey=profile_journey,
-            journey_index=journey_index,
             profile_journey_ex=profile_journey_ex,
-            journey_index_ex=journey_index_ex,
         )
         logger.debug(
             "context_assembled",
@@ -548,7 +517,6 @@ class PipelineOrchestrator:
             self.taxonomy,
             llm_client=llm_client if llm_client is not None else self.llm_client,
             response_parser=self.response_parser,
-            industry_stages=self.industry_stages,
             settings=self.settings,
         )
 

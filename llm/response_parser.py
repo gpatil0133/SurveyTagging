@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 
-from config_loaders.industry_stages import IndustryStagesRegistry
 from models.taxonomy import TaxonomyRegistry
 
 logger = logging.getLogger(__name__)
@@ -153,15 +152,8 @@ def _clean_why(raw, allowed_keys: frozenset[str]) -> dict[str, str]:
 class ResponseParser:
     """Validates LLM output against taxonomy and extracts structured tags."""
 
-    def __init__(
-        self,
-        taxonomy: TaxonomyRegistry,
-        industry_stages: IndustryStagesRegistry | None = None,
-    ) -> None:
+    def __init__(self, taxonomy: TaxonomyRegistry) -> None:
         self.taxonomy = taxonomy
-        # PARKED: only the removed journey fallback ever read this. Kept on the
-        # constructor so existing call sites (orchestrator, tests) still build.
-        self.industry_stages = industry_stages
 
     @staticmethod
     def _note_normalization(
@@ -250,25 +242,24 @@ class ResponseParser:
     def parse_question_response(
         self, data: dict, industry: str | None = None,
         project_type: str | None = None,
-        candidates_by_qid: dict[int, list[dict]] | None = None,  # per-question candidate lists
+        journey=None,  # ProfileJourney | None — the catalog the prompt inlined
     ) -> list[dict]:
         """Parse and validate question-level LLM response.
 
-        V8: the `journey` block is resolved through `candidates_by_qid` — the
-        same ranking the prompt showed the model — so both journey tag values
-        come from the tenant's profile rather than from model text. A question
-        with no candidates has no journey namespace and gets no journey tags.
+        V9: the `journey` block is resolved against `journey` — the same whole
+        catalog the prompt inlined — so both journey tag values come from the
+        tenant's profile rather than from model text. One namespace for the
+        survey, not one per question: the model was shown every moment, so an
+        id it returns is either in the journey or it is not real.
         """
         questions = data.get("questions", [])
         logger.debug("parse_question_response_start",
                      extra={"question_count": len(questions) if isinstance(questions, list) else 0,
-                            "candidate_qids": len(candidates_by_qid or {}),
+                            "journey_leaves": len(journey.leaves) if journey else 0,
                             "industry": industry, "project_type": project_type})
         if not isinstance(questions, list):
             logger.warning("llm_questions_not_list")
             return []
-
-        candidates_by_qid = candidates_by_qid or {}
 
         results = []
         for q_data in questions:
@@ -295,12 +286,9 @@ class ResponseParser:
                 else:
                     why.pop(field, None)  # explained a dimension it never set
 
-            # ---------- Journey block (leaf selected from this question's candidates) ----------
-            qid = q_data.get("id")
-            qid_int = int(qid) if isinstance(qid, int) or (isinstance(qid, str) and qid.isdigit()) else None
+            # ---------- Journey block (leaf selected from the tenant catalog) ----------
             self._parse_journey_for_question(
-                q_data=q_data, parsed=parsed,
-                candidates=candidates_by_qid.get(qid_int) if qid_int is not None else None,
+                q_data=q_data, parsed=parsed, journey=journey,
             )
 
             # dashboard_names multi-label
@@ -330,7 +318,7 @@ class ResponseParser:
             # `llm_enhance._apply_question_llm_results`, which holds the
             # question and so knows which ids actually exist. Splitting it that
             # way keeps the parser free of survey context, the way the journey
-            # block keeps its namespace in `candidates_by_qid`.
+            # block keeps its namespace in the passed-in catalog.
             favorable = _clean_favorable_options(q_data.get("favorable_options"))
             if favorable:
                 parsed["favorable_options"] = favorable
@@ -381,71 +369,73 @@ class ResponseParser:
         *,
         q_data: dict,
         parsed: dict,
-        candidates: list[dict] | None,
+        journey=None,  # ProfileJourney | None
     ) -> None:
         """Resolve the LLM's `journey` block into stage + sub-stage tag values.
 
-        V8: the model returns a `leaf_id` selected from this question's own
-        candidate list, and both values are read off that candidate. Nothing the
+        V9: the model returns a `leaf_id` selected from the tenant's whole
+        journey catalog, and both values are read off that leaf. Nothing the
         model types becomes a tag value, so a stage can no longer be invented,
         misspelled, or fuzzy-matched into the wrong place — the failure mode the
-        canon path spent a validation ladder defending against.
+        canon path spent a validation ladder defending against. That guarantee
+        came from selecting out of a supplied namespace, not from the embedding
+        ranker, so it survives the ranker's removal intact.
 
-        An unresolvable pick falls back to the top-ranked candidate as
-        `low_confidence_assigned` rather than being dropped, since the embedding
-        ranking is independent evidence that the question belongs somewhere.
+        An unresolvable pick is **dropped**, not defaulted. Under the ranker an
+        unknown id fell back to the top-scored candidate, which was defensible
+        only because that ranking was independent evidence the question belonged
+        there. With no ranker there is no such evidence — the leaves are in the
+        tenant's own source order — so defaulting would mean filing the metric
+        under whichever moment the profile happened to list first. The caller
+        sees the still-`pending_llm` tag and closes it as a decline.
+
         A model that declined to place the question (`journey: null`) is left
         alone — the caller marks it skipped with the reason.
 
         Writes nothing when there is no assignment to make.
         """
-        journey = q_data.get("journey")
-        if not isinstance(journey, dict) or not journey:
+        block = q_data.get("journey")
+        if not isinstance(block, dict) or not block:
             return
-        if not candidates:
-            # The model placed a question we gave it no candidates for. There is
-            # no namespace to resolve against, so there is no safe value.
-            logger.warning("journey_assigned_without_candidates",
+        if journey is None or not journey.leaves:
+            # The model placed a question for a tenant with no journey at all.
+            # There is no namespace to resolve against, so there is no safe value.
+            logger.warning("journey_assigned_without_catalog",
                            extra={"qid": q_data.get("id")})
             return
 
-        by_leaf = {c.get("leaf_id"): c for c in candidates if c.get("leaf_id")}
-        leaf_id = journey.get("leaf_id")
+        leaf_id = block.get("leaf_id")
         leaf_id = leaf_id.strip() if isinstance(leaf_id, str) else None
 
         status = "assigned"
-        confidence = str(journey.get("confidence") or "medium").lower().strip()
-        evidence = journey.get("evidence")
+        confidence = str(block.get("confidence") or "medium").lower().strip()
+        evidence = block.get("evidence")
 
-        chosen = by_leaf.get(leaf_id) if leaf_id else None
+        chosen = journey.leaf(leaf_id) if leaf_id else None
         if chosen is None:
-            # Tolerate a model that named the moment instead of copying the id,
-            # then fall back to the ranking.
-            chosen = self._match_candidate_by_name(journey, candidates)
+            # Tolerate a model that named the moment instead of copying the id.
+            chosen = journey.match_by_name(block.get("stage_name"),
+                                           block.get("sub_stage_name"))
             if chosen is None:
-                chosen = candidates[0]
                 logger.warning(
                     "journey_leaf_unresolved",
                     extra={"qid": q_data.get("id"), "llm_leaf_id": leaf_id,
-                           "fallback": chosen.get("leaf_id")},
+                           "leaves": len(journey.leaves)},
                 )
-                evidence = (evidence + " | " if evidence else "") + (
-                    "LLM returned an unknown leaf_id; defaulted to the top-ranked "
-                    "candidate."
-                )
+                return
             status = "low_confidence_assigned"
 
-        stage_value = chosen.get("stage_name")
+        stage_value = chosen.stage_value
         if not stage_value:
             return
-        sub_value = chosen.get("sub_stage_name") or None
+        sub_value = chosen.sub_stage_value or None
 
         # ---------- Confidence -> status escalation ----------
         if confidence in ("low", "none") and status == "assigned":
             status = "low_confidence_assigned"
 
         parsed["journey_stage"] = stage_value
-        parsed["journey_leaf_id"] = chosen.get("leaf_id")
+        parsed["journey_leaf_id"] = chosen.leaf_id
         # None is a real answer here: a one-level journey (EX lifecycle) has no
         # sub-stage, and inventing one is what produced metric names in the
         # sub_stage_name column under the canon path.
@@ -456,41 +446,14 @@ class ResponseParser:
         )
         if evidence:
             parsed["journey_evidence"] = evidence
-        # `leaf_id` rides along so a reader can tell WHICH candidate was picked.
-        # Name alone no longer identifies one: a two-level journey legitimately
-        # has several moments under the same stage.
-        parsed["journey_candidates"] = [
-            {"leaf_id": c.get("leaf_id"), "name": c.get("stage_name"),
-             "sub_stage": c.get("sub_stage_name"), "score": c.get("score")}
-            for c in candidates
-        ]
-
-    @staticmethod
-    def _match_candidate_by_name(journey: dict, candidates: list[dict]) -> dict | None:
-        """Second chance for a model that wrote names instead of the leaf_id.
-
-        Matches on the (stage, sub_stage) pair when both were given, else on
-        whichever single name was. Case-insensitive; no fuzzy matching — a near
-        miss goes to the ranking fallback, which is honest about being one.
-        """
-        stage = journey.get("stage_name")
-        sub = journey.get("sub_stage_name")
-        stage = stage.strip().lower() if isinstance(stage, str) else ""
-        sub = sub.strip().lower() if isinstance(sub, str) else ""
-        if not stage and not sub:
-            return None
-
-        for c in candidates:
-            c_stage = str(c.get("stage_name") or "").strip().lower()
-            c_sub = str(c.get("sub_stage_name") or "").strip().lower()
-            if stage and sub:
-                if c_stage == stage and c_sub == sub:
-                    return c
-            elif stage and c_stage == stage:
-                return c
-            elif sub and c_sub == sub:
-                return c
-        return None
+        # What the model was choosing from, recorded once per assignment rather
+        # than as a per-question candidate list. Under the ranker each question
+        # had its own top-4 worth writing down; now every question sees the same
+        # catalog, so repeating it per question would write the tenant's whole
+        # journey into the output N times to say one thing. The leaf id plus the
+        # journey it came from is the part a reader cannot reconstruct.
+        parsed["journey_name"] = journey.journey_name
+        parsed["journey_leaves_offered"] = len(journey.leaves)
 
     # ---------- Validation helpers ----------
 

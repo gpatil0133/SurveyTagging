@@ -7,9 +7,9 @@ the same place:
     {output_dir}/{tenant_id}/tenant_profile/{org_profile,cx_intelligence,ex_intelligence}.json
 
 Keeping the on-disk contract identical is what makes this a swap rather than a
-migration: `models.TenantProfile`, the tenant taggers, `llm.tenant_canon` and —
-critically — `pipeline.change_detector` (which fingerprints this directory to
-decide which surveys need re-tagging) all keep working untouched.
+migration: `models.TenantProfile`, the tenant taggers, `llm.profile_journey`
+and — critically — `pipeline.change_detector` (which fingerprints this directory
+to decide which surveys need re-tagging) all keep working untouched.
 
 The only shape difference between the two producers is `journeys`; see
 `adapt_payload`.
@@ -44,13 +44,13 @@ def adapt_payload(agent: Agent, payload: dict[str, Any]) -> dict[str, Any]:
     org and ex arrive ready to use. CX differs in exactly one place: the agent
     nests the journey list under `journey_analysis.journeys`, while
     `models.TenantProfile.cx_journeys` — and therefore
-    `llm.tenant_canon._aggregate_raw_stages` — reads a top-level `journeys`.
+    `llm.profile_journey._cx_leaves` — reads a top-level `journeys`.
 
     This matters more than its size suggests. Without the hoist nothing raises;
-    the canon builder simply aggregates zero stages, the gate falls back to
-    `industry_template`, and every `journey_stage` / `sub_stage_name` tag
-    silently degrades from tenant-specific to generic. Hence the regression test
-    in tests/test_tenant_profile/test_smx_adapter.py.
+    the journey builder simply finds zero stages, returns None, and every
+    `journey_stage` / `sub_stage_name` tag for the tenant is skipped instead of
+    placed. Hence the regression test in
+    tests/test_tenant_profile/test_smx_adapter.py.
 
     The original `journey_analysis` is preserved alongside the hoisted list so
     nothing (complexity, future fields) is lost.

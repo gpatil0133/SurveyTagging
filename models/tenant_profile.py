@@ -17,7 +17,6 @@ Design notes:
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -131,10 +130,9 @@ class TenantProfile(BaseModel):
         """Agent's industry coerced into the canonical taxonomy/registry key.
 
         The agent emits free-form labels ("Healthcare & Life Sciences", "SaaS /
-        Cloud Software") while taxonomy.yaml + journey_stages.yaml use a fixed
-        short name ("Healthcare", "SaaS / Technology"). This accessor maps
-        between them so registry lookups (industry-specific stage canon,
-        deterministic fallback) match.
+        Cloud Software") while taxonomy.yaml uses a fixed short name
+        ("Healthcare", "SaaS / Technology"). This accessor maps between them so
+        the deterministic industry fallback matches.
         """
         return _normalize_agent_industry(self.industry_vertical)
 

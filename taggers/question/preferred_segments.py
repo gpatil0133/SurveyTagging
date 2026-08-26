@@ -62,6 +62,7 @@ def segment_candidates(
 class PreferredSegmentsTagger(QuestionTagger):
     name = "question.preferred_segments"
     tag_dimension = "preferred_segments"
+    skip_value = []  # multi-label: an empty list, never None
     stage = 5
     source_type = "hybrid"
 
@@ -69,17 +70,13 @@ class PreferredSegmentsTagger(QuestionTagger):
     def depends_on(self) -> list[str]:
         return ["question.is_segmentable", "question.metric_type"]
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=[], source="deterministic", status="skipped",
-                             evidence=ev.content_message("preferred_segments", stage=5))
 
         metric_type = accumulator.get_question_tag_value(q.question_id, "metric_type")
         if metric_type not in _METRIC_TYPES:

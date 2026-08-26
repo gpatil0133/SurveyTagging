@@ -32,16 +32,12 @@ class TopicThemeTagger(QuestionTagger):
     stage = 5
     source_type = "llm"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
-        if question.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("topic_theme", stage=5))
-
         title_lower = question.title.lower()
         group_lower = question.matrix_group_title.lower()
         combined = f"{title_lower} {group_lower}"

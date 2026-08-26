@@ -8,8 +8,8 @@ is a guess about a survey rather than knowledge about a tenant, so each is held
 below that line and LLM Call 1 replaces it.
 
 Values are no longer coerced onto a ten-item enum. `_normalize_agent_industry`
-survives as a *derived* lookup key (journey_stages.yaml templates key on the short
-names) — never as the stored tag.
+survives as a *derived* lookup key for the content-heuristic tier below — never
+as the stored tag.
 """
 
 from __future__ import annotations
@@ -155,11 +155,10 @@ class IndustryTagger(ProjectTagger):
 
         # Tier 4: Survey content heuristics
         #
-        # NOTE: there is no corporate-record tier here. `CorporateContext.industry`
-        # exists and `loaders/corporate.py::load_corporate` can read it, but
-        # nothing calls that loader and `UnifiedContext` has no `corporate`
-        # field — the tenant's self-reported industry never reaches a tagger.
-        # Wiring it back is a deliberate decision, not a drive-by fix.
+        # NOTE: there is no corporate-record tier here. The tenant's
+        # self-reported industry lived in {TenantID}_CorporateData.json, which is
+        # retired; its loader and model were deleted along with it. The tenant
+        # profile is the replacement source and is read by Tier 1 above.
         title_lower = context.survey_meta.title.lower()
         q_text = " ".join(q.title.lower() for q in context.questions)
         combined = f"{title_lower} {q_text}"

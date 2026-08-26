@@ -10,7 +10,9 @@ import sharefs
 from loaders.directory import load_directory_signals
 from loaders.invitations import load_invitation_signals
 from loaders.responses import load_response_stats
+from loaders.directory import load_linked_directory_ids
 from loaders.survey_structure import load_survey_structure, parse_survey_data
+from loaders.verbatim import load_verbatim_signals
 from models.context import ExistingTags, MatrixGroup, UnifiedContext
 from models.overrides import ManualOverrides
 from models.signals import DirectorySignals
@@ -102,13 +104,7 @@ def assemble_context(
     config_dir: Path | None = None,
     tenant_profile: TenantProfile | None = None,
     profile_journey=None,          # V8: ProfileJourney | None  (CX)
-    journey_index=None,            # V8: JourneyIndex | None    (CX)
     profile_journey_ex=None,       # V8: ProfileJourney | None  (EX)
-    journey_index_ex=None,         # V8: JourneyIndex | None    (EX)
-    tenant_canon=None,             # PARKED (V5): TenantCanon | None  (CX)
-    canon_embeddings=None,         # PARKED (V5): CanonEmbeddingIndex | None  (CX)
-    tenant_canon_ex=None,          # PARKED (V5): TenantCanon | None  (EX)
-    canon_embeddings_ex=None,      # PARKED (V5): CanonEmbeddingIndex | None  (EX)
 ) -> UnifiedContext:
     """Build the complete UnifiedContext for a single survey.
 
@@ -121,12 +117,7 @@ def assemble_context(
         tenant_profile: Pre-loaded TenantProfile (cached per tenant).
             Optional — None means no Parallel.ai artifacts are available.
         profile_journey: Pre-built CX ProfileJourney (V8; cached per tenant).
-        journey_index: Pre-built CX JourneyIndex (V8; cached per tenant).
         profile_journey_ex: Pre-built EX ProfileJourney (V8; cached per tenant).
-        journey_index_ex: Pre-built EX JourneyIndex (V8; cached per tenant).
-        tenant_canon / canon_embeddings / tenant_canon_ex / canon_embeddings_ex:
-            PARKED. The canon layer no longer feeds the pipeline; accepted so
-            existing callers still construct.
 
     Returns:
         Fully assembled UnifiedContext ready for tagging.
@@ -156,6 +147,13 @@ def assemble_context(
     has_linking = sharefs.exists(survey_dir / "directory_linking.parquet")
     has_prepop = sharefs.exists(survey_dir / "prepop_data.parquet")
 
+    # Which directories this survey's responses join to, and what the platform's
+    # text analytics found in its verbatims. Both are per-survey reads; the
+    # directory VALUES they are matched against were read once per tenant into
+    # `directory_signals.segment_candidates`.
+    linked_directory_ids = load_linked_directory_ids(survey_dir) if has_linking else []
+    verbatim_signals = load_verbatim_signals(survey_dir)
+
     # Compute derived fields
     _compute_effective_positions(questions)
     question_groups = _compute_matrix_groups(questions)
@@ -184,13 +182,7 @@ def assemble_context(
         tenant_id=tenant_id,
         tenant_profile=tenant_profile,
         profile_journey=profile_journey,
-        journey_index=journey_index,
         profile_journey_ex=profile_journey_ex,
-        journey_index_ex=journey_index_ex,
-        tenant_canon=tenant_canon,
-        canon_embeddings=canon_embeddings,
-        tenant_canon_ex=tenant_canon_ex,
-        canon_embeddings_ex=canon_embeddings_ex,
         survey_meta=survey_meta,
         questions=questions,
         response_stats=response_stats,
@@ -198,6 +190,8 @@ def assemble_context(
         invitation_signals=invitation_signals,
         has_linking=has_linking,
         has_prepop=has_prepop,
+        linked_directory_ids=linked_directory_ids,
+        verbatim_signals=verbatim_signals,
         question_groups=question_groups,
         piping_map=piping_map,
         existing_tags=existing_tags,

@@ -52,17 +52,13 @@ class IsFilterableTagger(QuestionTagger):
     stage = 3
     source_type = "deterministic"
 
-    def tag_question(
+    def _tag_question(
         self,
         context: UnifiedContext,
         question: QuestionContext,
         accumulator: TagAccumulator,
     ) -> TagResult:
         q = question
-
-        if q.is_content_message:
-            return TagResult(value=None, source="deterministic", status="skipped",
-                             evidence=ev.content_message("is_filterable", stage=3))
 
         # Metrics first: the platform's scale flags outrank the question type, so
         # a CSAT delivered as a radio button is filtered on as a CSAT.
